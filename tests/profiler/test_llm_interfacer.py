@@ -81,6 +81,394 @@ class TestLLMInterfacer(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main()
 
+
+# (Existing TestLLMInterfacer class for old mock - may be removed later)
+# (Existing TestDeterministicStatsCollection class)
+
+# Import the main orchestrator function and other components if needed for type hints or defaults
+from src.profiler.llm_interfacer import (
+    get_ai_style_fingerprint_for_sample,
+    SingleSampleFingerprint # For referencing valid literals
+)
+from typing import get_args # For checking Literal values
+# Note: json, Path, Dict etc. are standard or already imported by unittest/other parts
+
+class TestAIOrchestrator(unittest.TestCase):
+    def setUp(self):
+        self.code_snippet = "def test_func(): pass"
+        self.deepseek_path = "dummy/deepseek.gguf"
+        self.divot5_path = "dummy/divot5_dir"
+
+        # Default valid fingerprint for mocking successful validation
+        # Aligned with the core 7 keys validated by the orchestrator.
+        self.core_valid_fingerprint_dict = {
+            "indent": 4, "quotes": "single", "linelen": 88,
+            "snake_pct": 0.80, "camel_pct": 0.10, "screaming_pct": 0.05,
+            "docstyle": "google"
+        }
+
+
+    @patch('src.profiler.llm_interfacer.collect_deterministic_stats')
+    @patch('src.profiler.llm_interfacer.get_deepseek_draft_fingerprint')
+    @patch('src.profiler.llm_interfacer.get_divot5_refined_output')
+    @patch('src.profiler.llm_interfacer.get_deepseek_polished_json')
+    def test_orchestration_success_flow(
+        self, mock_polished_json, mock_divot5_refined,
+        mock_deepseek_draft, mock_collect_stats
+    ):
+        """Test the successful orchestration flow with valid final JSON."""
+        mock_collect_stats.return_value = "STATS_BLOCK_CONTENT"
+        mock_deepseek_draft.return_value = {"raw_key": "raw_value"}
+        mock_divot5_refined.return_value = '"refined_key": "refined_value"'
+        # Ensure the polished JSON is a string that json.loads can parse
+        mock_polished_json.return_value = json.dumps(self.core_valid_fingerprint_dict)
+
+        result = get_ai_style_fingerprint_for_sample(
+            self.code_snippet, self.deepseek_path, self.divot5_path
+        )
+
+        mock_collect_stats.assert_called_once_with(self.code_snippet)
+        mock_deepseek_draft.assert_called_once_with(
+            "STATS_BLOCK_CONTENT", self.deepseek_path,
+            n_gpu_layers=-1, verbose=False # Default orchestrator values
+        )
+        mock_divot5_refined.assert_called_once_with(
+            self.code_snippet, {"raw_key": "raw_value"}, self.divot5_path,
+            num_denoising_steps=10, device=None # Default orchestrator values
+        )
+        mock_polished_json.assert_called_once_with(
+            '"refined_key": "refined_value"', self.deepseek_path,
+            n_gpu_layers=-1, verbose=False # Default orchestrator values
+        )
+
+        self.assertEqual(result.get("validation_status"), "passed")
+        self.assertNotIn("validation_errors", result)
+        self.assertNotIn("error", result)
+        for key, value in self.core_valid_fingerprint_dict.items():
+            self.assertEqual(result.get(key), value)
+
+    @patch('src.profiler.llm_interfacer.collect_deterministic_stats')
+    @patch('src.profiler.llm_interfacer.get_deepseek_draft_fingerprint')
+    @patch('src.profiler.llm_interfacer.get_divot5_refined_output')
+    @patch('src.profiler.llm_interfacer.get_deepseek_polished_json')
+    def test_orchestration_final_json_decode_error(
+        self, mock_polished_json, mock_divot5_refined,
+        mock_deepseek_draft, mock_collect_stats
+    ):
+        mock_collect_stats.return_value = "STATS_BLOCK"
+        mock_deepseek_draft.return_value = {}
+        mock_divot5_refined.return_value = "REFINED_OUTPUT"
+        mock_polished_json.return_value = "this is not valid json" # Invalid JSON string
+
+        result = get_ai_style_fingerprint_for_sample(
+            self.code_snippet, self.deepseek_path, self.divot5_path
+        )
+
+        self.assertEqual(result.get("validation_status"), "failed_json_parsing")
+        self.assertIn("error", result)
+        self.assertEqual(result.get("error"), "JSONDecodeError")
+        self.assertEqual(result.get("raw_output"), "this is not valid json")
+
+    @patch('src.profiler.llm_interfacer.collect_deterministic_stats')
+    @patch('src.profiler.llm_interfacer.get_deepseek_draft_fingerprint')
+    @patch('src.profiler.llm_interfacer.get_divot5_refined_output')
+    @patch('src.profiler.llm_interfacer.get_deepseek_polished_json')
+    def test_orchestration_validation_missing_keys(
+        self, mock_polished_json, mock_divot5_refined,
+        mock_deepseek_draft, mock_collect_stats
+    ):
+        incomplete_fp = self.core_valid_fingerprint_dict.copy()
+        del incomplete_fp["indent"] # Missing a key
+        mock_polished_json.return_value = json.dumps(incomplete_fp)
+        # Other mocks setup as in success case
+        mock_collect_stats.return_value = "STATS"
+        mock_deepseek_draft.return_value = {}
+        mock_divot5_refined.return_value = "REFINED"
+
+        result = get_ai_style_fingerprint_for_sample(
+            self.code_snippet, self.deepseek_path, self.divot5_path
+        )
+        self.assertEqual(result.get("validation_status"), "failed_sanity_checks")
+        self.assertIn("validation_errors", result)
+        self.assertTrue(any("Missing expected keys: indent" in err for err in result["validation_errors"]))
+
+    @patch('src.profiler.llm_interfacer.collect_deterministic_stats')
+    @patch('src.profiler.llm_interfacer.get_deepseek_draft_fingerprint')
+    @patch('src.profiler.llm_interfacer.get_divot5_refined_output')
+    @patch('src.profiler.llm_interfacer.get_deepseek_polished_json')
+    def test_orchestration_validation_invalid_indent(
+        self, mock_polished_json, mock_divot5_refined,
+        mock_deepseek_draft, mock_collect_stats
+    ):
+        invalid_fp = self.core_valid_fingerprint_dict.copy()
+        invalid_fp["indent"] = 5 # Invalid indent value
+        mock_polished_json.return_value = json.dumps(invalid_fp)
+        mock_collect_stats.return_value = "STATS"
+        mock_deepseek_draft.return_value = {}
+        mock_divot5_refined.return_value = "REFINED"
+
+        result = get_ai_style_fingerprint_for_sample(
+            self.code_snippet, self.deepseek_path, self.divot5_path
+        )
+        self.assertEqual(result.get("validation_status"), "failed_sanity_checks")
+        self.assertIn("validation_errors", result)
+        self.assertTrue(any("Invalid 'indent' value: 5" in err for err in result["validation_errors"]))
+
+    @patch('src.profiler.llm_interfacer.collect_deterministic_stats')
+    @patch('src.profiler.llm_interfacer.get_deepseek_draft_fingerprint')
+    @patch('src.profiler.llm_interfacer.get_divot5_refined_output')
+    @patch('src.profiler.llm_interfacer.get_deepseek_polished_json')
+    def test_orchestration_validation_invalid_linelen(
+        self, mock_polished_json, mock_divot5_refined,
+        mock_deepseek_draft, mock_collect_stats
+    ):
+        invalid_fp = self.core_valid_fingerprint_dict.copy()
+        invalid_fp["linelen"] = 200 # Invalid linelen value
+        mock_polished_json.return_value = json.dumps(invalid_fp)
+        mock_collect_stats.return_value = "STATS"
+        mock_deepseek_draft.return_value = {}
+        mock_divot5_refined.return_value = "REFINED"
+
+        result = get_ai_style_fingerprint_for_sample(
+            self.code_snippet, self.deepseek_path, self.divot5_path
+        )
+        self.assertEqual(result.get("validation_status"), "failed_sanity_checks")
+        self.assertIn("validation_errors", result)
+        self.assertTrue(any("Invalid 'linelen' value: 200" in err for err in result["validation_errors"]))
+
+
+    @patch('src.profiler.llm_interfacer.collect_deterministic_stats')
+    @patch('src.profiler.llm_interfacer.get_deepseek_draft_fingerprint')
+    @patch('src.profiler.llm_interfacer.get_divot5_refined_output')
+    @patch('src.profiler.llm_interfacer.get_deepseek_polished_json')
+    def test_orchestration_validation_invalid_quotes(
+        self, mock_polished_json, mock_divot5_refined,
+        mock_deepseek_draft, mock_collect_stats
+    ):
+        invalid_fp = self.core_valid_fingerprint_dict.copy()
+        invalid_fp["quotes"] = "triple" # Invalid quotes value
+        mock_polished_json.return_value = json.dumps(invalid_fp)
+        mock_collect_stats.return_value = "STATS"
+        mock_deepseek_draft.return_value = {}
+        mock_divot5_refined.return_value = "REFINED"
+
+        result = get_ai_style_fingerprint_for_sample(
+            self.code_snippet, self.deepseek_path, self.divot5_path
+        )
+        self.assertEqual(result.get("validation_status"), "failed_sanity_checks")
+        self.assertIn("validation_errors", result)
+        self.assertTrue(any("Invalid 'quotes' value: triple" in err for err in result["validation_errors"]))
+
+    @patch('src.profiler.llm_interfacer.collect_deterministic_stats')
+    @patch('src.profiler.llm_interfacer.get_deepseek_draft_fingerprint')
+    @patch('src.profiler.llm_interfacer.get_divot5_refined_output')
+    @patch('src.profiler.llm_interfacer.get_deepseek_polished_json')
+    def test_orchestration_validation_invalid_percentage(
+        self, mock_polished_json, mock_divot5_refined,
+        mock_deepseek_draft, mock_collect_stats
+    ):
+        invalid_fp = self.core_valid_fingerprint_dict.copy()
+        invalid_fp["snake_pct"] = 1.5 # Invalid percentage
+        mock_polished_json.return_value = json.dumps(invalid_fp)
+        mock_collect_stats.return_value = "STATS"
+        mock_deepseek_draft.return_value = {}
+        mock_divot5_refined.return_value = "REFINED"
+
+        result = get_ai_style_fingerprint_for_sample(
+            self.code_snippet, self.deepseek_path, self.divot5_path
+        )
+        self.assertEqual(result.get("validation_status"), "failed_sanity_checks")
+        self.assertIn("validation_errors", result)
+        self.assertTrue(any("Invalid 'snake_pct' value: 1.5" in err for err in result["validation_errors"]))
+
+
+    @patch('src.profiler.llm_interfacer.collect_deterministic_stats', side_effect=Exception("Stats collection error"))
+    def test_orchestration_error_in_early_step(self, mock_collect_stats):
+        """Test error handling if an early step in orchestration fails."""
+        result = get_ai_style_fingerprint_for_sample(
+            self.code_snippet, self.deepseek_path, self.divot5_path
+        )
+        self.assertEqual(result.get("validation_status"), "failed_orchestration")
+        self.assertEqual(result.get("error"), "OrchestrationError")
+        self.assertEqual(result.get("details"), "Stats collection error")
+
+
+# Ensure __main__ block at the end of the file calls unittest.main()
+# if __name__ == '__main__':
+#     unittest.main()
+
+
+# (Existing TestLLMInterfacer class for old mock - may be removed later)
+
+# Add new imports if needed for the new test class
+from src.profiler.llm_interfacer import (
+    get_deepseek_draft_fingerprint,
+    get_divot5_refined_output,
+    get_deepseek_polished_json,
+    # Llama, LlamaGrammar, T5ForConditionalGeneration, T5TokenizerFast might be needed for type checking mocks
+    # but we'll mostly mock their instances.
+)
+import json # For constructing mock JSON strings and parsing
+from unittest.mock import call, ANY # ANY might be useful for some subprocess calls if arguments are complex
+
+class TestAIClientFunctions(unittest.TestCase):
+    def setUp(self):
+        self.stats_block_example = "STATS_START\nindent_modal: 4\nSTATS_END"
+        self.model_path_example = "dummy/model/path"
+        self.code_snippet_example = "def foo(): pass"
+        self.raw_fingerprint_example = {"indent": 4, "quotes": "mixed?", "linelen": 90}
+        self.divot5_output_example = '"indent": 4, "quotes": "single", "linelen": 90'
+
+    # --- Tests for get_deepseek_draft_fingerprint ---
+
+    @patch('src.profiler.llm_interfacer.Llama')
+    def test_get_deepseek_draft_success(self, MockLlama):
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.create_chat_completion.return_value = {
+            'choices': [{'message': {'content': '{\n  "indent": 4,\n  "quotes": "single",\n  "linelen": 88,\n  "snake_pct": 0.8,\n  "camel_pct": 0.1,\n  "screaming_pct": 0.05,\n  "docstyle": "google"\n}'}}]
+        }
+        MockLlama.return_value = mock_llm_instance
+
+        result = get_deepseek_draft_fingerprint(self.stats_block_example, self.model_path_example)
+
+        MockLlama.assert_called_once_with(model_path=self.model_path_example, n_gpu_layers=-1, n_ctx=2048, verbose=False)
+        mock_llm_instance.create_chat_completion.assert_called_once()
+        args, kwargs = mock_llm_instance.create_chat_completion.call_args
+        self.assertEqual(kwargs['messages'][0]['role'], 'system')
+        self.assertIn("Return ONLY a JSON object", kwargs['messages'][0]['content'])
+        self.assertEqual(kwargs['messages'][1]['role'], 'user')
+        self.assertEqual(kwargs['messages'][1]['content'], self.stats_block_example)
+
+        expected_keys = ["indent", "quotes", "linelen", "snake_pct", "camel_pct", "screaming_pct", "docstyle"]
+        for key in expected_keys:
+            self.assertIn(key, result)
+        self.assertEqual(result["indent"], 4)
+
+    @patch('src.profiler.llm_interfacer.Llama')
+    def test_get_deepseek_draft_json_decode_error_fallback(self, MockLlama):
+        mock_llm_instance = MagicMock()
+        # Simulate output that's not valid JSON but has extractable parts
+        mock_llm_instance.create_chat_completion.return_value = {
+            'choices': [{'message': {'content': 'Here is the data: "indent": 4, "quotes": mixed?, "linelen": 100, invalid json'}}]
+        }
+        MockLlama.return_value = mock_llm_instance
+
+        result = get_deepseek_draft_fingerprint(self.stats_block_example, self.model_path_example)
+        self.assertEqual(result.get("indent"), 4) # From regex fallback
+        self.assertEqual(result.get("quotes"), "mixed?") # From regex fallback
+        self.assertEqual(result.get("linelen"), 100)
+        self.assertEqual(result.get("docstyle"), "unknown?") # Fallback for missing
+
+    @patch('src.profiler.llm_interfacer.Llama', None) # Simulate LlamaCPP not installed
+    def test_get_deepseek_draft_llama_not_available(self):
+        result = get_deepseek_draft_fingerprint(self.stats_block_example, self.model_path_example)
+        # Check it returns the specific mock for this case
+        self.assertEqual(result["quotes"], "mixed?")
+        self.assertEqual(result["docstyle"], "google_or_numpy")
+
+    @patch('src.profiler.llm_interfacer.Llama') # Llama is available
+    def test_get_deepseek_draft_model_load_fails(self, MockLlama):
+        MockLlama.side_effect = Exception("Failed to load model") # Simulate error during Llama()
+        result = get_deepseek_draft_fingerprint(self.stats_block_example, self.model_path_example)
+        self.assertEqual(result["quotes"], "mixed?")
+        self.assertEqual(result["linelen"], 90) # From the "loading fails" mock
+
+
+    # --- Tests for get_divot5_refined_output ---
+
+    @patch('src.profiler.llm_interfacer.torch')
+    @patch('src.profiler.llm_interfacer.T5TokenizerFast')
+    @patch('src.profiler.llm_interfacer.T5ForConditionalGeneration')
+    def test_get_divot5_refined_success(self, MockModel, MockTokenizer, MockTorch):
+        MockTorch.cuda.is_available.return_value = False # Test CPU path
+
+        mock_tokenizer_instance = MagicMock()
+        # Mock the __call__ (e.g., tokenizer()) to return a dict-like object with 'input_ids'
+        mock_tokenizer_instance.return_value = {'input_ids': MagicMock()}
+        mock_tokenizer_instance.decode.return_value = self.divot5_output_example
+        MockTokenizer.from_pretrained.return_value = mock_tokenizer_instance
+
+        mock_model_instance = MagicMock()
+        mock_model_instance.generate.return_value = [MagicMock()] # Simulate some output tensor
+        # Make sure that to(device) also returns the mock_model_instance for chaining
+        mock_model_instance.to.return_value = mock_model_instance
+        MockModel.from_pretrained.return_value = mock_model_instance
+
+        result_str = get_divot5_refined_output(
+            self.code_snippet_example, self.raw_fingerprint_example, self.model_path_example
+        )
+
+        MockTokenizer.from_pretrained.assert_called_once_with(self.model_path_example)
+        MockModel.from_pretrained.assert_called_once_with(self.model_path_example)
+        mock_model_instance.to.assert_called_once_with("cpu")
+        mock_model_instance.eval.assert_called_once()
+
+        # Check input to tokenizer (which is input to model)
+        args_tokenizer_call, kwargs_tokenizer_call = mock_tokenizer_instance.call_args
+        input_text_to_t5 = args_tokenizer_call[0] # First positional argument
+        self.assertIn("USER_CODE_START", input_text_to_t5)
+        self.assertIn(self.code_snippet_example, input_text_to_t5)
+        self.assertIn("RAW_FINGERPRINT_START", input_text_to_t5)
+        self.assertIn('"quotes": "mixed?"', input_text_to_t5) # From raw_fingerprint_example
+
+        mock_model_instance.generate.assert_called_once()
+        mock_tokenizer_instance.decode.assert_called_once()
+        self.assertEqual(result_str, self.divot5_output_example)
+
+    @patch('src.profiler.llm_interfacer.T5ForConditionalGeneration', None) # Simulate Transformers not installed
+    def test_get_divot5_refined_transformers_not_available(self):
+        result = get_divot5_refined_output(
+            self.code_snippet_example, self.raw_fingerprint_example, self.model_path_example
+        )
+        # Check it returns the specific mock for this case (should refine "mixed?")
+        self.assertIn('"quotes": "single"', result)
+        self.assertNotIn("mixed?", result)
+
+
+    # --- Tests for get_deepseek_polished_json ---
+
+    @patch('src.profiler.llm_interfacer.LlamaGrammar')
+    @patch('src.profiler.llm_interfacer.Llama')
+    def test_get_deepseek_polished_success(self, MockLlama, MockLlamaGrammar):
+        mock_grammar_instance = MagicMock()
+        MockLlamaGrammar.from_string.return_value = mock_grammar_instance
+
+        mock_llm_instance = MagicMock()
+        final_json_str = '{"indent": 4, "quotes": "single", "linelen": 90, "snake_pct": 0.82, "camel_pct": 0.12, "screaming_pct": 0.06, "docstyle": "google"}'
+        mock_llm_instance.create_chat_completion.return_value = {
+            'choices': [{'message': {'content': final_json_str}}]
+        }
+        MockLlama.return_value = mock_llm_instance
+
+        result = get_deepseek_polished_json(self.divot5_output_example, self.model_path_example)
+
+        MockLlama.assert_called_once_with(model_path=self.model_path_example, n_gpu_layers=-1, n_ctx=2048, verbose=False)
+        MockLlamaGrammar.from_string.assert_called_once() # With JSON_FINGERPRINT_GRAMMAR_STR
+
+        args_completion, kwargs_completion = mock_llm_instance.create_chat_completion.call_args
+        self.assertEqual(kwargs_completion['messages'][1]['content'], self.divot5_output_example)
+        self.assertEqual(kwargs_completion['grammar'], mock_grammar_instance)
+
+        self.assertEqual(result, final_json_str)
+
+    @patch('src.profiler.llm_interfacer.Llama', None) # Simulate LlamaCPP not installed
+    def test_get_deepseek_polished_llama_not_available(self):
+        result = get_deepseek_polished_json(self.divot5_output_example, self.model_path_example)
+        # Mock should wrap the input in braces
+        expected_mock_result = f"{{{self.divot5_output_example}}}"
+        self.assertEqual(result, expected_mock_result)
+
+# Make sure to add TestAIClientFunctions to the test suite if __main__ is used for discovery,
+# or ensure test runner discovers all TestCase classes.
+# If the original TestLLMInterfacer only tested the old mock, it might be removed soon.
+# For now, let's assume it's kept and we add this new class.
+
+# (Existing TestDeterministicStatsCollection class should be here)
+# ...
+
+# (Existing __main__ block for unittest.main() should be here)
+# ...
+
 # Add new imports if needed for the new test class
 from src.profiler.llm_interfacer import collect_deterministic_stats, _get_modal_indent, _get_line_length_percentile
 
