@@ -6,6 +6,20 @@ from collections import Counter
 # Assuming SingleSampleFingerprint structure from llm_interfacer.py
 # For standalone execution, we might redefine a simplified version or expect it to be importable.
 # from .llm_interfacer import SingleSampleFingerprint # This would be the typical import
+import json # For DivoT5 input/output
+import re   # For DivoT5 output parsing
+
+# Add Hugging Face Transformers import, guarded
+try:
+    import torch
+    from transformers import T5ForConditionalGeneration, T5TokenizerFast
+except ImportError:
+    torch = None # type: ignore
+    T5ForConditionalGeneration = None # type: ignore
+    T5TokenizerFast = None # type: ignore
+    # Keep Counter for the fallback mock logic
+    from collections import Counter
+    print("Warning: PyTorch or Hugging Face Transformers not found. DivoT5 unification will use simplified mock logic.")
 
 # Define the structure for the final, unified project-level style profile
 @dataclass
@@ -15,26 +29,18 @@ class UnifiedStyleProfile:
     preferred_quotes: Optional[Literal["single", "double"]] = None
     docstring_style: Optional[Literal["google", "numpy", "epytext", "restructuredtext", "plain", "other"]] = None
     max_line_length: Optional[int] = None
-    # Global preference for type hints, True if predominantly used, False if predominantly not, None if mixed/undetermined
-    prefers_type_hints: Optional[bool] = None
-    # Global preference for spacing around operators
-    prefers_spacing_around_operators: Optional[bool] = None
 
     # Columnar statistics for identifier patterns (project-wide)
-    # Percentages of total identifiers that fall into each category
     identifier_snake_case_pct: Optional[float] = None
     identifier_camelCase_pct: Optional[float] = None
-    identifier_PascalCase_pct: Optional[float] = None # Typically for classes
-    identifier_UPPER_SNAKE_CASE_pct: Optional[float] = None # Typically for constants
+    # identifier_PascalCase_pct: Optional[float] = None # REMOVED as per user spec for final profile
+    identifier_UPPER_SNAKE_CASE_pct: Optional[float] = None # User spec mentions UPPER_SCREAMING %
 
-    # Per-directory override map for specific style aspects if genuinely different sub-styles are detected
-    # Key is directory path (relative to repo root), value is a dict of overrides
-    # e.g., {"src/legacy_module/": {"indent_width": 2, "preferred_quotes": "double"}}
+    # Per-directory override map
     directory_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    # Could also include raw data or confidence scores from the diffusion process
     confidence_score: Optional[float] = None
-    raw_analysis_summary: Optional[Dict[str, Any]] = None
+    raw_analysis_summary: Optional[Dict[str, Any]] = None # For any raw supporting data
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -42,133 +48,193 @@ class UnifiedStyleProfile:
             "preferred_quotes": self.preferred_quotes,
             "docstring_style": self.docstring_style,
             "max_line_length": self.max_line_length,
-            "prefers_type_hints": self.prefers_type_hints,
-            "prefers_spacing_around_operators": self.prefers_spacing_around_operators,
             "identifier_snake_case_pct": self.identifier_snake_case_pct,
             "identifier_camelCase_pct": self.identifier_camelCase_pct,
-            "identifier_PascalCase_pct": self.identifier_PascalCase_pct,
             "identifier_UPPER_SNAKE_CASE_pct": self.identifier_UPPER_SNAKE_CASE_pct,
             "directory_overrides": self.directory_overrides,
             "confidence_score": self.confidence_score,
             "raw_analysis_summary": self.raw_analysis_summary,
         }
 
-# Placeholder/mock function for Diffusion Model interaction
 def unify_fingerprints_with_diffusion(
-    sample_fingerprints: List[Dict[str, Union[int, str, float, bool, None]]],
-    # We might need file paths or other metadata if considering file size/recency for weighting
-    # For now, keeping it simple with just the fingerprint dicts.
-    # file_metadata: Optional[List[Dict[str, Any]]] = None
+    per_sample_fingerprints: List[Dict[str, Any]], # Each dict should contain 'fingerprint': {...} and 'file_path': str
+    model_path: str,
+    num_beams: int = 4,
+    max_output_length: int = 1024, # Max length for the generated JSON profile
+    device: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Mock function to simulate a Code-Diffusion core unifying multiple
-    per-sample style fingerprints into a single project-level style profile.
-
-    In a real implementation, this would involve:
-    1.  Input: A list of style fingerprints (e.g., from the LLM).
-    2.  Processing: The diffusion model would "denoise", cluster, and smooth these,
-        potentially weighting them by file size, recency, or other heuristics.
-    3.  Output: A coherent `UnifiedStyleProfile`.
+    Uses a DivoT5 SafeTensor model to unify multiple per-sample style fingerprints
+    (including file paths for context) into a single project-level style profile.
 
     Args:
-        sample_fingerprints: A list of dictionaries, where each dictionary is a
-                             style fingerprint from a single code sample.
+        per_sample_fingerprints: A list of dictionaries, where each dictionary contains
+                                 a 'fingerprint' (the AI-derived style dict for a sample)
+                                 and 'file_path' (string path for that sample).
+        model_path: Path to the DivoT5 model directory (SafeTensor format).
+        num_beams: Number of beams for generation.
+        max_output_length: Maximum length of the generated JSON string.
+        device: Device to run the model on (e.g., "cpu", "cuda"). Auto-detects if None.
 
     Returns:
         A dictionary representing the unified project-level style profile.
+        Falls back to simpler aggregation if model interaction fails.
     """
-    if not sample_fingerprints:
-        # Return a default or empty profile if no samples are provided
-        return UnifiedStyleProfile().to_dict()
+    if T5ForConditionalGeneration is None or T5TokenizerFast is None or torch is None:
+        print("Error: Transformers/PyTorch not installed. DivoT5 unification falling back to basic mock aggregation.")
+        # Fallback to the old mock logic (simplified aggregation)
+        if not per_sample_fingerprints:
+            return UnifiedStyleProfile().to_dict()
 
-    # Simulate the unification process (denoising, clustering, smoothing)
-    # This is a very simplified mock. A real diffusion model is far more complex.
+        # Extract just the fingerprint dicts for mock processing
+        fingerprint_dicts_only = [item['fingerprint'] for item in per_sample_fingerprints if 'fingerprint' in item]
+        if not fingerprint_dicts_only:
+            return UnifiedStyleProfile().to_dict()
 
-    # --- Global Scalar Choices ---
-    # For simple scalars like indent_width, preferred_quotes, docstring_style, max_line_length
-    # we can take the most common value, or an average for numerical values.
+        # Simplified aggregation (mode for categorical, mean for numerical)
+        # This is the old mock logic, kept as a fallback.
+        final_profile = UnifiedStyleProfile()
+        for key in ["indent_width", "preferred_quotes", "docstring_style", "max_line_length"]:
+            values = [fp.get(key) for fp in fingerprint_dicts_only if fp.get(key) is not None]
+            if values:
+                if isinstance(values[0], int) and key == "max_line_length": # Average for linelen
+                    final_profile.max_line_length = int(sum(values) / len(values))
+                elif isinstance(values[0], int) and key == "indent_width": # Mode for indent
+                    final_profile.indent_width = Counter(values).most_common(1)[0][0]
+                else: # Mode for strings
+                    most_common_val = Counter(values).most_common(1)[0][0]
+                    if key == "preferred_quotes": final_profile.preferred_quotes = most_common_val
+                    elif key == "docstring_style": final_profile.docstring_style = most_common_val
 
-    indent_widths = [fp.get("indent") for fp in sample_fingerprints if fp.get("indent") is not None]
-    final_indent = Counter(indent_widths).most_common(1)[0][0] if indent_widths else None
+        for pct_key in ["identifier_snake_case_pct", "identifier_camelCase_pct", "identifier_UPPER_SNAKE_CASE_pct"]:
+            # Corrected:
+            pct_values = [fp.get(pct_key) for fp in fingerprint_dicts_only if fp.get(pct_key) is not None and isinstance(fp.get(pct_key), (float,int))]
+            if pct_values:
+                avg_pct = sum(pct_values) / len(pct_values)
+                if pct_key == "identifier_snake_case_pct": final_profile.identifier_snake_case_pct = round(avg_pct, 2)
+                elif pct_key == "identifier_camelCase_pct": final_profile.identifier_camelCase_pct = round(avg_pct, 2)
+                elif pct_key == "identifier_UPPER_SNAKE_CASE_pct": final_profile.identifier_UPPER_SNAKE_CASE_pct = round(avg_pct, 2)
 
-    quotes_prefs = [fp.get("quotes") for fp in sample_fingerprints if fp.get("quotes") is not None]
-    final_quotes = Counter(quotes_prefs).most_common(1)[0][0] if quotes_prefs else None
+        final_profile.confidence_score = 0.5 # Indicate mock/fallback result
+        return final_profile.to_dict()
 
-    doc_styles = [fp.get("docstyle") for fp in sample_fingerprints if fp.get("docstyle") is not None]
-    final_docstyle = Counter(doc_styles).most_common(1)[0][0] if doc_styles else None
+    if device is None:
+        selected_device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        selected_device = device
 
-    line_lengths = [fp.get("linelen") for fp in sample_fingerprints if fp.get("linelen") is not None]
-    final_linelen = int(sum(line_lengths) / len(line_lengths)) if line_lengths else None
+    print(f"DivoT5 Unification: Loading model from {model_path} onto device: {selected_device}")
 
-    type_hints_usage = [fp.get("has_type_hints") for fp in sample_fingerprints if fp.get("has_type_hints") is not None]
-    final_type_hints = Counter(type_hints_usage).most_common(1)[0][0] if type_hints_usage else None
+    try:
+        tokenizer = T5TokenizerFast.from_pretrained(model_path)
+        model = T5ForConditionalGeneration.from_pretrained(model_path).to(selected_device)
+        model.eval()
+    except Exception as e:
+        print(f"DivoT5 Unification: Error loading model from {model_path}: {e}")
+        print("Falling back to basic mock aggregation.")
+        # Recursive call to use the fallback logic defined above
+        return unify_fingerprints_with_diffusion(per_sample_fingerprints, "mock_path_trigger_fallback", num_beams, max_output_length, device)
 
-    spacing_ops_usage = [fp.get("spacing_around_operators") for fp in sample_fingerprints if fp.get("spacing_around_operators") is not None]
-    final_spacing_ops = Counter(spacing_ops_usage).most_common(1)[0][0] if spacing_ops_usage else None
 
+    # Prepare input for DivoT5
+    # Serialize the list of {"fingerprint": dict, "file_path": str} objects to a JSON string
+    try:
+        samples_json_str = json.dumps(per_sample_fingerprints, indent=2)
+    except TypeError as e:
+        print(f"DivoT5 Unification: Error serializing per_sample_fingerprints to JSON: {e}")
+        print("Falling back to basic mock aggregation.")
+        return unify_fingerprints_with_diffusion(per_sample_fingerprints, "mock_path_trigger_fallback", num_beams, max_output_length, device)
 
-    # --- Columnar Statistics for Identifier Patterns ---
-    # Average the percentages from samples. A real model might do more sophisticated analysis.
-    avg_camel_pct = sum(fp.get("camel_pct", 0.0) for fp in sample_fingerprints) / len(sample_fingerprints)
-    avg_snake_pct = sum(fp.get("snake_pct", 0.0) for fp in sample_fingerprints) / len(sample_fingerprints)
+    system_prompt = ("You are a style analysis assistant. Based on the following list of style fingerprints "
+                     "(each derived from a code sample, including its file path), determine the dominant, "
+                     "coherent project-level style profile. The project-level profile should include global "
+                     "choices for indentation, quotes, line length, and docstring style, as well as overall "
+                     "percentages for identifier casing (snake_case, camelCase, UPPER_SCREAMING_CASE). "
+                     "If strong, consistent sub-styles are detected for specific directories "
+                     "(inferable from 'file_path' in samples), provide those as 'directory_overrides'. "
+                     "Output the result as a single JSON object matching the UnifiedStyleProfile structure.")
 
-    # Placeholder for PascalCase (classes) and UPPER_SNAKE_CASE (constants)
-    # A real system would need the LLM to provide these, or derive them from identifier analysis.
-    # For the mock, let's assume some typical values if snake/camel are dominant.
-    final_pascal_pct = None
-    final_upper_snake_pct = None
+    input_text = (f"SYSTEM: {system_prompt}\n\n"
+                  f"USER_FINGERPRINT_SAMPLES_START:\n{samples_json_str}\nUSER_FINGERPRINT_SAMPLES_END:\n\n"
+                  f"PROJECT_STYLE_PROFILE_JSON_START:")
 
-    if avg_snake_pct > 0.5 or avg_camel_pct > 0.5: # If there's some dominant style
-        final_pascal_pct = random.uniform(0.05, 0.15) # Typical for class names
-        final_upper_snake_pct = random.uniform(0.02, 0.10) # Typical for constants
+    unified_profile_json_str = "{}" # Default to empty JSON
 
-    # Normalize percentages if needed (though they are independent features here)
-    total_pct = (avg_snake_pct + avg_camel_pct + (final_pascal_pct or 0.0) + (final_upper_snake_pct or 0.0))
-    if total_pct > 1.0 and total_pct > 0: # Avoid division by zero
-        # Simple normalization, a real model would handle this distributionally
-        avg_snake_pct /= total_pct
-        avg_camel_pct /= total_pct
-        if final_pascal_pct: final_pascal_pct /= total_pct
-        if final_upper_snake_pct: final_upper_snake_pct /= total_pct
+    try:
+        print(f"DivoT5 Unification: Input text length: {len(input_text)} chars. Number of samples: {len(per_sample_fingerprints)}")
+        # Ensure tokenizer handles potentially very long input. Max model length for T5 is often 512 or 1024.
+        # If input_text is too long, this will be an issue. Truncation might lose data.
+        # Consider strategies for handling >1000 samples if total serialized length is too great.
+        # For now, assume it fits or gets truncated by tokenizer.
+        inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=4096).to(selected_device) # Increased max_length for input
 
-    # --- Per-directory Overrides ---
-    # This is highly dependent on having file path information associated with fingerprints
-    # and a more complex clustering/analysis by the diffusion model.
-    # For a mock, we'll leave this empty or add a dummy override.
-    final_dir_overrides = {}
-    if len(sample_fingerprints) > 10 and random.random() < 0.1: # Small chance of a dummy override
-        final_dir_overrides["src/legacy_utils/"] = {
-            "indent_width": 2,
-            "preferred_quotes": "double",
-            "max_line_length": 100,
-        }
+        with torch.no_grad():
+            outputs = model.generate(
+                inputs.input_ids,
+                max_length=max_output_length,
+                num_beams=num_beams,
+                early_stopping=True,
+                # Consider adding task-specific prefix or other generation params if needed for DivoT5
+            )
 
-    mock_unified_profile = UnifiedStyleProfile(
-        indent_width=final_indent,
-        preferred_quotes=final_quotes,
-        docstring_style=final_docstyle,
-        max_line_length=final_linelen,
-        prefers_type_hints=final_type_hints,
-        prefers_spacing_around_operators=final_spacing_ops,
-        identifier_snake_case_pct=round(avg_snake_pct, 3),
-        identifier_camelCase_pct=round(avg_camel_pct, 3),
-        identifier_PascalCase_pct=round(final_pascal_pct, 3) if final_pascal_pct is not None else None,
-        identifier_UPPER_SNAKE_CASE_pct=round(final_upper_snake_pct, 3) if final_upper_snake_pct is not None else None,
-        directory_overrides=final_dir_overrides,
-        confidence_score=random.uniform(0.75, 0.95) # Mock confidence
-    )
+        if outputs is not None and len(outputs) > 0:
+            unified_profile_json_str = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+            # Sometimes T5 might output the "PROJECT_STYLE_PROFILE_JSON_START:" part if not explicitly handled
+            # or if the prompt structure is slightly off for its training.
+            # A simple cleanup:
+            if unified_profile_json_str.startswith("PROJECT_STYLE_PROFILE_JSON_START:"):
+                unified_profile_json_str = unified_profile_json_str[len("PROJECT_STYLE_PROFILE_JSON_START:"):].strip()
+            if not unified_profile_json_str.startswith("{"): # If it's not JSON, something went wrong
+                print(f"Warning: DivoT5 output does not look like JSON: '{unified_profile_json_str[:200]}...'")
+                # Fallback or raise error
+        else:
+            print("Warning: DivoT5 model returned an empty or unexpected response.")
 
-    return mock_unified_profile.to_dict()
+    except Exception as e:
+        print(f"DivoT5 Unification: Error during model inference: {e}")
+        print("Falling back to basic mock aggregation.")
+        return unify_fingerprints_with_diffusion(per_sample_fingerprints, "mock_path_trigger_fallback", num_beams, max_output_length, device)
+
+    # Parse the output JSON string from DivoT5
+    try:
+        # Attempt to find a valid JSON block if there's surrounding text
+        json_match = re.search(r'\{.*\}', unified_profile_json_str, re.DOTALL)
+        if json_match:
+            unified_profile_json_str = json_match.group(0)
+
+        final_profile_dict = json.loads(unified_profile_json_str)
+
+        # Basic validation: check for a few key fields expected in UnifiedStyleProfile
+        # More detailed validation of values can be done by the caller or in a separate step.
+        expected_top_keys = ["indent_width", "preferred_quotes", "docstring_style", "max_line_length",
+                             "identifier_snake_case_pct", "identifier_camelCase_pct",
+                             "identifier_UPPER_SNAKE_CASE_pct", "directory_overrides"]
+        for key in expected_top_keys:
+            if key not in final_profile_dict:
+                print(f"Warning: DivoT5 output JSON missing expected key '{key}'. Output: {unified_profile_json_str[:500]}")
+                # Decide if this constitutes a failure or if partial data is acceptable
+                # For now, we proceed but this indicates an issue.
+
+        return final_profile_dict
+
+    except json.JSONDecodeError as e:
+        print(f"DivoT5 Unification: Failed to decode JSON from model output: {e}")
+        print(f"Model output was: '{unified_profile_json_str[:500]}...'") # Print snippet of problematic output
+        print("Falling back to basic mock aggregation.")
+        return unify_fingerprints_with_diffusion(per_sample_fingerprints, "mock_path_trigger_fallback", num_beams, max_output_length, device)
+
 
 if __name__ == '__main__':
     # Example usage:
     # Create some mock sample fingerprints (as if from the LLM interfacer)
-    mock_samples = [
-        {"indent": 4, "quotes": "single", "linelen": 88, "camel_pct": 0.1, "snake_pct": 0.9, "docstyle": "google", "has_type_hints": True, "spacing_around_operators": True},
-        {"indent": 4, "quotes": "single", "linelen": 88, "camel_pct": 0.15, "snake_pct": 0.8, "docstyle": "google", "has_type_hints": True, "spacing_around_operators": True},
-        {"indent": 2, "quotes": "double", "linelen": 79, "camel_pct": 0.5, "snake_pct": 0.4, "docstyle": "numpy", "has_type_hints": False, "spacing_around_operators": False},
-        {"indent": 4, "quotes": "single", "linelen": 90, "camel_pct": 0.2, "snake_pct": 0.75, "docstyle": "google", "has_type_hints": True, "spacing_around_operators": True},
-        {"indent": 4, "quotes": "double", "linelen": 88, "camel_pct": 0.05, "snake_pct": 0.9, "docstyle": "plain", "has_type_hints": None, "spacing_around_operators": True},
+    # Removed has_type_hints and spacing_around_operators from mock samples
+    # Updated structure for per_sample_fingerprints
+    mock_samples_with_paths = [
+        {"fingerprint": {"indent": 4, "quotes": "single", "linelen": 88, "docstyle": "google", "snake_pct":0.8, "camel_pct":0.1, "UPPER_SNAKE_CASE_pct":0.05}, "file_path": "src/module_a/file1.py"},
+        {"fingerprint": {"indent": 2, "quotes": "double", "linelen": 79, "docstyle": "numpy", "snake_pct":0.2, "camel_pct":0.7, "UPPER_SNAKE_CASE_pct":0.03}, "file_path": "src/legacy/file2.py"},
+        {"fingerprint": {"indent": 4, "quotes": "single", "linelen": 90, "docstyle": "google", "snake_pct":0.75, "camel_pct":0.15, "UPPER_SNAKE_CASE_pct":0.04}, "file_path": "src/module_a/file3.py"},
+        {"fingerprint": {"indent": 4, "quotes": "single", "linelen": 88, "docstyle": "google", "snake_pct":0.82, "camel_pct":0.10, "UPPER_SNAKE_CASE_pct":0.05}, "file_path": "src/module_b/file4.py"},
+        {"fingerprint": {"indent": 4, "quotes": "double", "linelen": 88, "docstyle": "plain", "snake_pct":0.88, "camel_pct":0.05, "UPPER_SNAKE_CASE_pct":0.02}, "file_path": "tests/test_file5.py"},
     ]  * 5 # Multiply to get more samples for averaging
 
     print("--- Mock Unified Profile from Diffusion Model ---")
