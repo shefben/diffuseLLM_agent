@@ -4,6 +4,7 @@ import random
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Union, Optional
 from dataclasses import dataclass
+import math # For floor
 
 # Add import for the new AI fingerprinting function
 from .llm_interfacer import get_ai_style_fingerprint_for_sample # Assuming relative import if in same package
@@ -19,6 +20,8 @@ class CodeSample:
     end_line: int
     ai_fingerprint: Optional[Dict[str, Any]] = None # To store the result from AI processing
     error_while_fingerprinting: Optional[str] = None # To store any error message
+    file_size_kb: Optional[float] = None  # New field
+    mod_timestamp: Optional[float] = None # New field
 
 class StyleSampler:
     def __init__(self,
@@ -72,9 +75,19 @@ class StyleSampler:
         docstrings (as snippets), and then gets an AI style fingerprint for each.
         """
         elements_in_file: List[CodeSample] = []
-        raw_code_elements_to_fingerprint: List[Tuple[str, str, str, int, int]] = [] # item_name, item_type, snippet, start, end
+        raw_code_elements_to_fingerprint: List[Tuple[str, str, str, int, int]] = []
+
+        file_metadata_collected = False
+        current_file_size_kb: Optional[float] = None
+        current_mod_timestamp: Optional[float] = None
 
         try:
+            # Collect file metadata once per file
+            file_stat = file_path.stat()
+            current_file_size_kb = round(file_stat.st_size / 1024.0, 2)
+            current_mod_timestamp = file_stat.st_mtime
+            file_metadata_collected = True
+
             with open(file_path, "r", encoding="utf-8") as f:
                 source_code = f.read()
 
@@ -125,16 +138,22 @@ class StyleSampler:
                         node_start_line, node_end_line
                     ))
 
+        except FileNotFoundError: # Should ideally be caught by discover_python_files, but defensive
+            print(f"Error: File {file_path} not found during element extraction.")
+            return []
         except SyntaxError:
             print(f"Syntax error in {file_path}, skipping AI fingerprinting for this file.")
-            return [] # No elements if file can't be parsed
+            return []
         except Exception as e:
             print(f"Could not process {file_path} for element extraction: {e}")
             return []
 
-        # Now, for each extracted raw code element, get its AI fingerprint
+        if not file_metadata_collected: # Should not happen if no exception before this point
+            print(f"Warning: File metadata not collected for {file_path}")
+
+
         for name, type_val, snippet, start, end in raw_code_elements_to_fingerprint:
-            print(f"StyleSampler: Getting AI fingerprint for {type_val} '{name}' in {file_path.name}...")
+            # AI fingerprinting call
             ai_fp_dict = None
             error_msg = None
             try:
@@ -147,25 +166,17 @@ class StyleSampler:
                     divot5_device=self.divot5_device,
                     divot5_num_denoising_steps=self.divot5_num_denoising_steps
                 )
-                # Optionally, check ai_fp_dict for 'validation_status' or 'error' keys
                 if ai_fp_dict.get("validation_status") != "passed":
                     error_msg = f"AI fingerprinting validation failed: {ai_fp_dict.get('validation_status')}, errors: {ai_fp_dict.get('validation_errors', ai_fp_dict.get('details'))}"
-                    print(f"Warning: {error_msg} for {type_val} '{name}'")
-                    # Decide if you want to keep the fingerprint dict even if validation failed
-                    # For now, we store it along with the error.
             except Exception as e_fp:
                 error_msg = f"Exception during AI fingerprinting: {e_fp}"
-                print(f"Error: {error_msg} for {type_val} '{name}'")
 
             elements_in_file.append(CodeSample(
-                file_path=file_path,
-                item_name=name,
-                item_type=type_val,
-                code_snippet=snippet, # Store original snippet
-                start_line=start,
-                end_line=end,
-                ai_fingerprint=ai_fp_dict,
-                error_while_fingerprinting=error_msg
+                file_path=file_path, item_name=name, item_type=type_val,
+                code_snippet=snippet, start_line=start, end_line=end,
+                ai_fingerprint=ai_fp_dict, error_while_fingerprinting=error_msg,
+                file_size_kb=current_file_size_kb, # Add collected metadata
+                mod_timestamp=current_mod_timestamp  # Add collected metadata
             ))
 
         return elements_in_file
@@ -194,28 +205,167 @@ class StyleSampler:
 
     def sample_elements(self) -> List[CodeSample]:
         """
-        Performs sampling of the collected code elements (which now include AI fingerprints).
-        Stratified sampling logic to be implemented later.
+        Performs stratified sampling of the collected code elements by directory.
+        Aims to make the sample representative of different sub-domains (folders).
         """
-        # Ensure elements are collected (this now does AI fingerprinting)
-        if not self._collected_elements: # If not pre-populated by calling collect_all_elements explicitly
+        if not self._collected_elements:
             self.collect_all_elements()
 
         if not self._collected_elements:
             print("StyleSampler: No elements available for sampling.")
             return []
 
-        # Filter out elements that had errors during fingerprinting if needed, or handle them
-        # For now, all collected elements (even with errors) are candidates for sampling.
-        # A consumer of these samples should check `error_while_fingerprinting` and `ai_fingerprint['validation_status']`.
+        total_elements_available = len(self._collected_elements)
 
-        if len(self._collected_elements) <= self.target_samples:
-            print(f"StyleSampler: Collected {len(self._collected_elements)} elements, which is <= target {self.target_samples}. Returning all.")
-            return self._collected_elements
-        else:
-            # Current: Random sampling. TODO: Implement stratified sampling.
-            print(f"StyleSampler: Collected {len(self._collected_elements)} elements. Randomly sampling {self.target_samples}.")
-            return random.sample(self._collected_elements, self.target_samples)
+        if total_elements_available == 0: # Should be caught by above, but defensive
+            return []
+
+        if total_elements_available <= self.target_samples:
+            print(f"StyleSampler: Collected {total_elements_available} elements, which is <= target {self.target_samples}. Returning all.")
+            return self._collected_elements[:] # Return a copy
+
+        # 1. Group elements by directory
+        elements_by_dir: Dict[Path, List[CodeSample]] = {}
+        for sample in self._collected_elements:
+            dir_path = sample.file_path.parent
+            if dir_path not in elements_by_dir:
+                elements_by_dir[dir_path] = []
+            elements_by_dir[dir_path].append(sample)
+
+        # Sort directories to make apportionment deterministic if fractions are equal later
+        sorted_dirs = sorted(elements_by_dir.keys(), key=lambda p: str(p))
+
+        # 2. Calculate initial proportional samples per directory (using floor)
+        #    and store fractional parts for tie-breaking/remainder distribution.
+
+        # Stores (directory_path, num_elements_in_dir, ideal_float_samples, fractional_part, current_int_samples)
+        dir_sample_info = []
+
+        # If target_samples is very small, e.g., less than num_dirs, ensure representation
+        # For now, simple proportional allocation. Refinements for min 1 sample per dir can be added.
+
+        calculated_total_ideal_samples = 0.0 # For sanity check, should be close to target_samples
+
+        for dir_path in sorted_dirs:
+            elements_in_dir = elements_by_dir[dir_path]
+            num_elements_in_dir = len(elements_in_dir)
+
+            # Ideal number of samples (float)
+            ideal_samples_float = (num_elements_in_dir / total_elements_available) * self.target_samples
+            calculated_total_ideal_samples += ideal_samples_float
+
+            # Initial integer allocation (floor)
+            current_int_samples = math.floor(ideal_samples_float)
+            fractional_part = ideal_samples_float - current_int_samples
+
+            # Cap at the number of available items in that directory
+            current_int_samples = min(current_int_samples, num_elements_in_dir)
+
+            dir_sample_info.append({
+                "path": dir_path,
+                "num_available": num_elements_in_dir,
+                "ideal_float": ideal_samples_float,
+                "fractional": fractional_part,
+                "current_samples": current_int_samples
+            })
+
+        # 3. Distribute remaining samples based on largest fractional parts
+        current_allocated_samples = sum(info["current_samples"] for info in dir_sample_info)
+        samples_remaining_to_allocate = self.target_samples - current_allocated_samples
+
+        # Sort directories by fractional part descending to prioritize allocation
+        # Add secondary sort key (e.g., num_available descending) for tie-breaking if fractions are same
+        dir_sample_info.sort(key=lambda x: (x["fractional"], x["num_available"]), reverse=True)
+
+        for i in range(samples_remaining_to_allocate):
+            allocated_this_round = False
+            for info in dir_sample_info: # Iterate through sorted list
+                if info["current_samples"] < info["num_available"]:
+                    info["current_samples"] += 1
+                    allocated_this_round = True
+                    # Re-sort or cycle through if one dir gets multiple remainders.
+                    # For simplicity, one pass then re-sort for next remainder.
+                    # Or, simply iterate and if a dir gets one, move to next for fairness in this round.
+                    # The current loop iterates up to samples_remaining_to_allocate times.
+                    # In each iteration, it finds the *next available* directory from the sorted list.
+                    # To ensure fairness, we should re-sort or pick strategically if one dir gets all remainders.
+                    # A simpler way for now: iterate through the sorted list once per remainder.
+                    break
+            if not allocated_this_round:
+                # This might happen if target_samples > total_elements_available,
+                # but that case is handled at the start.
+                # Or if all directories are at max capacity for their current_samples.
+                break # No more samples can be allocated.
+
+        # Recalculate current_allocated_samples after distributing remainders
+        current_allocated_samples = sum(info["current_samples"] for info in dir_sample_info)
+
+        # 4. Handle potential over/under-allocation due to multiple constraints or rounding edge cases
+        # This step aims to get exactly self.target_samples if possible
+        if current_allocated_samples != self.target_samples:
+            # If under-allocated (more common if initial current_samples were capped by num_available)
+            # and total elements allow, try to add more from largest available pools.
+            if current_allocated_samples < self.target_samples:
+                # Sort by num_available - current_samples (descending) to find where we can add more
+                dir_sample_info.sort(key=lambda x: (x["num_available"] - x["current_samples"]), reverse=True)
+                for i in range(self.target_samples - current_allocated_samples):
+                    added_in_final_pass = False
+                    for info in dir_sample_info:
+                        if info["current_samples"] < info["num_available"]:
+                            info["current_samples"] += 1
+                            added_in_final_pass = True
+                            break
+                    if not added_in_final_pass: break # Cannot add more
+
+            # If over-allocated (less common with floor + remainder, but possible if logic changes)
+            # Remove from smallest pools that have samples > 0 (or > 1 if min representation is 1)
+            elif current_allocated_samples > self.target_samples:
+                # Sort by current_samples (ascending, but non-zero)
+                dir_sample_info.sort(key=lambda x: (x["current_samples"] if x["current_samples"] > 0 else float('inf')))
+                for i in range(current_allocated_samples - self.target_samples):
+                    removed_in_final_pass = False
+                    for info in dir_sample_info:
+                        if info["current_samples"] > 0: # Don't go below 0
+                            # Could add logic here to not go below 1 if dir is non-empty and target allows
+                            info["current_samples"] -= 1
+                            removed_in_final_pass = True
+                            break
+                    if not removed_in_final_pass: break # Cannot remove more
+
+        # 5. Perform the actual sampling from each directory
+        final_selected_samples: List[CodeSample] = []
+        for info in dir_sample_info:
+            dir_path = info["path"]
+            num_to_sample_from_this_dir = info["current_samples"]
+
+            if num_to_sample_from_this_dir > 0:
+                dir_elements = elements_by_dir[dir_path]
+                # Ensure we don't try to sample more than available (should be handled by min() earlier)
+                actual_to_sample = min(num_to_sample_from_this_dir, len(dir_elements))
+
+                # random.sample requires k <= len(population)
+                if actual_to_sample > 0 :
+                     final_selected_samples.extend(random.sample(dir_elements, actual_to_sample))
+
+        # Final check on total count, can happen if target is high and many strata are small
+        # If still not enough, and total_elements_available > len(final_selected_samples),
+        # it implies some strata didn't get enough due to caps.
+        # This case should ideally be handled by the remainder distribution logic.
+        # If too many, truncate (though this should also be handled by adjustments).
+        if len(final_selected_samples) > self.target_samples:
+            # This indicates an issue in allocation logic if it happens when total_elements_available > target_samples
+            print(f"Warning: Stratified sampling resulted in {len(final_selected_samples)} samples, expected {self.target_samples}. Truncating.")
+            final_selected_samples = random.sample(final_selected_samples, self.target_samples) # Re-sample from the over-sampled set
+        elif len(final_selected_samples) < self.target_samples and total_elements_available > len(final_selected_samples):
+            # This indicates an issue in allocation or that all small strata were exhausted before target was met.
+            # Try to fill remaining from the overall pool of *unsampled* elements if any.
+            # This is a bit complex to do efficiently here. The current logic should try to avoid this.
+            print(f"Warning: Stratified sampling resulted in {len(final_selected_samples)} samples, less than target {self.target_samples} despite available elements. This may happen if all strata are small.")
+            # For now, we return what we have. A more sophisticated fill could be added.
+
+
+        print(f"StyleSampler: Stratified sampling complete. Selected {len(final_selected_samples)} elements out of {total_elements_available} from {len(elements_by_dir)} directories.")
+        return final_selected_samples
 
 if __name__ == '__main__':
     # This is a placeholder for where you'd import CodeSample if it's moved
