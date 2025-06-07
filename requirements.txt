@@ -1,3 +1,13 @@
 black
 ruff
 toml
+
+# For GGUF model interaction (e.g., DeepSeek)
+llama-cpp-python
+
+# For SafeTensor model interaction (e.g., DivoT5, T5-3B using Hugging Face)
+transformers
+safetensors
+accelerate
+torch
+sentencepiece
