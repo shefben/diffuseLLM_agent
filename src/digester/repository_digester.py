@@ -56,6 +56,7 @@ except ImportError:
 
 # NEW: Import from graph_structures
 from .graph_structures import CallGraph, ControlDependenceGraph, DataDependenceGraph, NodeID # NodeID might be a NewType
+from .signature_trie import SignatureTrie, generate_function_signature_string # NEW import
 # LibCST metadata providers for graph building
 from libcst.metadata import ParentNodeProvider, PositionProvider, QualifiedNameProvider, ScopeProvider
 
@@ -70,17 +71,67 @@ class ParsedFileResult:
     treesitter_has_errors: bool = False
     treesitter_error_message: Optional[str] = None
     type_info: Optional[Dict[str, Any]] = None
-    extracted_symbols: List[Dict[str, Any]] = field(default_factory=list) # NEW FIELD
+    extracted_symbols: List[Dict[str, Any]] = field(default_factory=list)
 
-class SymbolDocstringExtractorVisitor(ast.NodeVisitor):
-    def __init__(self, module_qname: str, file_path_str: str, source_code_lines: List[str]):
+class SymbolAndSignatureExtractorVisitor(ast.NodeVisitor): # Renamed
+    def __init__(self, module_qname: str, file_path_str: str,
+                 source_code_lines: List[str],
+                 type_info_map_for_resolver: Optional[Dict[str, str]],
+                 signature_trie_ref: SignatureTrie):
         self.module_qname: str = module_qname
         self.file_path_str: str = file_path_str
         self.source_code_lines: List[str] = source_code_lines
-        self.symbols: List[Dict[str, Any]] = []
-        self.current_class_name: Optional[str] = None
+        self.symbols_for_embedding: List[Dict[str, Any]] = [] # Renamed from self.symbols
+        self.current_class_name: Optional[str] = None # FQN of current class context
+        self.type_info_map_for_resolver = type_info_map_for_resolver if type_info_map_for_resolver else {}
+        self.signature_trie_ref = signature_trie_ref
 
-    def _get_node_source(self, node: ast.AST) -> str:
+    def _local_type_resolver(self, node: ast.AST, category_hint: str) -> Optional[str]:
+        # PyanalyzeTypeExtractionVisitor keys:
+        # - Variables: f"{name_of_variable}:{category_from_pyanalyze_visitor}:{node.lineno}:{node.col_offset}"
+        #   e.g., "x:variable_definition:1:0"
+        # - Parameters: f"{func_name}.{param_name}:parameter:{node.lineno}:{node.col_offset}"
+        #   e.g., "foo.a:parameter:1:8"
+        # - Return annotations: f"{func_name}.<return_annotation>:function_return_annotation_type:{node.lineno}:{node.col_offset}"
+        #   (node here is the annotation node itself, e.g. ast.Name(id='int'))
+
+        # category_hint from generate_function_signature_string is like:
+        # "func_name.param_name:parameter_posonly", "func_name.param_name:parameter",
+        # "func_name.*vararg_name:parameter_vararg_annotation", "func_name:return_annotation"
+
+        # Attempt to map category_hint to the key structure used by PyanalyzeTypeExtractionVisitor
+        key_name_part = category_hint.split(":")[0] # e.g., "func_name.param_name" or "func_name" for return
+        key_category_part = category_hint.split(":")[-1] # e.g., "parameter", "return_annotation"
+
+        # Adjust category for Pyanalyze's specific keys if needed based on PyanalyzeTypeExtractionVisitor
+        if key_category_part == "return_annotation":
+            # Pyanalyze uses "function_return_annotation" for the node,
+            # and "function_return_annotation_type" for the type string from dump_value
+            # Let's assume Pyanalyze stored type of node.returns with key like:
+            # "func_name.<return_annotation>:function_return_annotation_type:line:col"
+            # The node passed here IS node.returns.
+            # The category_hint "func_name:return_annotation" needs mapping.
+            # The PyanalyzeTypeExtractionVisitor uses:
+            # `self._add_type_info(node.returns, f"{node.name}.<return_annotation>", "function_return_annotation")`
+            # So, the key_name_part from category_hint (func_name) needs ".<return_annotation>" appended.
+            # And category becomes "function_return_annotation".
+            key_to_lookup = f"{key_name_part}.<return_annotation>:function_return_annotation:{node.lineno}:{node.col_offset}"
+        elif key_category_part.startswith("parameter"):
+            # PyanalyzeTypeExtractionVisitor uses:
+            # `self._add_type_info(arg_node, f"{node.name}.{arg_node.arg}", "parameter")`
+            # category_hint is "func_name.param_name:parameter..."
+            # So, key_name_part is "func_name.param_name", category is "parameter"
+            key_to_lookup = f"{key_name_part}:parameter:{node.lineno}:{node.col_offset}"
+        else: # Fallback or other types of hints not directly from Pyanalyze visitor
+            key_to_lookup = f"{key_name_part}:{key_category_part}:{node.lineno}:{node.col_offset}"
+
+
+        resolved_type = self.type_info_map_for_resolver.get(key_to_lookup)
+        # print(f"Resolver: node={type(node)}, hint='{category_hint}', lookup_key='{key_to_lookup}', result='{resolved_type}'")
+        return resolved_type
+
+
+    def _get_node_source(self, node: ast.AST) -> str: # As before
         if hasattr(ast, 'unparse'):
             try:
                 return ast.unparse(node)
@@ -95,91 +146,77 @@ class SymbolDocstringExtractorVisitor(ast.NodeVisitor):
                  return "\n".join(self.source_code_lines[start_line:end_line])
         return ""
 
-    def _add_symbol_and_docstring(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef], item_type_prefix: str):
+    def _process_func_or_method(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], item_type_prefix: str):
         base_fqn_parts = [self.module_qname]
-        if self.current_class_name: # This is for methods within a class
-            base_fqn_parts.append(self.current_class_name)
+        if self.current_class_name: base_fqn_parts.append(self.current_class_name)
         base_fqn_parts.append(node.name)
         fqn = ".".join(filter(None, base_fqn_parts))
 
         code_content = self._get_node_source(node)
-        self.symbols.append({
+        self.symbols_for_embedding.append({
             "fqn": fqn, "item_type": f"{item_type_prefix}_code", "content": code_content,
-            "file_path": self.file_path_str,
-            "start_line": node.lineno, "end_line": node.end_lineno if hasattr(node, 'end_lineno') else node.lineno
+            "file_path": self.file_path_str, "start_line": node.lineno,
+            "end_line": node.end_lineno if hasattr(node, 'end_lineno') and node.end_lineno is not None else node.lineno
         })
-
         docstring = ast.get_docstring(node, clean=False)
         if docstring:
-            docstring_node_start_line = node.lineno
-            docstring_node_end_line = node.lineno + len(docstring.splitlines()) -1
-            if node.body and isinstance(node.body[0], ast.Expr) and \
-               isinstance(node.body[0].value, (ast.Constant if hasattr(ast, 'Constant') else ast.Str)): # Constant for Py3.8+
-                doc_expr_node = node.body[0]
-                docstring_node_start_line = doc_expr_node.lineno
-                if hasattr(doc_expr_node, 'end_lineno') and doc_expr_node.end_lineno is not None:
-                     docstring_node_end_line = doc_expr_node.end_lineno
-                else:
-                     docstring_node_end_line = doc_expr_node.lineno + len(docstring.splitlines()) -1
-
-            self.symbols.append({
+            doc_node_start = node.lineno
+            doc_node_end = node.lineno
+            if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, (ast.Constant if hasattr(ast, 'Constant') else ast.Str)):
+                doc_expr_node = node.body[0]; doc_node_start = doc_expr_node.lineno
+                if hasattr(doc_expr_node, 'end_lineno') and doc_expr_node.end_lineno is not None: doc_node_end = doc_expr_node.end_lineno
+                else: doc_node_end = doc_expr_node.lineno + len(docstring.splitlines()) -1
+            else: # Fallback if docstring is present but not the first expr
+                doc_node_end = doc_node_start + len(docstring.splitlines()) - 1
+            self.symbols_for_embedding.append({
                 "fqn": fqn, "item_type": f"docstring_for_{item_type_prefix}", "content": docstring,
-                "file_path": self.file_path_str,
-                "start_line": docstring_node_start_line, "end_line": docstring_node_end_line
+                "file_path": self.file_path_str, "start_line": doc_node_start, "end_line": doc_node_end
             })
 
-    def visit_FunctionDef(self, node: ast.FunctionDef):
-        item_prefix = "method" if self.current_class_name else "function"
-        self._add_symbol_and_docstring(node, item_prefix)
-        # Do not call self.generic_visit(node) here if we don't want nested items to be processed
-        # by this simple _add_symbol_and_docstring. If nested items are classes/functions,
-        # their own visit_ClassDef/visit_FunctionDef will handle them with correct context.
-        # However, to allow processing of, e.g. a class defined inside a function, generic_visit is needed.
-        super().generic_visit(node)
+        signature_string = generate_function_signature_string(node, self._local_type_resolver)
+        self.signature_trie_ref.insert(signature_string, fqn)
 
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        self._process_func_or_method(node, "method" if self.current_class_name else "function")
+        super().generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        item_prefix = "method" if self.current_class_name else "function"
-        self._add_symbol_and_docstring(node, item_prefix)
+        self._process_func_or_method(node, "method" if self.current_class_name else "function")
         super().generic_visit(node)
 
-
     def visit_ClassDef(self, node: ast.ClassDef):
-        # Determine FQN for the class itself based on outer context
         outer_context_fqn_parts = [self.module_qname]
-        if self.current_class_name: # This class is nested
+        if self.current_class_name:
             outer_context_fqn_parts.append(self.current_class_name)
         outer_context_fqn_parts.append(node.name)
         class_fqn = ".".join(filter(None, outer_context_fqn_parts))
 
         class_code_content = self._get_node_source(node)
-        self.symbols.append({
+        self.symbols_for_embedding.append({
             "fqn": class_fqn, "item_type": "class_code", "content": class_code_content,
-            "file_path": self.file_path_str,
-            "start_line": node.lineno, "end_line": node.end_lineno if hasattr(node, 'end_lineno') else node.lineno
+            "file_path": self.file_path_str, "start_line": node.lineno,
+            "end_line": node.end_lineno if hasattr(node, 'end_lineno') and node.end_lineno is not None else node.lineno
         })
         class_docstring = ast.get_docstring(node, clean=False)
         if class_docstring:
-            doc_node_start = node.lineno; doc_node_end = node.lineno + len(class_docstring.splitlines()) -1
-            if node.body and isinstance(node.body[0], ast.Expr) and \
-               isinstance(node.body[0].value, (ast.Constant if hasattr(ast, 'Constant') else ast.Str)):
-                doc_expr_node_cls = node.body[0]
-                doc_node_start = doc_expr_node_cls.lineno
-                if hasattr(doc_expr_node_cls, 'end_lineno') and doc_expr_node_cls.end_lineno is not None:
-                    doc_node_end = doc_expr_node_cls.end_lineno
+            doc_node_start = node.lineno; doc_node_end = node.lineno
+            if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, (ast.Constant if hasattr(ast, 'Constant') else ast.Str)):
+                doc_expr_node_cls = node.body[0]; doc_node_start = doc_expr_node_cls.lineno
+                if hasattr(doc_expr_node_cls, 'end_lineno') and doc_expr_node_cls.end_lineno is not None: doc_node_end = doc_expr_node_cls.end_lineno
                 else: doc_node_end = doc_expr_node_cls.lineno + len(class_docstring.splitlines()) -1
-            self.symbols.append({
+            else: # Fallback if docstring is present but not the first expr
+                doc_node_end = doc_node_start + len(class_docstring.splitlines()) - 1
+            self.symbols_for_embedding.append({
                 "fqn": class_fqn, "item_type": "docstring_for_class", "content": class_docstring,
                 "file_path": self.file_path_str, "start_line": doc_node_start, "end_line": doc_node_end
             })
 
-        # Set context for methods defined within this class
-        original_current_class_name = self.current_class_name
-        self.current_class_name = class_fqn # Methods will use this fully qualified class name
+        original_outer_class_name_context = self.current_class_name
+        self.current_class_name = class_fqn
 
-        super().generic_visit(node) # Process nested functions/classes
+        super().generic_visit(node)
 
-        self.current_class_name = original_current_class_name # Restore context
+        self.current_class_name = original_outer_class_name_context
 
 
 class DataDependenceVisitor(ast.NodeVisitor):
@@ -709,6 +746,7 @@ class RepositoryDigester:
         self.project_call_graph: CallGraph = {}
         self.project_control_dependence_graph: ControlDependenceGraph = {}
         self.project_data_dependence_graph: DataDependenceGraph = defaultdict(set)
+        self.signature_trie = SignatureTrie() # NEW: Initialize SignatureTrie
 
         self.ts_parser: Optional[Parser] = None
         if Parser and get_language:
@@ -768,29 +806,37 @@ class RepositoryDigester:
         py_ast_module: ast.Module,
         module_qname: str,
         file_path: Path,
-        source_code_lines: List[str]
+        source_code_lines: List[str],
+        type_info: Optional[Dict[str, str]]
     ) -> List[Dict[str, Any]]:
 
-        visitor = SymbolDocstringExtractorVisitor(module_qname, str(file_path), source_code_lines)
+        visitor = SymbolAndSignatureExtractorVisitor( # Renamed and passing new args
+            module_qname, str(file_path), source_code_lines,
+            type_info,
+            self.signature_trie
+        )
         visitor.visit(py_ast_module)
 
-        module_docstring = ast.get_docstring(py_ast_module, clean=False)
-        if module_docstring:
-            start_line, end_line = 1, len(module_docstring.splitlines())
+        module_docstring_text = ast.get_docstring(py_ast_module, clean=False)
+        if module_docstring_text:
+            start_line, end_line = 1, 1
             if py_ast_module.body and isinstance(py_ast_module.body[0], ast.Expr) and \
                isinstance(py_ast_module.body[0].value, (ast.Constant if hasattr(ast, 'Constant') else ast.Str)):
                 doc_expr_node_mod = py_ast_module.body[0]
                 start_line = doc_expr_node_mod.lineno
                 if hasattr(doc_expr_node_mod, 'end_lineno') and doc_expr_node_mod.end_lineno is not None:
                     end_line = doc_expr_node_mod.end_lineno
-                else: end_line = doc_expr_node_mod.lineno + len(module_docstring.splitlines()) -1
+                else:
+                    end_line = doc_expr_node_mod.lineno + len(module_docstring_text.splitlines()) -1
+            else:
+                 end_line = start_line + len(module_docstring_text.splitlines()) -1
 
-            visitor.symbols.append({
-                "fqn": module_qname, "item_type": "docstring_for_module", "content": module_docstring,
+            visitor.symbols_for_embedding.append({ # Appending to renamed list
+                "fqn": module_qname, "item_type": "docstring_for_module", "content": module_docstring_text,
                 "file_path": str(file_path), "start_line": start_line, "end_line": end_line
             })
 
-        return visitor.symbols
+        return visitor.symbols_for_embedding
 
     @staticmethod
     def _get_module_qname_from_path(file_path: Path, project_root: Path) -> str:
@@ -892,9 +938,14 @@ class RepositoryDigester:
 
         if py_ast_module_for_symbols:
             module_qname = self._get_module_qname_from_path(file_path, self.repo_path)
+            type_info_for_resolver : Optional[Dict[str,str]] = None
+            if file_type_info and not file_type_info.get("error") and not file_type_info.get("info"):
+                type_info_for_resolver = file_type_info
+
             try:
                 extracted_symbols_list = self._extract_symbols_and_docstrings_from_ast(
-                    py_ast_module_for_symbols, module_qname, file_path, source_code_lines
+                    py_ast_module_for_symbols, module_qname, file_path, source_code_lines,
+                    type_info_for_resolver
                 )
             except Exception as e_sym_extract:
                  print(f"Error during symbol/docstring extraction for {file_path.name}: {e_sym_extract}")

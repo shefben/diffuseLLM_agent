@@ -11,7 +11,8 @@ import os # For os.pathsep
 # Adjust import path
 from src.digester.repository_digester import RepositoryDigester, ParsedFileResult, _create_ast_node_id
 from src.digester.graph_structures import NodeID, CallGraph, ControlDependenceGraph, DataDependenceGraph
-from typing import Dict, Set, Optional, Any # Ensure Any is imported for NumpyNdarray fallback
+from src.digester.signature_trie import generate_function_signature_string # For signature trie tests
+from typing import Dict, Set, Optional, Any, Callable # Ensure Any is imported for NumpyNdarray fallback
 import numpy as np
 
 # Import pyanalyze components for type checking mocks and patching globals
@@ -1008,6 +1009,117 @@ z = x        # Use of module x (depends on def1)
         self.mock_faiss_index_instance.add.assert_not_called()
         self.assertEqual(len(digester.faiss_id_to_metadata), 0)
         self.assertEqual(self.mock_faiss_index_instance.ntotal, 0)
+
+    # --- Tests for Signature Trie Population ---
+    def test_extract_symbols_populates_signature_trie(self):
+        """
+        Tests that _extract_symbols_and_docstrings_from_ast (when called, e.g., by parse_file)
+        correctly generates signatures and inserts them into the trie.
+        """
+        code = """
+def func_one(a: int, b: str) -> bool:
+    pass
+
+class MyClass:
+    def method_one(self, c: float) -> None:
+        pass
+"""
+        file_name = "sig_trie_test.py"
+        file_path = self._create_dummy_file(file_name, code)
+        module_qname = "sig_trie_test"
+
+        # Mock type_info that _extract_symbols_and_docstrings_from_ast's visitor would use
+        # Keys are based on SymbolAndSignatureExtractorVisitor._local_type_resolver's logic
+        # For parameters: "FunctionName.ParamName:parameter:Line:Col"
+        # For return: "FunctionName.<return_annotation>:function_return_annotation:Line:Col"
+        mock_type_info_for_resolver = {
+            f"func_one.a:parameter:2:{len('def func_one(')}": "int",
+            f"func_one.b:parameter:2:{len('def func_one(a: int, ')}": "str",
+            f"func_one.<return_annotation>:function_return_annotation:2:{len('def func_one(a: int, b: str) -> ')}": "bool",
+
+            f"MyClass.method_one.self:parameter:6:{len('    def method_one(')}": "sig_trie_test.MyClass",
+            f"MyClass.method_one.c:parameter:6:{len('    def method_one(self, ')}": "float",
+            f"MyClass.method_one.<return_annotation>:function_return_annotation:6:{len('    def method_one(self, c: float) -> ')}": "None",
+        }
+
+        py_ast_module = ast.parse(code)
+        source_code_lines = code.splitlines()
+
+        digester = RepositoryDigester(self.test_repo_root)
+
+        with patch.object(digester.signature_trie, 'insert') as mock_trie_insert:
+            # Note: _extract_symbols_and_docstrings_from_ast expects Dict[str,str] for type_info
+            # but PyanalyzeTypeExtractionVisitor produces Dict[str,Any] (can be error dicts).
+            # The logic in parse_file filters this. So, pass a correctly filtered map.
+            digester._extract_symbols_and_docstrings_from_ast(
+                py_ast_module, module_qname, file_path, source_code_lines, mock_type_info_for_resolver
+            )
+
+        self.assertGreaterEqual(mock_trie_insert.call_count, 2)
+
+        # Expected signature for func_one
+        func_one_node = py_ast_module.body[0]
+        # This local resolver mimics the one inside SymbolAndSignatureExtractorVisitor
+        def local_resolver(node: ast.AST, hint: str) -> Optional[str]:
+            key_name_part = hint.split(":")[0]
+            key_category_part = hint.split(":")[-1]
+            if key_category_part == "return_annotation":
+                key_to_lookup = f"{key_name_part}.<return_annotation>:function_return_annotation:{node.lineno}:{node.col_offset}"
+            elif key_category_part.startswith("parameter"):
+                key_to_lookup = f"{key_name_part}:parameter:{node.lineno}:{node.col_offset}"
+            else:
+                key_to_lookup = f"{key_name_part}:{key_category_part}:{node.lineno}:{node.col_offset}"
+            return mock_type_info_for_resolver.get(key_to_lookup)
+
+        expected_sig_func_one = generate_function_signature_string(func_one_node, local_resolver) # type: ignore
+        expected_fqn_func_one = f"{module_qname}.func_one"
+
+        class_node = py_ast_module.body[1]
+        method_one_node = class_node.body[0]
+        expected_sig_method_one = generate_function_signature_string(method_one_node, local_resolver) # type: ignore
+        expected_fqn_method_one = f"{module_qname}.MyClass.method_one"
+
+        mock_trie_insert.assert_any_call(expected_sig_func_one, expected_fqn_func_one)
+        mock_trie_insert.assert_any_call(expected_sig_method_one, expected_fqn_method_one)
+
+
+    @patch('src.digester.repository_digester.RepositoryDigester._infer_types_with_pyanalyze')
+    @patch('src.digester.repository_digester.RepositoryDigester._build_call_graph_for_file')
+    @patch('src.digester.repository_digester.RepositoryDigester._build_control_dependencies_for_file')
+    @patch('src.digester.repository_digester.RepositoryDigester._build_data_dependencies_for_file')
+    # No need to mock SymbolAndSignatureExtractorVisitor.visit, we mock trie.insert directly
+    def test_digest_repository_populates_signature_trie(
+            self, mock_ddg, mock_cdg, mock_cg, mock_infer_types):
+
+        code = "def main_func(p1: int) -> str: pass"
+        file_name = "main_for_trie.py"
+        file_path = self._create_dummy_file(file_name, code)
+        module_qname = "main_for_trie"
+
+        # Mock Pyanalyze to return type_info for the function
+        # Keys need to match what _local_type_resolver in SymbolAndSignatureExtractorVisitor expects
+        func_node_for_lines = ast.parse(code).body[0] # type: ignore
+        param_p1_node = func_node_for_lines.args.args[0]
+        return_node = func_node_for_lines.returns
+
+        mock_type_info = {
+            f"{module_qname}.main_func.p1:parameter:{param_p1_node.lineno}:{param_p1_node.col_offset}": "int",
+            f"{module_qname}.main_func.<return_annotation>:function_return_annotation:{return_node.lineno}:{return_node.col_offset}": "str"
+        }
+        mock_infer_types.return_value = mock_type_info
+
+        mock_ts_tree = MagicMock(); mock_ts_tree.root_node.has_error = False
+        self.mock_ts_parser_instance.parse.return_value = mock_ts_tree
+
+        digester = RepositoryDigester(self.test_repo_root)
+        # Mock the insert method of the trie instance that the digester created
+        digester.signature_trie.insert = MagicMock()
+
+        digester.digest_repository()
+
+        expected_signature = "main_func(int)->str"
+        expected_fqn = f"{module_qname}.main_func"
+        digester.signature_trie.insert.assert_called_once_with(expected_signature, expected_fqn)
 
 
 if __name__ == '__main__':
