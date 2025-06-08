@@ -8,6 +8,29 @@ import os
 import re # For CallGraphVisitor._resolve_callee_fqn
 from collections import defaultdict
 
+# SentenceTransformer and numpy imports
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None # type: ignore
+    print("Warning: sentence-transformers library not found. Embedding generation will be disabled.")
+
+try:
+    import numpy as np
+    NumpyNdarray = np.ndarray
+except ImportError:
+    np = None # type: ignore
+    NumpyNdarray = Any # Fallback type hint
+    print("Warning: numpy library not found. Embeddings may not work as expected.")
+
+# Add FAISS import
+try:
+    import faiss
+except ImportError:
+    faiss = None # type: ignore
+    print("Warning: faiss library not found. FAISS indexing will be disabled.")
+
+
 # Tree-sitter imports
 try:
     from tree_sitter import Parser, Language
@@ -47,6 +70,116 @@ class ParsedFileResult:
     treesitter_has_errors: bool = False
     treesitter_error_message: Optional[str] = None
     type_info: Optional[Dict[str, Any]] = None
+    extracted_symbols: List[Dict[str, Any]] = field(default_factory=list) # NEW FIELD
+
+class SymbolDocstringExtractorVisitor(ast.NodeVisitor):
+    def __init__(self, module_qname: str, file_path_str: str, source_code_lines: List[str]):
+        self.module_qname: str = module_qname
+        self.file_path_str: str = file_path_str
+        self.source_code_lines: List[str] = source_code_lines
+        self.symbols: List[Dict[str, Any]] = []
+        self.current_class_name: Optional[str] = None
+
+    def _get_node_source(self, node: ast.AST) -> str:
+        if hasattr(ast, 'unparse'):
+            try:
+                return ast.unparse(node)
+            except Exception:
+                pass
+
+        if hasattr(node, 'lineno') and hasattr(node, 'end_lineno') and node.end_lineno is not None: # Ensure end_lineno is not None
+            start_line = node.lineno -1
+            end_line = node.end_lineno # ast.get_source_segment uses end_lineno as exclusive for lines list
+
+            if 0 <= start_line < len(self.source_code_lines) and 0 <= end_line <= len(self.source_code_lines) and start_line < end_line:
+                 return "\n".join(self.source_code_lines[start_line:end_line])
+        return ""
+
+    def _add_symbol_and_docstring(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef], item_type_prefix: str):
+        base_fqn_parts = [self.module_qname]
+        if self.current_class_name: # This is for methods within a class
+            base_fqn_parts.append(self.current_class_name)
+        base_fqn_parts.append(node.name)
+        fqn = ".".join(filter(None, base_fqn_parts))
+
+        code_content = self._get_node_source(node)
+        self.symbols.append({
+            "fqn": fqn, "item_type": f"{item_type_prefix}_code", "content": code_content,
+            "file_path": self.file_path_str,
+            "start_line": node.lineno, "end_line": node.end_lineno if hasattr(node, 'end_lineno') else node.lineno
+        })
+
+        docstring = ast.get_docstring(node, clean=False)
+        if docstring:
+            docstring_node_start_line = node.lineno
+            docstring_node_end_line = node.lineno + len(docstring.splitlines()) -1
+            if node.body and isinstance(node.body[0], ast.Expr) and \
+               isinstance(node.body[0].value, (ast.Constant if hasattr(ast, 'Constant') else ast.Str)): # Constant for Py3.8+
+                doc_expr_node = node.body[0]
+                docstring_node_start_line = doc_expr_node.lineno
+                if hasattr(doc_expr_node, 'end_lineno') and doc_expr_node.end_lineno is not None:
+                     docstring_node_end_line = doc_expr_node.end_lineno
+                else:
+                     docstring_node_end_line = doc_expr_node.lineno + len(docstring.splitlines()) -1
+
+            self.symbols.append({
+                "fqn": fqn, "item_type": f"docstring_for_{item_type_prefix}", "content": docstring,
+                "file_path": self.file_path_str,
+                "start_line": docstring_node_start_line, "end_line": docstring_node_end_line
+            })
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        item_prefix = "method" if self.current_class_name else "function"
+        self._add_symbol_and_docstring(node, item_prefix)
+        # Do not call self.generic_visit(node) here if we don't want nested items to be processed
+        # by this simple _add_symbol_and_docstring. If nested items are classes/functions,
+        # their own visit_ClassDef/visit_FunctionDef will handle them with correct context.
+        # However, to allow processing of, e.g. a class defined inside a function, generic_visit is needed.
+        super().generic_visit(node)
+
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        item_prefix = "method" if self.current_class_name else "function"
+        self._add_symbol_and_docstring(node, item_prefix)
+        super().generic_visit(node)
+
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        # Determine FQN for the class itself based on outer context
+        outer_context_fqn_parts = [self.module_qname]
+        if self.current_class_name: # This class is nested
+            outer_context_fqn_parts.append(self.current_class_name)
+        outer_context_fqn_parts.append(node.name)
+        class_fqn = ".".join(filter(None, outer_context_fqn_parts))
+
+        class_code_content = self._get_node_source(node)
+        self.symbols.append({
+            "fqn": class_fqn, "item_type": "class_code", "content": class_code_content,
+            "file_path": self.file_path_str,
+            "start_line": node.lineno, "end_line": node.end_lineno if hasattr(node, 'end_lineno') else node.lineno
+        })
+        class_docstring = ast.get_docstring(node, clean=False)
+        if class_docstring:
+            doc_node_start = node.lineno; doc_node_end = node.lineno + len(class_docstring.splitlines()) -1
+            if node.body and isinstance(node.body[0], ast.Expr) and \
+               isinstance(node.body[0].value, (ast.Constant if hasattr(ast, 'Constant') else ast.Str)):
+                doc_expr_node_cls = node.body[0]
+                doc_node_start = doc_expr_node_cls.lineno
+                if hasattr(doc_expr_node_cls, 'end_lineno') and doc_expr_node_cls.end_lineno is not None:
+                    doc_node_end = doc_expr_node_cls.end_lineno
+                else: doc_node_end = doc_expr_node_cls.lineno + len(class_docstring.splitlines()) -1
+            self.symbols.append({
+                "fqn": class_fqn, "item_type": "docstring_for_class", "content": class_docstring,
+                "file_path": self.file_path_str, "start_line": doc_node_start, "end_line": doc_node_end
+            })
+
+        # Set context for methods defined within this class
+        original_current_class_name = self.current_class_name
+        self.current_class_name = class_fqn # Methods will use this fully qualified class name
+
+        super().generic_visit(node) # Process nested functions/classes
+
+        self.current_class_name = original_current_class_name # Restore context
 
 
 class DataDependenceVisitor(ast.NodeVisitor):
@@ -562,16 +695,20 @@ class CallGraphVisitor(cst.CSTVisitor):
                 self.project_call_graph.setdefault(caller_fqn, set()).add(callee_fqn)
 
 class RepositoryDigester:
-    def __init__(self, repo_path: Union[str, Path]):
+    def __init__(self,
+                 repo_path: Union[str, Path],
+                 embedding_model_name: str = 'all-MiniLM-L6-v2',
+                ):
         self.repo_path = Path(repo_path).resolve()
         if not self.repo_path.is_dir():
             raise ValueError(f"Repository path {self.repo_path} is not a valid directory.")
+
         self._all_py_files: List[Path] = []
         self.digested_files: Dict[Path, ParsedFileResult] = {}
 
         self.project_call_graph: CallGraph = {}
         self.project_control_dependence_graph: ControlDependenceGraph = {}
-        self.project_data_dependence_graph: DataDependenceGraph = defaultdict(set) # NEW
+        self.project_data_dependence_graph: DataDependenceGraph = defaultdict(set)
 
         self.ts_parser: Optional[Parser] = None
         if Parser and get_language:
@@ -586,13 +723,74 @@ class RepositoryDigester:
         self.pyanalyze_checker: Optional[Checker] = None
         if pyanalyze and Checker and Config and Options:
             try:
-                pyanalyze_options = Options(paths=[str(self.repo_path)]) # Corrected
-                pyanalyze_config = Config.from_options(pyanalyze_options) # Corrected
-                self.pyanalyze_checker = Checker(config=pyanalyze_config) # Corrected
+                pyanalyze_options = Options(paths=[str(self.repo_path)])
+                pyanalyze_config = Config.from_options(pyanalyze_options)
+                self.pyanalyze_checker = Checker(config=pyanalyze_config)
             except Exception as e: print(f"Warning: Failed to initialize Pyanalyze Checker: {e}."); self.pyanalyze_checker = None
-        elif not (pyanalyze and Checker and Config and Options): # Corrected
-             print("Warning: Pyanalyze library or its core components not found. Type inference disabled.") # Corrected
+        elif not (pyanalyze and Checker and Config and Options):
+             print("Warning: Pyanalyze library or its core components not found. Type inference disabled.")
              self.pyanalyze_checker = None
+
+        # Embedding model initialization
+        self.embedding_model: Optional[SentenceTransformer] = None
+        self.embedding_dimension: Optional[int] = None
+        if SentenceTransformer:
+            try:
+                print(f"RepositoryDigester: Initializing embedding model '{embedding_model_name}'...")
+                self.embedding_model = SentenceTransformer(embedding_model_name)
+                if self.embedding_model:
+                    self.embedding_dimension = self.embedding_model.get_sentence_embedding_dimension()
+                print(f"RepositoryDigester: Embedding model initialized. Dimension: {self.embedding_dimension}.")
+            except Exception as e:
+                print(f"Error initializing SentenceTransformer model '{embedding_model_name}': {e}")
+                self.embedding_model = None
+        else:
+            print("RepositoryDigester: sentence-transformers library not available. Embedding generation disabled.")
+
+        # NEW: Initialize FAISS Index
+        self.faiss_index: Optional[faiss.Index] = None # type: ignore
+        self.faiss_id_to_metadata: List[Dict[str, Any]] = []
+        if faiss and self.embedding_model and self.embedding_dimension:
+            try:
+                print(f"RepositoryDigester: Initializing FAISS IndexFlatL2 with dimension {self.embedding_dimension}...")
+                self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension)
+                print("RepositoryDigester: FAISS Index initialized.")
+            except Exception as e:
+                print(f"Error initializing FAISS index: {e}")
+                self.faiss_index = None
+        elif not faiss:
+            print("RepositoryDigester: faiss library not available. FAISS indexing disabled.")
+        elif not self.embedding_model or not self.embedding_dimension:
+            print("RepositoryDigester: Embedding model not available or dimension unknown. FAISS indexing disabled.")
+
+    def _extract_symbols_and_docstrings_from_ast(
+        self,
+        py_ast_module: ast.Module,
+        module_qname: str,
+        file_path: Path,
+        source_code_lines: List[str]
+    ) -> List[Dict[str, Any]]:
+
+        visitor = SymbolDocstringExtractorVisitor(module_qname, str(file_path), source_code_lines)
+        visitor.visit(py_ast_module)
+
+        module_docstring = ast.get_docstring(py_ast_module, clean=False)
+        if module_docstring:
+            start_line, end_line = 1, len(module_docstring.splitlines())
+            if py_ast_module.body and isinstance(py_ast_module.body[0], ast.Expr) and \
+               isinstance(py_ast_module.body[0].value, (ast.Constant if hasattr(ast, 'Constant') else ast.Str)):
+                doc_expr_node_mod = py_ast_module.body[0]
+                start_line = doc_expr_node_mod.lineno
+                if hasattr(doc_expr_node_mod, 'end_lineno') and doc_expr_node_mod.end_lineno is not None:
+                    end_line = doc_expr_node_mod.end_lineno
+                else: end_line = doc_expr_node_mod.lineno + len(module_docstring.splitlines()) -1
+
+            visitor.symbols.append({
+                "fqn": module_qname, "item_type": "docstring_for_module", "content": module_docstring,
+                "file_path": str(file_path), "start_line": start_line, "end_line": end_line
+            })
+
+        return visitor.symbols
 
     @staticmethod
     def _get_module_qname_from_path(file_path: Path, project_root: Path) -> str:
@@ -653,25 +851,65 @@ class RepositoryDigester:
         return type_info_map
 
     def parse_file(self, file_path: Path) -> ParsedFileResult:
-        source_code = ""; libcst_module_obj=None; libcst_error_str=None; treesitter_tree_obj=None; treesitter_errors_flag=False; treesitter_error_msg=None; file_type_info=None
+        source_code = ""
         try:
             with open(file_path, "r", encoding="utf-8") as f: source_code = f.read()
-        except Exception as e: return ParsedFileResult(file_path, "", libcst_error=f"FRE: {e}", treesitter_has_errors=True, treesitter_error_message=f"FRE: {e}", type_info={"error": f"FRE: {e}"})
+        except Exception as e:
+            return ParsedFileResult(file_path=file_path, source_code="",
+                                    libcst_error=f"File read error: {e}",
+                                    treesitter_has_errors=True, treesitter_error_message=f"File read error: {e}",
+                                    type_info={"error": f"File read error: {e}"}, extracted_symbols=[]) # Ensure new field is present
+
+        source_code_lines = source_code.splitlines()
+
+        libcst_module_obj: Optional[cst.Module] = None; libcst_error_str: Optional[str] = None
         try: libcst_module_obj = cst.parse_module(source_code)
-        except cst.ParserSyntaxError as e_cs: libcst_error_str = f"LCST PSE: {e_cs.message}"
-        except Exception as e_cg: libcst_error_str = f"LCST Err: {e_cg}" # type: ignore
+        except cst.ParserSyntaxError as e_cs: libcst_error_str = f"LibCST PSE: {e_cs.message}"
+        except Exception as e_cg: libcst_error_str = f"LibCST Err: {e_cg}"
+
+        treesitter_tree_obj: Optional[TreeSitterTree] = None; treesitter_errors_flag: bool = False; treesitter_error_msg: Optional[str] = None
         if self.ts_parser:
             try:
                 treesitter_tree_obj = self.ts_parser.parse(bytes(source_code, "utf8"))
                 if treesitter_tree_obj.root_node.has_error: treesitter_errors_flag=True; treesitter_error_msg="TS errors."
             except Exception as e_ts: treesitter_errors_flag=True; treesitter_error_msg = f"TS Ex: {e_ts}"
         else: treesitter_errors_flag=True; treesitter_error_msg = "TS not init."
-        if not libcst_error_str and source_code.strip():
+
+        file_type_info: Optional[Dict[str, Any]] = None
+        if not libcst_error_str and source_code.strip() :
             try: file_type_info = self._infer_types_with_pyanalyze(file_path, source_code)
             except Exception as e_ti: file_type_info = {"error": f"TypeInf Ex: {e_ti}"}
         elif not source_code.strip(): file_type_info = {"info": "TypeInf skip empty."}
-        else: file_type_info = {"info": "TypeInf skip LCST err."}
-        return ParsedFileResult(file_path,source_code,libcst_module_obj,treesitter_tree_obj,libcst_error_str,treesitter_errors_flag,treesitter_error_msg,file_type_info)
+        else: file_type_info = {"info": "TypeInf skip LCST/AST err."}
+
+        extracted_symbols_list: List[Dict[str, Any]] = []
+        py_ast_module_for_symbols: Optional[ast.Module] = None
+        try:
+            if source_code.strip():
+                py_ast_module_for_symbols = ast.parse(source_code, filename=str(file_path))
+        except SyntaxError as e_ast:
+            print(f"Warning: AST parsing for symbol extraction failed in {file_path.name}: {e_ast}")
+
+        if py_ast_module_for_symbols:
+            module_qname = self._get_module_qname_from_path(file_path, self.repo_path)
+            try:
+                extracted_symbols_list = self._extract_symbols_and_docstrings_from_ast(
+                    py_ast_module_for_symbols, module_qname, file_path, source_code_lines
+                )
+            except Exception as e_sym_extract:
+                 print(f"Error during symbol/docstring extraction for {file_path.name}: {e_sym_extract}")
+                 if isinstance(extracted_symbols_list, list): # Ensure it's a list before appending
+                    extracted_symbols_list.append({"error": f"Symbol extraction failed: {e_sym_extract}", "fqn": module_qname, "item_type":"error"})
+
+
+        return ParsedFileResult(
+            file_path=file_path, source_code=source_code,
+            libcst_module=libcst_module_obj, treesitter_tree=treesitter_tree_obj,
+            libcst_error=libcst_error_str,
+            treesitter_has_errors=treesitter_errors_flag, treesitter_error_message=treesitter_error_msg,
+            type_info=file_type_info,
+            extracted_symbols=extracted_symbols_list
+        )
 
     def _build_call_graph_for_file(self, file_path: Path, parsed_result: ParsedFileResult) -> None:
         if not parsed_result.libcst_module:
@@ -763,20 +1001,107 @@ class RepositoryDigester:
                 self._build_control_dependencies_for_file(py_file, parsed_result)
                 # For DDG, we need source_code that is ast-parsable.
                 # _build_data_dependencies_for_file handles its own ast.parse errors.
-                if parsed_result.source_code: # Check if there's source to attempt parsing for DDG
+                if parsed_result.source_code:
                     self._build_data_dependencies_for_file(py_file, parsed_result)
 
-        print(f"RepoDigester: Digestion complete. Processed files: {len(self.digested_files)}")
-        files_fully_ok_both_parsers = sum(1 for r in self.digested_files.values() if r.libcst_module and not r.libcst_error and r.treesitter_tree and not r.treesitter_has_errors) # Corrected
-        files_with_any_libcst_error = sum(1 for res in self.digested_files.values() if res.libcst_error) # Corrected
+        # --- NEW: Embedding Generation for all collected symbols ---
+        if self.embedding_model and np:
+            print("RepositoryDigester: Starting embedding generation...")
+            all_text_contents: List[str] = []
+            all_symbol_references: List[Dict[str, Any]] = []
+
+            for file_path_iter in self._all_py_files:
+                parsed_result_item = self.digested_files.get(file_path_iter)
+                if parsed_result_item and parsed_result_item.extracted_symbols:
+                    for symbol_dict in parsed_result_item.extracted_symbols:
+                        content = symbol_dict.get("content")
+                        if isinstance(content, str) and content.strip():
+                            all_text_contents.append(content)
+                            all_symbol_references.append(symbol_dict)
+
+            if all_text_contents:
+                print(f"RepositoryDigester: Generating embeddings for {len(all_text_contents)} text items...")
+                try:
+                    embeddings_np_array = self.embedding_model.encode(
+                        all_text_contents,
+                        show_progress_bar=False
+                    )
+                    print(f"RepositoryDigester: Generated {len(embeddings_np_array)} embeddings.")
+
+                    if len(embeddings_np_array) == len(all_symbol_references):
+                        for i, symbol_dict_ref in enumerate(all_symbol_references):
+                            symbol_dict_ref["embedding"] = embeddings_np_array[i]
+                    else:
+                        print("Warning: Mismatch between number of text items and generated embeddings. Embeddings not stored back.")
+
+                except Exception as e_embed:
+                    print(f"Error during embedding generation: {e_embed}")
+            else:
+                print("RepositoryDigester: No text content found to generate embeddings for.")
+        elif not self.embedding_model:
+            print("RepositoryDigester: Embedding model not available. Skipping embedding generation.")
+        elif not np:
+            print("RepositoryDigester: Numpy not available. Skipping embedding generation.")
+
+        # --- NEW: FAISS Index Population ---
+        if self.faiss_index is not None and np is not None:
+            print("RepositoryDigester: Populating FAISS index...")
+            embeddings_to_add_list: List[NumpyNdarray] = []
+            metadata_to_add_list: List[Dict[str, Any]] = []
+
+            for file_path_ordered in self._all_py_files:
+                parsed_result_item = self.digested_files.get(file_path_ordered)
+                if parsed_result_item and parsed_result_item.extracted_symbols:
+                    for symbol_dict in parsed_result_item.extracted_symbols:
+                        if "embedding" in symbol_dict and isinstance(symbol_dict["embedding"], np.ndarray):
+                            embeddings_to_add_list.append(symbol_dict["embedding"])
+                            metadata_to_add_list.append({
+                                "fqn": symbol_dict.get("fqn"),
+                                "item_type": symbol_dict.get("item_type"),
+                                "file_path": str(symbol_dict.get("file_path")),
+                                "start_line": symbol_dict.get("start_line"),
+                                "end_line": symbol_dict.get("end_line"),
+                            })
+
+            if embeddings_to_add_list:
+                try:
+                    embeddings_2d_array = np.vstack(embeddings_to_add_list)
+                    self.faiss_index.add(embeddings_2d_array.astype(np.float32))
+                    self.faiss_id_to_metadata.extend(metadata_to_add_list)
+                    print(f"RepositoryDigester: Added {self.faiss_index.ntotal} embeddings to FAISS index.")
+                except Exception as e_faiss:
+                    print(f"Error adding embeddings to FAISS index: {e_faiss}")
+            else:
+                print("RepositoryDigester: No embeddings found to add to FAISS index.")
+        elif not self.faiss_index:
+            print("RepositoryDigester: FAISS index not available. Skipping FAISS population.")
+        elif not np:
+            print("RepositoryDigester: Numpy not available. Skipping FAISS population.")
+
+        print(f"RepositoryDigester: Digestion complete. Processed files: {len(self.digested_files)}")
+        files_fully_ok_both_parsers = sum(1 for r in self.digested_files.values() if r.libcst_module and not r.libcst_error and r.treesitter_tree and not r.treesitter_has_errors)
+        files_with_any_libcst_error = sum(1 for res in self.digested_files.values() if res.libcst_error)
         files_with_any_treesitter_issue = sum(1 for res in self.digested_files.values() if res.treesitter_has_errors)
         files_with_type_info = sum(1 for res in self.digested_files.values() if res.type_info and not res.type_info.get("error") and not res.type_info.get("info"))
+
+        num_embedded_items = 0
+        if self.embedding_model:
+            for res in self.digested_files.values():
+                if res.extracted_symbols:
+                    for sym_dict in res.extracted_symbols:
+                        if "embedding" in sym_dict:
+                            num_embedded_items +=1
+
         print(f"  Total Python files found: {len(self._all_py_files)}")
         print(f"  Files for which parsing was attempted: {len(self.digested_files)}")
         print(f"  Files successfully parsed by LibCST & Tree-sitter (no errors): {files_fully_ok_both_parsers}")
         print(f"  Files with LibCST parsing errors: {files_with_any_libcst_error}")
         print(f"  Files with Tree-sitter parsing issues: {files_with_any_treesitter_issue}")
         print(f"  Files with some type info extracted: {files_with_type_info}")
+        print(f"  Total symbols/docstrings with embeddings: {num_embedded_items}")
+        if self.faiss_index:
+            print(f"  Total items in FAISS index: {self.faiss_index.ntotal}")
+
 
 if __name__ == '__main__':
     current_script_dir = Path(__file__).parent

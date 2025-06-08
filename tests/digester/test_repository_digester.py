@@ -11,7 +11,8 @@ import os # For os.pathsep
 # Adjust import path
 from src.digester.repository_digester import RepositoryDigester, ParsedFileResult, _create_ast_node_id
 from src.digester.graph_structures import NodeID, CallGraph, ControlDependenceGraph, DataDependenceGraph
-from typing import Dict, Set, Optional # Ensure these are available for type hints if CallGraph hint is expanded
+from typing import Dict, Set, Optional, Any # Ensure Any is imported for NumpyNdarray fallback
+import numpy as np
 
 # Import pyanalyze components for type checking mocks and patching globals
 import src.digester.repository_digester # To patch its global 'pyanalyze'
@@ -58,6 +59,31 @@ class TestRepositoryDigester(unittest.TestCase):
         self.patcher_pyanalyze_dump_value = patch('src.digester.repository_digester.pyanalyze_dump_value', self.mock_dump_value_func)
         self.MockPyanalyzeDumpValue_obj = self.patcher_pyanalyze_dump_value.start()
 
+        # Mocks for SentenceTransformer and FAISS
+        self.mock_embedding_model_instance = MagicMock()
+        self.mock_embedding_model_instance.get_sentence_embedding_dimension.return_value = 384
+        self.mock_embedding_model_instance.encode.return_value = [np.array([0.1, 0.2]), np.array([0.3, 0.4])]
+
+        self.patcher_sentence_transformer = patch('src.digester.repository_digester.SentenceTransformer', return_value=self.mock_embedding_model_instance)
+        self.MockSentenceTransformer = self.patcher_sentence_transformer.start()
+
+        self.mock_faiss_index_instance = MagicMock()
+        self.mock_faiss_index_instance.ntotal = 0
+        def faiss_add_side_effect(embeddings_array):
+            self.mock_faiss_index_instance.ntotal += len(embeddings_array)
+        self.mock_faiss_index_instance.add.side_effect = faiss_add_side_effect
+
+        # Patch where faiss.IndexFlatL2 is looked up
+        self.patcher_faiss_index_constructor = patch('src.digester.repository_digester.faiss.IndexFlatL2', return_value=self.mock_faiss_index_instance)
+        self.MockFaissIndexFlatL2 = self.patcher_faiss_index_constructor.start()
+
+        # Mock the faiss module itself if it's checked directly (e.g., 'if faiss:')
+        self.patcher_faiss_module = patch('src.digester.repository_digester.faiss', MagicMock(IndexFlatL2=self.MockFaissIndexFlatL2))
+        self.MockFaissModule_obj = self.patcher_faiss_module.start()
+
+        # Patch numpy if repository_digester.py imports it as 'np'
+        self.patcher_numpy_module = patch('src.digester.repository_digester.np', np)
+        self.MockNumpyModule_obj = self.patcher_numpy_module.start()
 
     def tearDown(self):
         shutil.rmtree(self.test_repo_root)
@@ -67,7 +93,10 @@ class TestRepositoryDigester(unittest.TestCase):
         self.patcher_pyanalyze_options.stop()
         self.patcher_pyanalyze_module.stop()
         self.patcher_pyanalyze_dump_value.stop()
-
+        self.patcher_sentence_transformer.stop()
+        self.patcher_faiss_index_constructor.stop()
+        self.patcher_faiss_module.stop()
+        self.patcher_numpy_module.stop()
 
     def _create_dummy_file(self, path_from_repo_root: str, content: str = ""):
         if Path(path_from_repo_root).is_absolute():
@@ -867,6 +896,119 @@ z = x        # Use of module x (depends on def1)
         self.assertEqual(len(digester.project_data_dependence_graph), 0)
         printed_output = "".join(str(c.args[0]) for c in mock_print.call_args_list if c.args)
         self.assertIn("SyntaxError parsing syntax_err_ddg.py with ast for data dependence", printed_output)
+
+    # --- Tests for Embedding and FAISS Initialization in __init__ ---
+    def test_init_embedding_model_and_faiss_success(self):
+        # Reset mocks that might have been called during RepositoryDigester instantiation in other tests' helpers
+        self.MockSentenceTransformer.reset_mock()
+        self.MockFaissIndexFlatL2.reset_mock()
+
+        digester = RepositoryDigester(self.test_repo_root, embedding_model_name="test-model")
+
+        self.MockSentenceTransformer.assert_called_once_with("test-model")
+        self.assertIsNotNone(digester.embedding_model)
+        self.assertEqual(digester.embedding_dimension, 384)
+        self.mock_embedding_model_instance.get_sentence_embedding_dimension.assert_called_once()
+        self.MockFaissIndexFlatL2.assert_called_once_with(384)
+        self.assertIsNotNone(digester.faiss_index)
+
+    @patch('src.digester.repository_digester.SentenceTransformer', None)
+    def test_init_sentence_transformer_not_available(self, mock_st_none):
+        # This test needs to ensure that the global SentenceTransformer symbol in repository_digester
+        # is None when __init__ is called.
+        with patch('builtins.print') as mock_print:
+            digester = RepositoryDigester(self.test_repo_root) # Re-instantiate to trigger __init__ with patch
+        self.assertIsNone(digester.embedding_model)
+        self.assertIsNone(digester.embedding_dimension)
+        self.assertIsNone(digester.faiss_index)
+        self.assertTrue(any("sentence-transformers library not available" in str(c.args) for c in mock_print.call_args_list))
+
+    @patch('src.digester.repository_digester.faiss', None)
+    def test_init_faiss_not_available(self, mock_faiss_none):
+        self.MockSentenceTransformer.reset_mock() # Ensure ST model loads
+        with patch('builtins.print') as mock_print:
+            digester = RepositoryDigester(self.test_repo_root) # Re-instantiate
+        self.assertIsNotNone(digester.embedding_model)
+        self.assertIsNone(digester.faiss_index)
+        self.assertTrue(any("faiss library not available" in str(c.args) for c in mock_print.call_args_list))
+
+    # --- Tests for Embedding Generation and FAISS population in digest_repository ---
+    @patch('src.digester.repository_digester.RepositoryDigester.parse_file')
+    def test_digest_repository_embedding_and_faiss_flow(self, mock_parse_file):
+        file1_path = self._create_dummy_file("file1_embed.py", "def f1(): pass")
+
+        symbol1_f1_code = {"fqn": "file1_embed.f1", "item_type": "function_code", "content": "def f1(): pass", "file_path": str(file1_path), "start_line":1, "end_line":1}
+        symbol2_f1_doc = {"fqn": "file1_embed.f1", "item_type": "docstring_for_function", "content": "doc for f1", "file_path": str(file1_path), "start_line":1, "end_line":1}
+
+        parsed_result_file1 = ParsedFileResult(
+            file_path=file1_path, source_code="def f1(): pass",
+            extracted_symbols=[symbol1_f1_code, symbol2_f1_doc],
+            libcst_module=MagicMock() # Needs a truthy LibCST module for graph builders to be called
+        )
+        mock_parse_file.return_value = parsed_result_file1
+
+        dummy_embedding_dim = 384 # Must match what get_sentence_embedding_dimension returns
+        dummy_embedding1 = np.random.rand(dummy_embedding_dim).astype(np.float32)
+        dummy_embedding2 = np.random.rand(dummy_embedding_dim).astype(np.float32)
+        self.mock_embedding_model_instance.encode.return_value = [dummy_embedding1, dummy_embedding2]
+
+        digester = RepositoryDigester(self.test_repo_root)
+        digester._all_py_files = [file1_path]
+
+        with patch('src.digester.repository_digester.np.vstack') as mock_vstack:
+            mock_vstack.return_value = np.array([dummy_embedding1, dummy_embedding2])
+            digester.digest_repository()
+
+        self.mock_embedding_model_instance.encode.assert_called_once_with(
+            ["def f1(): pass", "doc for f1"], show_progress_bar=False
+        )
+        self.assertIsNotNone(symbol1_f1_code.get("embedding"))
+        self.assertTrue(np.array_equal(symbol1_f1_code["embedding"], dummy_embedding1))
+        self.assertIsNotNone(symbol2_f1_doc.get("embedding"))
+        self.assertTrue(np.array_equal(symbol2_f1_doc["embedding"], dummy_embedding2))
+
+        mock_vstack.assert_called_once()
+        args_vstack, _ = mock_vstack.call_args
+        self.assertEqual(len(args_vstack[0]), 2)
+        self.assertTrue(np.array_equal(args_vstack[0][0], dummy_embedding1))
+
+        self.mock_faiss_index_instance.add.assert_called_once()
+        args_faiss_add, _ = self.mock_faiss_index_instance.add.call_args
+        self.assertTrue(isinstance(args_faiss_add[0], np.ndarray))
+        self.assertEqual(args_faiss_add[0].dtype, np.float32)
+        self.assertEqual(self.mock_faiss_index_instance.ntotal, 2)
+
+
+        self.assertEqual(len(digester.faiss_id_to_metadata), 2)
+        self.assertEqual(digester.faiss_id_to_metadata[0]["fqn"], "file1_embed.f1")
+        self.assertEqual(digester.faiss_id_to_metadata[0]["item_type"], "function_code")
+        self.assertEqual(digester.faiss_id_to_metadata[1]["fqn"], "file1_embed.f1")
+        self.assertEqual(digester.faiss_id_to_metadata[1]["item_type"], "docstring_for_function")
+
+    @patch('src.digester.repository_digester.RepositoryDigester.parse_file')
+    def test_digest_repository_no_embeddings_generated(self, mock_parse_file):
+        file1_path = self._create_dummy_file("file_no_embed_content.py", "def f1(): pass")
+        symbol1_f1_code = {"fqn": "file1.f1", "item_type": "function_code", "content": "  ", "file_path": str(file1_path)}
+        parsed_result_file1 = ParsedFileResult(
+            file_path=file1_path, source_code="def f1(): pass",
+            extracted_symbols=[symbol1_f1_code],
+            libcst_module=MagicMock() # For graph builders
+        )
+        mock_parse_file.return_value = parsed_result_file1
+
+        digester = RepositoryDigester(self.test_repo_root)
+        digester._all_py_files = [file1_path]
+
+        # Reset encode mock for this specific test as it might be called by other tests' __init__
+        self.mock_embedding_model_instance.encode = MagicMock()
+
+        digester.digest_repository()
+
+        self.mock_embedding_model_instance.encode.assert_not_called()
+        self.mock_faiss_index_instance.add.assert_not_called()
+        self.assertEqual(len(digester.faiss_id_to_metadata), 0)
+        self.assertEqual(self.mock_faiss_index_instance.ntotal, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

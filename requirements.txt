@@ -18,4 +18,10 @@ libcst
 # For Phase 2: Repository Digestion (Parsing & Type Inference)
 tree-sitter
 tree-sitter-python
-pyright
+pyright # Retained, though Pyanalyze is being used for type inference currently
+pyanalyze # For AST annotation and type inference
+
+# For Phase 2: Embeddings and FAISS Indexing
+numpy # Often a core dependency for ML/vector tasks, good to have explicitly
+sentence-transformers
+faiss-cpu
