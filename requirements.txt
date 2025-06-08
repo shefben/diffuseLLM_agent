@@ -28,3 +28,7 @@ faiss-cpu
 
 # For Phase 2: File System Watcher
 watchdog
+
+# For Phase 3 & 4: Spec/Plan Schemas and YAML processing
+pydantic
+PyYAML
