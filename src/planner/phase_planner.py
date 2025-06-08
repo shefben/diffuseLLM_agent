@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Union, Optional, TYPE_CHECKING, Type, Tuple,
 from pathlib import Path
 import json
 import hashlib
-import random # For dummy scorer
+import random # For dummy scorer and branch names
 
 # Forward references for type hints if full imports are problematic
 if TYPE_CHECKING:
@@ -15,7 +15,9 @@ if TYPE_CHECKING:
 from .spec_model import Spec
 from .phase_model import Phase
 from .refactor_grammar import BaseRefactorOperation, REFACTOR_OPERATION_INSTANCES
-from src.validator.validator import Validator # New import
+from src.validator.validator import Validator
+from src.builder.commit_builder import CommitBuilder # New import
+from src.agent_group.exceptions import PhaseFailure # New import
 
 # REFACTOR_OPERATION_CLASSES is not directly used by PhasePlanner logic, REFACTOR_OPERATION_INSTANCES is.
 
@@ -127,6 +129,10 @@ class PhasePlanner:
         self.validator_handle: Callable[[Optional[str], str, 'RepositoryDigester', Path], Tuple[bool, Optional[str]]] = self.validator.validate_patch
         self.score_style_handle: Callable[[Any, Dict[str, Any]], float] = PhasePlanner.mock_score_style_handle
         print("PhasePlanner: Validator handle set to actual validator. Mock style scorer configured.")
+
+        # Initialize CommitBuilder
+        self.commit_builder = CommitBuilder(config=None) # Pass config if available/needed
+        print("PhasePlanner: CommitBuilder instance initialized.")
 
         self.plan_cache: Dict[str, List[Phase]] = {}
         # self.phi2_scorer_cache: Dict[str, float] = {} # Optional cache
@@ -425,14 +431,114 @@ Score:"""
                     execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "error", "error_message": str(e)})
                     # Decide if planning should stop if a phase errors.
                     # For now, continue with other phases.
+                    # For this subtask, process only the first successful patch
+                    if validated_patch: # A patch script was successfully generated and (mock) validated by agent group
+                        print("\nPhasePlanner: Phase successful. Preparing for CommitBuilder integration.")
 
-            print("--- CollaborativeAgentGroup execution finished for all phases ---")
-            print("Execution Summary:")
-            for summary_item in execution_summary: # type: ignore
+                        # 1. Mock Patch Application & Create validated_patch_content_map
+                        if not phase_obj.target_file:
+                            print("PhasePlanner Warning: Phase target_file is None. Cannot proceed with CommitBuilder for this phase.")
+                            continue # Or handle as an error depending on expected behavior
+
+                        target_file_path = Path(phase_obj.target_file)
+                        # validated_patch is the LibCST script string.
+                        # In a real scenario, this script would be applied to the original content.
+                        # For this mock, we assume validated_patch IS the new full content.
+                        # This aligns with how validator's _apply_patch_script mock currently behaves
+                        # if we assume the script itself is the content to be validated.
+                        # This is a known simplification point.
+
+                        # If validated_patch is a script, we need to simulate its application.
+                        # Let's use the validator's _apply_patch_script for this simulation.
+                        original_content = self.digester.get_file_content(self.project_root_path / target_file_path)
+                        if original_content is None and not target_file_path.exists(): # New file scenario
+                            print(f"PhasePlanner: Original content for {target_file_path} not found, assuming new file for mock application.")
+                            original_content = ""
+
+                        if original_content is not None:
+                             # The validator's _apply_patch_script needs to be accessible or replicated here.
+                             # Or, we assume validated_patch is already the final content.
+                             # Let's assume validated_patch (script) IS the final content for simplicity here,
+                             # acknowledging this is a mock simplification.
+                             # If validated_patch is a script, it should be *applied* by a proper mechanism.
+                             # For now, let's pass the script itself as the content.
+                             # This means validator should have been validating the script string directly.
+
+                             # If CollaborativeAgentGroup returns the script, then this is the script.
+                             # If it's supposed to return applied content, then this is content.
+                             # Current return from agent_group.run is the script string.
+                             # So, for CommitBuilder, we need the *final content*.
+                             # We will use the validator's _apply_patch_script to *simulate* this.
+
+                            print(f"PhasePlanner: (Mock) Simulating application of patch script for {target_file_path}...")
+                            final_content_for_commit = self.validator._apply_patch_script(original_content, validated_patch) # type: ignore
+
+                            validated_patch_content_map = {target_file_path: final_content_for_commit}
+                            print(f"PhasePlanner: (Mock) Created validated_patch_content_map for {target_file_path}.")
+                        else:
+                            print(f"PhasePlanner Error: Could not get original content for {target_file_path} to simulate patch application.")
+                            continue
+
+
+                        # 2. Mock diff_summary
+                        # In a real scenario, this would come from comparing original_content and final_content_for_commit
+                        diff_summary = f"Mock diff summary for {target_file_path}: Applied agent-generated script."
+                        print(f"PhasePlanner: (Mock) Generated diff_summary: '{diff_summary}'.")
+
+                        # 3. Mock validator_results_summary
+                        validator_results_summary = "Mock validator results: All checks passed on final attempt by agent group."
+                        if self.agent_group.patch_history:
+                            try:
+                                last_attempt_info = self.agent_group.patch_history[-1] # (script, is_valid, score, error_traceback)
+                                last_error_tb = last_attempt_info[3] if len(last_attempt_info) > 3 else "N/A"
+                                validator_results_summary = f"Final validation in agent: Valid={last_attempt_info[1]}, Score={last_attempt_info[2]:.2f}, Last Error='{str(last_error_tb)[:50]}...'"
+                            except Exception as e_hist:
+                                print(f"PhasePlanner: Error accessing patch_history: {e_hist}")
+                                validator_results_summary = "Could not retrieve detailed validator summary from agent_group.patch_history."
+                        print(f"PhasePlanner: (Mock) Gathered validator_results_summary: '{validator_results_summary}'.")
+
+                        # 4. Define branch_name and commit_title
+                        # Ensure random is imported if not already: import random at the top of the file
+                        branch_name = f"feature/auto-patch-{spec.issue_description[:20].replace(' ', '-').lower()}-{random.randint(1000,9999)}"
+                        commit_title = f"Auto-apply patch for '{spec.issue_description[:40]}...'"
+                        print(f"PhasePlanner: Defined branch: '{branch_name}', title: '{commit_title}'.")
+
+                        # 5. Call CommitBuilder
+                        print("PhasePlanner: Calling CommitBuilder.process_and_submit_patch...")
+                        self.commit_builder.process_and_submit_patch(
+                            validated_patch_content_map=validated_patch_content_map,
+                            spec=spec,
+                            diff_summary=diff_summary,
+                            validator_results_summary=validator_results_summary,
+                            branch_name=branch_name,
+                            commit_title=commit_title,
+                            project_root=self.project_root_path
+                        )
+                        print("PhasePlanner: CommitBuilder call finished.")
+                        # For this subtask, break after processing the first successful patch
+                        print("PhasePlanner: Breaking after first successful phase patch submission (mock).")
+                        break
+                except PhaseFailure as pf_e:
+                    print(f"PhasePlanner: CollaborativeAgentGroup reported PhaseFailure for phase {phase_obj.operation_name}: {pf_e}")
+                    execution_summary.append({"phase": phase_obj.operation_name, "status": "PhaseFailure", "error": str(pf_e)})
+                    # Decide if we should stop the whole plan if one phase fails critically
+                    print("PhasePlanner: Stopping plan execution due to PhaseFailure.")
+                    break
+                except Exception as e:
+                    print(f"Error running agent group for phase {phase_obj.operation_name}: {type(e).__name__} - {e}")
+                    import traceback
+                    traceback.print_exc() # Print full traceback for debugging
+                    execution_summary.append({"phase": phase_obj.operation_name, "status": "error", "error_message": str(e)})
+                    # Optionally, break here:
+                    # print("Stopping further phase execution due to error.")
+                    # break
+
+            print("--- CollaborativeAgentGroup execution finished for all phases (or broke early) ---")
+            print("Execution Summary (from planner):")
+            for summary_item in execution_summary:
                 print(f"  - {summary_item}")
             # The method still returns the plan (List[Phase]).
             # The execution_summary is for logging/observation at this stage.
-            # Future: Might return a more complex object bundling plan and execution results.
         else:
             print("PhasePlanner: Failed to generate a plan (beam search returned empty).")
         return best_plan # Return the list of Phase objects as per original signature
