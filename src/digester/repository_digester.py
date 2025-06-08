@@ -1151,8 +1151,174 @@ class RepositoryDigester:
         print(f"  Files with some type info extracted: {files_with_type_info}")
         print(f"  Total symbols/docstrings with embeddings: {num_embedded_items}")
         if self.faiss_index:
+        if self.faiss_index:
             print(f"  Total items in FAISS index: {self.faiss_index.ntotal}")
 
+    # --- New Incremental Update Interface and Internal Methods ---
+
+    def _rebuild_full_faiss_index(self) -> None:
+        """Clears and rebuilds the FAISS index from all current digested_files embeddings."""
+        if not faiss or not self.embedding_model or not self.embedding_dimension or not np:
+            print("RepositoryDigester: FAISS or dependencies not available, skipping FAISS rebuild.")
+            self.faiss_index = None
+            self.faiss_id_to_metadata = []
+            return
+
+        print("RepositoryDigester: Rebuilding full FAISS index...")
+        # Reset FAISS index and metadata
+        try:
+            self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension)
+        except Exception as e_faiss_init:
+            print(f"Error re-initializing FAISS index: {e_faiss_init}")
+            self.faiss_index = None
+            self.faiss_id_to_metadata = []
+            return
+
+        self.faiss_id_to_metadata = []
+
+        all_embeddings_list: List[NumpyNdarray] = []
+        all_metadata_list: List[Dict[str, Any]] = []
+
+        for parsed_result in self.digested_files.values():
+            if parsed_result and parsed_result.extracted_symbols:
+                for symbol_dict in parsed_result.extracted_symbols:
+                    if "embedding" in symbol_dict and isinstance(symbol_dict["embedding"], np.ndarray):
+                        all_embeddings_list.append(symbol_dict["embedding"])
+                        all_metadata_list.append({
+                            "fqn": symbol_dict.get("fqn"),
+                            "item_type": symbol_dict.get("item_type"),
+                            "file_path": str(symbol_dict.get("file_path")),
+                            "start_line": symbol_dict.get("start_line"),
+                            "end_line": symbol_dict.get("end_line"),
+                        })
+
+        if all_embeddings_list and self.faiss_index is not None:
+            try:
+                embeddings_2d_array = np.vstack(all_embeddings_list).astype(np.float32)
+                self.faiss_index.add(embeddings_2d_array)
+                self.faiss_id_to_metadata = all_metadata_list
+                print(f"RepositoryDigester: FAISS index rebuilt with {self.faiss_index.ntotal} items.")
+            except Exception as e_rebuild:
+                print(f"Error rebuilding FAISS index: {e_rebuild}")
+                if self.embedding_dimension:
+                    self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension)
+                else:
+                    self.faiss_index = None
+                self.faiss_id_to_metadata = []
+        elif not all_embeddings_list:
+            print("RepositoryDigester: No embeddings found to rebuild FAISS index.")
+
+
+    def _clear_data_for_file(self, file_path: Path) -> None:
+        file_id_str_to_match = str(file_path.relative_to(self.repo_path)) if file_path.is_absolute() and self.repo_path.is_absolute() and self.repo_path in file_path.parents else file_path.name
+        print(f"RepositoryDigester: Clearing data for file: {file_id_str_to_match}")
+
+        old_parsed_result = self.digested_files.get(file_path)
+        if old_parsed_result and old_parsed_result.extracted_symbols and hasattr(self, 'signature_trie'):
+            # This part remains complex: requires knowing old signatures to delete from trie.
+            print(f"  SignatureTrie: Placeholder - Robust signature removal for {file_id_str_to_match} is complex and deferred.")
+            # Example logic:
+            # for symbol in old_parsed_result.extracted_symbols:
+            #     if symbol_is_function_like(symbol) and "signature_str" in symbol: # Assuming signature was stored
+            #         self.signature_trie.delete(symbol["signature_str"], symbol["fqn"])
+
+
+        graphs_to_clean = [
+            self.project_call_graph,
+            self.project_control_dependence_graph,
+            self.project_data_dependence_graph
+        ]
+        for graph in graphs_to_clean:
+            if not isinstance(graph, dict): continue
+            keys_to_delete = [k for k in graph.keys() if isinstance(k, str) and k.startswith(file_id_str_to_match + ":")]
+            for k_del in keys_to_delete:
+                del graph[k_del]
+            for k_remaining in list(graph.keys()):
+                if isinstance(graph[k_remaining], set):
+                    graph[k_remaining] = {val for val in graph[k_remaining] if not (isinstance(val, str) and val.startswith(file_id_str_to_match + ":"))}
+                    if not graph[k_remaining]:
+                        del graph[k_remaining]
+        print(f"  Graphs: Removed nodes and edges related to {file_id_str_to_match}.")
+
+        if file_path in self.digested_files:
+            del self.digested_files[file_path]
+            print(f"  Removed {file_id_str_to_match} from digested_files.")
+
+        print(f"RepositoryDigester: Data clearing for {file_id_str_to_match} completed (FAISS will be rebuilt after all changes).")
+
+
+    def _update_or_add_file(self, file_path: Path) -> None:
+        print(f"RepositoryDigester: Updating/Adding file: {file_path.name}")
+        self._clear_data_for_file(file_path)
+
+        parsed_result = self.parse_file(file_path)
+        self.digested_files[file_path] = parsed_result
+
+        if parsed_result.source_code and (parsed_result.libcst_module or parsed_result.treesitter_tree):
+            py_ast_for_graphs: Optional[ast.Module] = None
+            try:
+                if parsed_result.source_code.strip():
+                     py_ast_for_graphs = ast.parse(parsed_result.source_code, filename=str(file_path))
+            except SyntaxError:
+                print(f"Syntax error in {file_path.name} during update, skipping graph builds.")
+
+            if py_ast_for_graphs:
+                self._build_call_graph_for_file(file_path, parsed_result)
+                self._build_control_dependencies_for_file(file_path, parsed_result)
+                self._build_data_dependencies_for_file(file_path, parsed_result)
+
+        # Embeddings are generated during parse_file via _extract_symbols_and_docstrings_from_ast.
+        # Signature Trie is also populated during parse_file.
+        # FAISS index will be rebuilt after all file operations in a batch (e.g., by handle_file_event or a higher-level coordinator).
+        # For a single update, we trigger it here.
+        self._rebuild_full_faiss_index()
+
+        print(f"RepositoryDigester: Finished updating/adding {file_path.name}")
+
+
+    def _remove_file_data(self, file_path: Path) -> None:
+        print(f"RepositoryDigester: Removing data for deleted file: {file_path.name}")
+        self._clear_data_for_file(file_path)
+
+        if file_path in self._all_py_files:
+            try: self._all_py_files.remove(file_path)
+            except ValueError: pass
+
+        self._rebuild_full_faiss_index() # Rebuild FAISS after removal
+        print(f"RepositoryDigester: Finished removing data for {file_path.name}")
+
+
+    def handle_file_event(self, event_type: str, src_path: Path, dest_path: Optional[Path] = None) -> None:
+        print(f"RepositoryDigester: Received event: {event_type} on {src_path}" + (f" -> {dest_path}" if dest_path else ""))
+
+        abs_src_path = src_path.resolve()
+        abs_dest_path = dest_path.resolve() if dest_path else None
+
+        try:
+            abs_src_path.relative_to(self.repo_path)
+            if abs_dest_path: abs_dest_path.relative_to(self.repo_path)
+        except ValueError:
+            print(f"Warning: Event path {abs_src_path} (or {abs_dest_path}) is outside configured repo root {self.repo_path}. Ignoring.")
+            return
+
+        if event_type == "created":
+            if abs_src_path not in self._all_py_files: self._all_py_files.append(abs_src_path)
+            self._update_or_add_file(abs_src_path)
+        elif event_type == "modified":
+            # Ensure it's tracked if it was somehow missed (e.g. modified before initial scan completed)
+            if abs_src_path not in self._all_py_files: self._all_py_files.append(abs_src_path)
+            self._update_or_add_file(abs_src_path)
+        elif event_type == "deleted":
+            self._remove_file_data(abs_src_path)
+        elif event_type == "moved":
+            if abs_dest_path:
+                self._remove_file_data(abs_src_path)
+                if abs_dest_path not in self._all_py_files: self._all_py_files.append(abs_dest_path)
+                self._update_or_add_file(abs_dest_path)
+            else:
+                print(f"Warning: 'moved' event for {abs_src_path} missing destination path.")
+        else:
+            print(f"Warning: Unknown event type '{event_type}' for path {abs_src_path}.")
 
 if __name__ == '__main__':
     current_script_dir = Path(__file__).parent

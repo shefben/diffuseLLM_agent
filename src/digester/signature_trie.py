@@ -70,6 +70,22 @@ class SignatureTrie:
             node = node.children[char]
         return True # Prefix exists
 
+    def delete(self, signature_str: str, function_fqn: str) -> bool:
+        """
+        Deletes a specific function_fqn from the set associated with a signature_str.
+        Does not prune trie nodes even if function_fqns becomes empty.
+        """
+        node = self.root
+        for char in signature_str:
+            if char not in node.children:
+                return False # Signature string not found
+            node = node.children[char]
+
+        if function_fqn in node.function_fqns:
+            node.function_fqns.remove(function_fqn)
+            return True
+        return False # FQN not found for that signature
+
 def generate_function_signature_string(
     func_node: ast.FunctionDef,
     type_resolver: Callable[[ast.AST, str], Optional[str]],

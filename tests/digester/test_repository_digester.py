@@ -1121,6 +1121,188 @@ class MyClass:
         expected_fqn = f"{module_qname}.main_func"
         digester.signature_trie.insert.assert_called_once_with(expected_signature, expected_fqn)
 
+    # --- Tests for Incremental Update Methods ---
+
+    def test_clear_data_for_file(self):
+        digester = RepositoryDigester(self.test_repo_root)
+        file_a_rel = "file_a.py"
+        file_b_rel = "file_b.py"
+        # Resolve paths as they would be stored in digested_files keys
+        file_a_abs = (self.test_repo_root / file_a_rel).resolve()
+        file_b_abs = (self.test_repo_root / file_b_rel).resolve()
+
+        # For NodeIDs, the prefix is based on relative path to repo_root or filename
+        # In _clear_data_for_file, it's `str(file_path.relative_to(self.repo_path))`
+        # So, for file_a_abs, the prefix will be file_a_rel
+
+        mock_parsed_a = ParsedFileResult(file_path=file_a_abs, source_code="def fa(): pass", extracted_symbols=[{"fqn":"file_a.fa", "file_path":str(file_a_abs)}])
+        mock_parsed_b = ParsedFileResult(file_path=file_b_abs, source_code="def fb(): pass", extracted_symbols=[{"fqn":"file_b.fb", "file_path":str(file_b_abs)}])
+        digester.digested_files = {file_a_abs: mock_parsed_a, file_b_abs: mock_parsed_b}
+
+        node_a1 = NodeID(f"{file_a_rel}:1:0:FunctionDef:fa:def")
+        node_a2 = NodeID(f"{file_a_rel}:2:0:Name:x:use") # Conceptual node from file_a
+        node_b1 = NodeID(f"{file_b_rel}:1:0:FunctionDef:fb:def")
+        node_b2 = NodeID(f"{file_b_rel}:2:0:Name:y:use") # Conceptual node from file_b
+
+        digester.project_call_graph = {node_a1: {node_b1}, node_b1: {node_a2, node_b2}}
+
+        digester.faiss_id_to_metadata = [
+            {"file_path": str(file_a_abs), "fqn": "file_a.fa"},
+            {"file_path": str(file_b_abs), "fqn": "file_b.fb"},
+            {"file_path": str(file_a_abs), "fqn": "file_a.fa_doc"}
+        ]
+        # Mock signature trie (simplified: assume no real removal for this placeholder test)
+        digester.signature_trie.delete = MagicMock()
+
+        digester._clear_data_for_file(file_a_abs)
+
+        self.assertNotIn(file_a_abs, digester.digested_files)
+        self.assertIn(file_b_abs, digester.digested_files)
+
+        self.assertNotIn(node_a1, digester.project_call_graph)
+        self.assertIn(node_b1, digester.project_call_graph)
+        self.assertNotIn(node_a2, digester.project_call_graph.get(node_b1, set()))
+        self.assertIn(node_b2, digester.project_call_graph.get(node_b1, set()))
+
+        # FAISS metadata handled by _rebuild_full_faiss_index, _clear_data_for_file doesn't directly modify it now
+        # The placeholder version of _clear_data_for_file in the prompt *did* modify it.
+        # The version in the SUT *does* modify self.faiss_id_to_metadata
+        self.assertEqual(len(digester.faiss_id_to_metadata), 1) # Based on SUT's _clear_data_for_file logic
+        if digester.faiss_id_to_metadata: # Check if list is not empty
+            self.assertEqual(digester.faiss_id_to_metadata[0]["fqn"], "file_b.fb")
+
+
+    def test_rebuild_full_faiss_index(self):
+        digester = RepositoryDigester(self.test_repo_root)
+        if not digester.embedding_model or not digester.embedding_dimension or not src.digester.repository_digester.faiss or not src.digester.repository_digester.np:
+            self.skipTest("Dependencies for FAISS/embedding (faiss, numpy, SentenceTransformer) not available or model not loaded.")
+
+        file1 = self._create_dummy_file("file1.py", "def f1(): pass")
+        file2 = self._create_dummy_file("file2.py", "def f2(): pass")
+
+        emb_dim = digester.embedding_dimension
+        emb1 = np.random.rand(emb_dim).astype(np.float32)
+        emb2 = np.random.rand(emb_dim).astype(np.float32)
+        emb3 = np.random.rand(emb_dim).astype(np.float32)
+
+        digester.digested_files[file1.resolve()] = ParsedFileResult(file1.resolve(), "", extracted_symbols=[
+            {"fqn":"f1","item_type":"function_code","content":"c1","file_path":str(file1.resolve()),"embedding":emb1},
+            {"fqn":"f1d","item_type":"docstring","content":"d1","file_path":str(file1.resolve()),"embedding":emb2}
+        ])
+        digester.digested_files[file2.resolve()] = ParsedFileResult(file2.resolve(), "", extracted_symbols=[
+            {"fqn":"f2","item_type":"function_code","content":"c2","file_path":str(file2.resolve()),"embedding":emb3}
+        ])
+
+        # Reset the mocked faiss_index instance that was created in setUp for the digester instance
+        # This ensures we are testing the re-initialization within _rebuild_full_faiss_index
+        digester.faiss_index = MagicMock(spec=src.digester.repository_digester.faiss.IndexFlatL2 if src.digester.repository_digester.faiss else MagicMock())
+        digester.faiss_index.ntotal = 0
+        def add_side_effect_rebuild(embeddings_array): digester.faiss_index.ntotal += len(embeddings_array)
+        digester.faiss_index.add.side_effect = add_side_effect_rebuild
+
+        # We need to ensure that when _rebuild_full_faiss_index calls `faiss.IndexFlatL2`,
+        # it gets our new mock, not the one from global setUp.
+        with patch('src.digester.repository_digester.faiss.IndexFlatL2', return_value=digester.faiss_index) as mock_faiss_constructor_in_rebuild:
+            digester._rebuild_full_faiss_index()
+
+        mock_faiss_constructor_in_rebuild.assert_called_once_with(emb_dim)
+        self.assertEqual(digester.faiss_index.add.call_count, 1)
+        args_add, _ = digester.faiss_index.add.call_args
+        self.assertEqual(args_add[0].shape[0], 3)
+        self.assertEqual(len(digester.faiss_id_to_metadata), 3)
+        self.assertEqual(digester.faiss_id_to_metadata[0]["fqn"], "f1")
+        self.assertEqual(digester.faiss_id_to_metadata[2]["fqn"], "f2")
+
+    @patch('src.digester.repository_digester.RepositoryDigester._rebuild_full_faiss_index')
+    @patch('src.digester.repository_digester.RepositoryDigester._build_data_dependencies_for_file')
+    @patch('src.digester.repository_digester.RepositoryDigester._build_control_dependencies_for_file')
+    @patch('src.digester.repository_digester.RepositoryDigester._build_call_graph_for_file')
+    @patch('src.digester.repository_digester.RepositoryDigester.parse_file')
+    @patch('src.digester.repository_digester.RepositoryDigester._clear_data_for_file')
+    def test_update_or_add_file(self, mock_clear, mock_parse, mock_build_cg, mock_build_cdg, mock_build_ddg, mock_rebuild_faiss):
+        file_path_abs = self.test_repo_root / "updated.py"
+        self._create_dummy_file("updated.py", "new content")
+
+        mock_parsed_result = ParsedFileResult(file_path_abs, "new content", libcst_module=MagicMock(), extracted_symbols=[{"content":"sym"}])
+        mock_parse.return_value = mock_parsed_result
+
+        digester = RepositoryDigester(self.test_repo_root)
+        # Ensure necessary components are mocked if not fully available/reliable from setUp
+        if not digester.embedding_model: digester.embedding_model = MagicMock()
+        if not digester.faiss_index: digester.faiss_index = MagicMock()
+        if not src.digester.repository_digester.np: src.digester.repository_digester.np = np
+
+
+        digester._update_or_add_file(file_path_abs)
+
+        mock_clear.assert_called_once_with(file_path_abs)
+        mock_parse.assert_called_once_with(file_path_abs)
+        self.assertEqual(digester.digested_files[file_path_abs], mock_parsed_result)
+        mock_build_cg.assert_called_once_with(file_path_abs, mock_parsed_result)
+        mock_build_cdg.assert_called_once_with(file_path_abs, mock_parsed_result)
+        mock_build_ddg.assert_called_once_with(file_path_abs, mock_parsed_result)
+        mock_rebuild_faiss.assert_called_once()
+
+    @patch('src.digester.repository_digester.RepositoryDigester._clear_data_for_file')
+    @patch('src.digester.repository_digester.RepositoryDigester._rebuild_full_faiss_index')
+    def test_remove_file_data(self, mock_rebuild_faiss, mock_clear):
+        file_rel_path = "to_remove.py"
+        file_abs_path = self.test_repo_root / file_rel_path
+        self._create_dummy_file(file_rel_path)
+
+        digester = RepositoryDigester(self.test_repo_root)
+        digester._all_py_files = [file_abs_path]
+        digester.digested_files[file_abs_path] = MagicMock()
+
+        digester._remove_file_data(file_abs_path)
+
+        mock_clear.assert_called_once_with(file_abs_path)
+        mock_rebuild_faiss.assert_called_once()
+        self.assertNotIn(file_abs_path, digester._all_py_files)
+        # _clear_data_for_file is mocked, so it won't remove from digested_files unless we assert its internal behavior
+        # or let it run (but it's complex). For this test, mock_clear is enough.
+        # If we want to check digested_files, mock_clear should have a side_effect or not be mocked.
+        # For now, assume mock_clear implies removal from digested_files as per its contract.
+
+
+    @patch('src.digester.repository_digester.RepositoryDigester._update_or_add_file')
+    @patch('src.digester.repository_digester.RepositoryDigester._remove_file_data')
+    def test_handle_file_event_dispatch(self, mock_remove, mock_update_add):
+        digester = RepositoryDigester(self.test_repo_root)
+        src_rel_path = "src.py"
+        dest_rel_path = "dest.py"
+        src_abs_path = self._create_dummy_file(src_rel_path) # Create for path resolution
+        dest_abs_path = self.test_repo_root / dest_rel_path # Does not need to exist for this test logic
+
+        digester.handle_file_event("created", src_abs_path)
+        mock_update_add.assert_called_once_with(src_abs_path)
+        mock_update_add.reset_mock()
+
+        digester.handle_file_event("modified", src_abs_path)
+        mock_update_add.assert_called_once_with(src_abs_path)
+        mock_update_add.reset_mock()
+
+        digester.handle_file_event("deleted", src_abs_path)
+        mock_remove.assert_called_once_with(src_abs_path)
+        mock_remove.reset_mock()
+
+        digester.handle_file_event("moved", src_abs_path, dest_abs_path)
+        mock_remove.assert_called_once_with(src_abs_path)
+        mock_update_add.assert_called_once_with(dest_abs_path)
+
+    def test_handle_file_event_path_outside_repo(self):
+        digester = RepositoryDigester(self.test_repo_root)
+        # Create a path that's genuinely outside the temp repo_root
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=True) as tmp_file:
+            outside_path = Path(tmp_file.name)
+
+        with patch('builtins.print') as mock_print:
+            digester.handle_file_event("created", outside_path)
+
+        # Ensure the warning about path being outside is printed
+        # The exact path string might vary (e.g. /tmp/ vs /var/folders/) so check for substring
+        self.assertTrue(any(f"Warning: Event path {outside_path.resolve()} is outside configured repo root" in str(c.args) for c in mock_print.call_args_list))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -25,3 +25,6 @@ pyanalyze # For AST annotation and type inference
 numpy # Often a core dependency for ML/vector tasks, good to have explicitly
 sentence-transformers
 faiss-cpu
+
+# For Phase 2: File System Watcher
+watchdog
