@@ -1372,6 +1372,36 @@ class RepositoryDigester:
             "info": "Mock PDG slice relevant to the phase context."
         }
 
+    def get_file_content(self, file_path: Path) -> Optional[str]:
+        """
+        Retrieves the source code of a file if it has been digested.
+        Args:
+            file_path: The absolute path to the file.
+        Returns:
+            The source code as a string, or None if the file is not found or not digested.
+        """
+        # Ensure file_path is absolute, matching keys in self.digested_files if they are absolute
+        abs_file_path = file_path.resolve()
+
+        # Check if this path (or its string representation if keys are strings) is in digested_files
+        # The keys in self.digested_files are Path objects from self.repo_path.rglob("*.py")
+        # which should be absolute after .resolve() during discover_python_files.
+
+        parsed_result = self.digested_files.get(abs_file_path)
+        if parsed_result:
+            return parsed_result.source_code
+        else:
+            # Fallback: try to match by comparing string representations if Path objects don't match directly
+            # (e.g. due to symlinks or slight path differences not caught by resolve)
+            # This is less ideal but can be a fallback.
+            str_file_path = str(abs_file_path)
+            for path_key, result_val in self.digested_files.items():
+                if str(path_key) == str_file_path:
+                    return result_val.source_code
+
+            print(f"RepositoryDigester Warning: File content not found for {abs_file_path}. It might not be a tracked Python file or wasn't digested.")
+            return None
+
 
 if __name__ == '__main__':
     current_script_dir = Path(__file__).parent

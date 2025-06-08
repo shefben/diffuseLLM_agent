@@ -9,6 +9,7 @@ from .diffusion_core import DiffusionCore
 if TYPE_CHECKING:
     from src.planner.phase_model import Phase
     from src.digester.repository_digester import RepositoryDigester
+    from src.validator.validator import Validator # For type hinting
     # Define Path from pathlib for type hinting if not already globally available
     # from pathlib import Path
 
@@ -16,36 +17,39 @@ class CollaborativeAgentGroup:
     def __init__(self,
                  style_profile: Dict[str, Any],
                  naming_conventions_db_path: Path,
+                 validator_instance: 'Validator', # New parameter
                  llm_core_config: Optional[Dict[str, Any]] = None,
                  diffusion_core_config: Optional[Dict[str, Any]] = None,
-                 llm_model_path: Optional[str] = None # New parameter for LLMCore
+                 llm_model_path: Optional[str] = None
                  ):
         """
         Initializes the CollaborativeAgentGroup.
         Args:
             style_profile: Dictionary containing style profile information.
             naming_conventions_db_path: Path to the naming conventions database.
+            validator_instance: An instance of the Validator class.
             llm_core_config: Optional configuration for LLMCore.
             diffusion_core_config: Optional configuration for DiffusionCore.
             llm_model_path: Optional path to GGUF model for LLMCore repairs.
         """
         self.style_profile = style_profile
         self.naming_conventions_db_path = naming_conventions_db_path
-        self.max_repair_attempts = 3 # Define max_repair_attempts for the loop
+        self.validator = validator_instance # Store the validator instance
+        self.max_repair_attempts = 3
 
         # Initialize Core Agents
         self.llm_agent = LLMCore(
             style_profile=self.style_profile,
             naming_conventions_db_path=self.naming_conventions_db_path,
             config=llm_core_config,
-            llm_model_path=llm_model_path # Pass to LLMCore
+            llm_model_path=llm_model_path
         )
         self.diffusion_agent = DiffusionCore(
             style_profile=self.style_profile,
             config=diffusion_core_config
         )
 
-        self.current_patch_candidate: Optional[Any] = None # Will hold the script string during iteration
+        self.current_patch_candidate: Optional[Any] = None
         self.patch_history: list = [] # To store (script, validation_result, score, error) tuples
         self._current_run_context_data: Optional[Dict[str, Any]] = None # For preview context
 
@@ -285,32 +289,91 @@ class CollaborativeAgentGroup:
                     context_data_for_repair = context_data.copy()
                     context_data_for_repair['current_patch_candidate_DEBUG'] = self.current_patch_candidate # Add the failing script for LLM to see
 
-                    llm_proposed_fix_script = self.llm_agent.propose_repair_diff(error_traceback, context_data_for_repair)
+                    target_file_str = context_data.get("phase_target_file")
 
-                    if llm_proposed_fix_script:
-                        print(f"LLMCore proposed a fix script (len: {len(llm_proposed_fix_script)}).")
-                        # Now, pass this proposed fix to DiffusionCore for potential "re-denoising" or merging.
-                        # self.current_patch_candidate is the script that just failed (and was polished before failing).
-                        # llm_proposed_fix_script is the new script from LLM.
-                        print("Loop Step E (Diffusion Re-Denoise/Merge): Processing LLM's proposed fix script.")
-                        merged_fixed_script = self.diffusion_agent.re_denoise_spans(
-                            failed_patch_script=self.current_patch_candidate, # The one that failed validation
-                            proposed_fix_script=llm_proposed_fix_script,
-                            context_data=context_data_for_repair # Pass relevant context
+                    # --- Attempt Heuristic Fixes (New Step before LLM repair) ---
+                    heuristically_fixed_script: Optional[str] = None
+                    if target_file_str and error_traceback: # Ensure necessary info is available
+                        print("Loop Step D.1 (Heuristic Fix Attempt): Attempting heuristic fixes via Validator.")
+                        heuristically_fixed_script = self.validator.attempt_heuristic_fixes(
+                            error_traceback,
+                            self.current_patch_candidate, # The script that just failed (after polish)
+                            target_file_str
                         )
 
-                        if merged_fixed_script:
-                            print(f"DiffusionCore processed the fix. Resulting script len: {len(merged_fixed_script)}.")
-                            self.current_patch_candidate = merged_fixed_script # This becomes the candidate for the next iteration's duplicate guard/validation/polish.
+                    if heuristically_fixed_script:
+                        print("CollaborativeAgentGroup: Validator proposed a heuristic fix. Applying and re-validating.")
+                        self.current_patch_candidate = heuristically_fixed_script
+                        # Record this heuristic attempt and re-validation result
+                        # For simplicity in this step, we'll re-validate and then the main loop's logic will handle it.
+                        # A more granular history might distinguish this.
+                        # Re-validate immediately:
+                        print("Loop Step D.2 (Post-Heuristic Validation): Re-validating heuristically fixed script.")
+                        project_root = self.digester.repo_path # Get project_root for validator_handle
+                        is_valid, new_validation_payload, new_error_traceback = validator_handle( # validator_handle is self.validator.validate_patch
+                            patch_script_str=self.current_patch_candidate,
+                            target_file_path_str=target_file_str,
+                            digester=digester,
+                            project_root=project_root
+                        )
+                        # Update error_traceback and is_valid based on this new validation
+                        error_traceback = new_error_traceback
+                        validation_payload = new_validation_payload # update for potential use by LLM repair if heuristic fails
+
+                        # Update patch history with the result of the heuristic fix attempt and its validation
+                        # For score, we can use a neutral score or re-score if needed, here using previous style_score or 0.0
+                        current_style_score = self.patch_history[-1][2] if self.patch_history else 0.0
+                        self.patch_history.append((self.current_patch_candidate, is_valid, current_style_score, error_traceback))
+
+                        if is_valid:
+                            print("CollaborativeAgentGroup: Heuristic fix was successful! Proceeding to polish this version.")
+                            # The loop will continue, and this now valid script will go through polish again.
+                            # This is slightly redundant polishing but ensures consistency.
+                            # Alternatively, could return here if polish is not deemed necessary for heuristic fixes.
+                            # For now, let it go through the standard "if is_valid:" path at the start of the next iteration.
+                            # NO, if it's valid, it should go to the polish step of *this* iteration.
+                            # The main `if is_valid:` check at the top of the loop handles this.
+                            # So, if heuristic fix makes it valid, the next iteration will start, `is_valid` will be true,
+                            # and it will go to polish.
+                            # Let's adjust the flow slightly: if heuristic makes it valid, we should re-enter the polish phase of the current iteration.
+                            # This means we might need a sub-loop or a goto-like structure, or restructure the main loop.
+                            # For now, let the main loop re-evaluate. If heuristic fix is valid, the next iteration starts,
+                            # it gets polished, then validated. If still valid, it's returned.
+                            # This seems acceptable. The `error_traceback` is updated, so LLM repair won't be triggered if `is_valid` is true.
                         else:
-                            print("DiffusionCore did not return a script after processing LLM's fix. Breaking repair loop.")
-                            break # Break if diffusion fails to produce something
-                    else:
-                        print("LLMCore could not propose a repair. Breaking repair loop.")
-                        # If LLM has no proposal, no point in re-denoising. Break the repair loop.
+                            print("CollaborativeAgentGroup: Heuristic fix did not pass validation. Proceeding to LLM repair with new traceback if any.")
+                            # error_traceback is already updated from the failed heuristic fix.
+
+                    # --- LLM-based Repair (Original Step D) ---
+                    # Only proceed to LLM repair if no successful heuristic fix occurred that made the script valid.
+                    if not is_valid and error_traceback: # error_traceback might have been updated by failed heuristic
+                        print("Loop Step D.3 (LLM Repair Attempt): No successful heuristic fix or heuristic fix failed. Attempting LLM repair.")
+                        llm_proposed_fix_script = self.llm_agent.propose_repair_diff(error_traceback, context_data_for_repair)
+
+                        if llm_proposed_fix_script:
+                            print(f"LLMCore proposed a fix script (len: {len(llm_proposed_fix_script)}).")
+                            print("Loop Step E (Diffusion Re-Denoise/Merge): Processing LLM's proposed fix script.")
+                            merged_fixed_script = self.diffusion_agent.re_denoise_spans(
+                                failed_patch_script=self.current_patch_candidate, # Script before LLM proposal
+                                proposed_fix_script=llm_proposed_fix_script,
+                                context_data=context_data_for_repair
+                            )
+
+                            if merged_fixed_script:
+                                print(f"DiffusionCore processed the fix. Resulting script len: {len(merged_fixed_script)}.")
+                                self.current_patch_candidate = merged_fixed_script
+                            else:
+                                print("DiffusionCore did not return a script after processing LLM's fix. Breaking repair loop.")
+                                break
+                        else:
+                            print("LLMCore could not propose a repair. Breaking repair loop.")
+                            break
+                    elif not error_traceback and not is_valid: # e.g. heuristic fix removed error but still not valid for other reasons
+                        print("Loop Step D.3 (Skipping LLM Repair): No error traceback, but script still not valid. Cannot proceed with LLM repair. Breaking loop.")
                         break
+
             else: # No error_traceback from validation (e.g. style score too low but otherwise valid, or duplicate without specific repair path)
-                print("Loop Step D/E (No Repair Path): Validation failed without a actionable traceback, or duplicate guard triggered generic error. No further repair attempts in this iteration.")
+                print("Loop Step D/E (No Repair Path): Validation failed without an actionable traceback, or duplicate guard triggered generic error. No further repair attempts in this iteration.")
                 # If style is the only issue, and we don't have a specific re-denoise for style, we might break.
                 # Or, if a previous version was good enough, that might be selected later.
                 break # Break if no clear path to repair/improve

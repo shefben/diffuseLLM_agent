@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 from .spec_model import Spec
 from .phase_model import Phase
 from .refactor_grammar import BaseRefactorOperation, REFACTOR_OPERATION_INSTANCES
+from src.validator.validator import Validator # New import
+
 # REFACTOR_OPERATION_CLASSES is not directly used by PhasePlanner logic, REFACTOR_OPERATION_INSTANCES is.
 
 # Fallback for RepositoryDigester if not available (e.g. in isolated subtask)
@@ -41,17 +43,15 @@ if TYPE_CHECKING or 'RepositoryDigester' not in globals(): # Keep this for Repos
 
 
 class PhasePlanner:
-    @staticmethod
-    def mock_validator_handle(patch: Any, digester: 'RepositoryDigester', phase_ctx: 'Phase') -> Tuple[bool, Any, Optional[str]]:
-        print(f"PhasePlanner.mock_validator_handle: Validating patch: {str(patch)[:100]} for phase: {phase_ctx.operation_name}")
-        if isinstance(patch, dict) and patch.get("value") and "FAIL_VALIDATION" in str(patch.get("value")): # Check actual value
-            return False, {"reason": "Simulated validation failure triggered by FAIL_VALIDATION string"}, "Traceback: Contains FAIL_VALIDATION"
-        return True, {"detail": "Mock validation successful"}, None
+    # mock_validator_handle is now removed.
+    # The actual validator instance's validate_patch method will be used.
 
     @staticmethod
     def mock_score_style_handle(patch: Any, style_profile: Dict[str, Any]) -> float:
         print(f"PhasePlanner.mock_score_style_handle: Scoring style for patch: {str(patch)[:100]} with profile keys: {list(style_profile.keys())}")
-        if isinstance(patch, dict) and patch.get("value") and "BAD_STYLE" in str(patch.get("value")): # Check actual value
+        # Assuming patch is now a script string, this mock might need adjustment if it were to inspect content.
+        # For now, it's a simple mock.
+        if isinstance(patch, str) and "BAD_STYLE_MARKER_IN_SCRIPT" in patch:
             return 0.3 # Low score for bad style
         return 0.9 # Default high score
 
@@ -106,19 +106,27 @@ class PhasePlanner:
 
         # Import and Initialize CollaborativeAgentGroup
         from src.agent_group.collaborative_agent_group import CollaborativeAgentGroup
+
+        # Initialize Validator
+        self.validator = Validator(config=None) # Pass config if PhasePlanner has one for Validator
+        print("PhasePlanner: Validator instance initialized.")
+
+        # Import and Initialize CollaborativeAgentGroup
+        from src.agent_group.collaborative_agent_group import CollaborativeAgentGroup
         self.agent_group: 'CollaborativeAgentGroup' = CollaborativeAgentGroup(
             style_profile=self.style_fingerprint,
             naming_conventions_db_path=self.naming_conventions_db_path,
+            validator_instance=self.validator, # Pass validator instance
             llm_core_config=None,
             diffusion_core_config=None,
-            llm_model_path=llm_model_path # Pass down
+            llm_model_path=llm_model_path
         )
         print("PhasePlanner: CollaborativeAgentGroup initialized.")
 
-        # Store mock handles from static methods
-        self.validator_handle: Callable[[Any, 'RepositoryDigester', 'Phase'], Tuple[bool, Any, Optional[str]]] = PhasePlanner.mock_validator_handle
+        # Store actual validator handle and mock score style handle
+        self.validator_handle: Callable[[Optional[str], str, 'RepositoryDigester', Path], Tuple[bool, Optional[str]]] = self.validator.validate_patch
         self.score_style_handle: Callable[[Any, Dict[str, Any]], float] = PhasePlanner.mock_score_style_handle
-        print("PhasePlanner: Mock validator and style scorer handles configured.")
+        print("PhasePlanner: Validator handle set to actual validator. Mock style scorer configured.")
 
         self.plan_cache: Dict[str, List[Phase]] = {}
         # self.phi2_scorer_cache: Dict[str, float] = {} # Optional cache
