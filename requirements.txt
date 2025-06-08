@@ -1,0 +1,34 @@
+black
+ruff
+toml
+
+# For GGUF model interaction (e.g., DeepSeek)
+llama-cpp-python
+
+# For SafeTensor model interaction (e.g., DivoT5, T5-3B using Hugging Face)
+transformers
+safetensors
+accelerate
+torch
+sentencepiece
+
+# For code parsing and modification (identifier renaming)
+libcst
+
+# For Phase 2: Repository Digestion (Parsing & Type Inference)
+tree-sitter
+tree-sitter-python
+pyright # Retained, though Pyanalyze is being used for type inference currently
+pyanalyze # For AST annotation and type inference
+
+# For Phase 2: Embeddings and FAISS Indexing
+numpy # Often a core dependency for ML/vector tasks, good to have explicitly
+sentence-transformers
+faiss-cpu
+
+# For Phase 2: File System Watcher
+watchdog
+
+# For Phase 3 & 4: Spec/Plan Schemas and YAML processing
+pydantic
+PyYAML

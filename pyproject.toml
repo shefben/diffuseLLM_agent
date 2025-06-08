@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai_coding_assistant"
+version = "0.0.1"
+description = "A self-hosted Python toolchain for codebase evolution."
+readme = "README.md"
+requires-python = ">=3.8" # Example, can be adjusted
+# Add dependencies from requirements.txt here or keep them separate
+# For now, keeping them in requirements.txt is fine.
+# dependencies = [
+#   "black",
+#   "ruff",
+# ]
+
+# Placeholder for tool configurations that the assistant will manage
+[tool.black]
+# line_length = 88 # Example: Assistant might determine and set this
+# target_version = ['py38'] # Example
+
+[tool.ruff]
+# select = ["E", "F", "W"] # Example: Common selections
+# ignore = [] # Example
+# line-length = 88 # Example, to be consistent with black
+
+# [tool.ruff.lint.isort] # Example for ruff's isort integration
+# known-first-party = ["src"]
+
+[tool.ai_coding_assistant]
+# This section could be used by the assistant itself for its own configuration
+# For example, path to a more detailed style fingerprint file, etc.
+style_fingerprint_path = "config/style_fingerprint.json" # Example placeholder
