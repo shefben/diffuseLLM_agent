@@ -11,3 +11,6 @@ safetensors
 accelerate
 torch
 sentencepiece
+
+# For code parsing and modification (identifier renaming)
+libcst
