@@ -1,7 +1,8 @@
-from typing import TYPE_CHECKING, Any, Dict, Tuple, Callable, Optional
+from typing import TYPE_CHECKING, Any, Dict, Tuple, Callable, Optional, List # Added List
 from pathlib import Path
 
 # Local imports
+from .exceptions import PhaseFailure # New import
 from .llm_core import LLMCore
 from .diffusion_core import DiffusionCore
 
@@ -16,7 +17,8 @@ class CollaborativeAgentGroup:
                  style_profile: Dict[str, Any],
                  naming_conventions_db_path: Path,
                  llm_core_config: Optional[Dict[str, Any]] = None,
-                 diffusion_core_config: Optional[Dict[str, Any]] = None
+                 diffusion_core_config: Optional[Dict[str, Any]] = None,
+                 llm_model_path: Optional[str] = None # New parameter for LLMCore
                  ):
         """
         Initializes the CollaborativeAgentGroup.
@@ -25,25 +27,29 @@ class CollaborativeAgentGroup:
             naming_conventions_db_path: Path to the naming conventions database.
             llm_core_config: Optional configuration for LLMCore.
             diffusion_core_config: Optional configuration for DiffusionCore.
+            llm_model_path: Optional path to GGUF model for LLMCore repairs.
         """
         self.style_profile = style_profile
         self.naming_conventions_db_path = naming_conventions_db_path
+        self.max_repair_attempts = 3 # Define max_repair_attempts for the loop
 
         # Initialize Core Agents
         self.llm_agent = LLMCore(
             style_profile=self.style_profile,
             naming_conventions_db_path=self.naming_conventions_db_path,
-            config=llm_core_config
+            config=llm_core_config,
+            llm_model_path=llm_model_path # Pass to LLMCore
         )
         self.diffusion_agent = DiffusionCore(
             style_profile=self.style_profile,
             config=diffusion_core_config
         )
 
-        self.current_patch_candidate: Optional[Any] = None
-        self.patch_history: list = [] # To store (patch, validation_result, score) tuples
+        self.current_patch_candidate: Optional[Any] = None # Will hold the script string during iteration
+        self.patch_history: list = [] # To store (script, validation_result, score, error) tuples
+        self._current_run_context_data: Optional[Dict[str, Any]] = None # For preview context
 
-        print("CollaborativeAgentGroup initialized with LLMCore and DiffusionCore.")
+        print("CollaborativeAgentGroup initialized with LLMCore, DiffusionCore, and max_repair_attempts.")
 
     def _perform_duplicate_guard(self, patch_script_str: Optional[str], context_data: Dict[str, Any]) -> bool:
         """
@@ -126,9 +132,11 @@ class CollaborativeAgentGroup:
         }
 
         # Add PDG slice and code snippets from digester
-        # These calls assume digester methods handle potential errors or missing data gracefully.
         context_data["retrieved_code_snippets"] = digester.get_code_snippets_for_phase(phase_ctx)
         context_data["pdg_slice"] = digester.get_pdg_slice_for_phase(phase_ctx)
+
+        # Store context for potential use in utility methods like generate_patch_preview
+        self._current_run_context_data = context_data
 
         print(f"Step 1: Context Broadcast prepared. Context keys: {list(context_data.keys())}")
         if context_data["retrieved_code_snippets"]:
@@ -177,9 +185,9 @@ class CollaborativeAgentGroup:
         self.current_patch_candidate = completed_patch_script
 
         # --- Iterative Refinement Loop (Simplified Placeholder) ---
-        max_iterations = 3
-        for i in range(max_iterations):
-            print(f"\n--- Iteration {i + 1} ---")
+        # max_iterations renamed to self.max_repair_attempts and defined in __init__
+        for i in range(self.max_repair_attempts): # Use self.max_repair_attempts
+            print(f"\n--- Repair Iteration {i + 1}/{self.max_repair_attempts} ---")
 
             # --- Step 5 (Part A): Duplicate Guard ---
             # self.current_patch_candidate holds the script string from diffusion or previous repair
@@ -271,37 +279,52 @@ class CollaborativeAgentGroup:
                 print(f"Script requires repair (or loop exit) after iteration {i+1} (is_valid={is_valid}). Error: {error_traceback}")
                 if error_traceback:
                     # --- Phase 5: Step 5 (LLM Proposes Repair - was Step 6a) ---
-                print("Loop Step D (Attempt Repair): Attempting repair with LLMCore.")
-                # propose_repair_diff takes traceback and context_data.
-                # The current_patch_candidate at this point is the one that failed (either initial or polished).
-                repair_diff_script_or_new_script = self.llm_agent.propose_repair_diff(error_traceback, context_data)
-                if repair_diff_script_or_new_script:
-                    print(f"LLMCore proposed a repair/new script.")
-                    self.current_patch_candidate = repair_diff_script_or_new_script # This becomes the candidate for the next iteration
-                else:
-                    print("LLMCore could not propose a repair. Trying DiffusionCore re-denoise (if applicable).")
-                    # --- Phase 5: Step 6b (Diffusion Re-Denoises - was Step 6b) ---
-                    # re_denoise_spans expects the patch that failed and affected_spans.
-                    # This part is tricky as 'affected_spans' needs to come from validation_payload.
-                    # And the patch is a script string.
-                    affected_spans = validation_payload.get("affected_spans", []) if isinstance(validation_payload, dict) else []
-                    if affected_spans: # Only call if there are specific spans
-                         print("Loop Step E (Re-Denoise): Attempting re-denoise with DiffusionCore.")
-                         self.current_patch_candidate = self.diffusion_agent.re_denoise_spans(self.current_patch_candidate, affected_spans, context_data)
+                    print("Loop Step D (Attempt Repair): Attempting repair with LLMCore.")
+
+                    # Ensure context_data for repair includes the script that just failed
+                    context_data_for_repair = context_data.copy()
+                    context_data_for_repair['current_patch_candidate_DEBUG'] = self.current_patch_candidate # Add the failing script for LLM to see
+
+                    llm_proposed_fix_script = self.llm_agent.propose_repair_diff(error_traceback, context_data_for_repair)
+
+                    if llm_proposed_fix_script:
+                        print(f"LLMCore proposed a fix script (len: {len(llm_proposed_fix_script)}).")
+                        # Now, pass this proposed fix to DiffusionCore for potential "re-denoising" or merging.
+                        # self.current_patch_candidate is the script that just failed (and was polished before failing).
+                        # llm_proposed_fix_script is the new script from LLM.
+                        print("Loop Step E (Diffusion Re-Denoise/Merge): Processing LLM's proposed fix script.")
+                        merged_fixed_script = self.diffusion_agent.re_denoise_spans(
+                            failed_patch_script=self.current_patch_candidate, # The one that failed validation
+                            proposed_fix_script=llm_proposed_fix_script,
+                            context_data=context_data_for_repair # Pass relevant context
+                        )
+
+                        if merged_fixed_script:
+                            print(f"DiffusionCore processed the fix. Resulting script len: {len(merged_fixed_script)}.")
+                            self.current_patch_candidate = merged_fixed_script # This becomes the candidate for the next iteration's duplicate guard/validation/polish.
+                        else:
+                            print("DiffusionCore did not return a script after processing LLM's fix. Breaking repair loop.")
+                            break # Break if diffusion fails to produce something
                     else:
-                        print("No specific affected spans for DiffusionCore re-denoise, or LLM repair failed. Aborting iteration if no progress.")
-                        # If no repair from LLM and no specific spans for Diffusion, we might be stuck.
-                        # End the loop or try a more general re-denoise if that's an option.
+                        print("LLMCore could not propose a repair. Breaking repair loop.")
+                        # If LLM has no proposal, no point in re-denoising. Break the repair loop.
                         break
-            else: # No error_traceback from validation (e.g. style score too low but otherwise valid)
-                print("Loop Step D/E (No Repair Path): Validation failed without a traceback (e.g. style issue), or no repair proposed. No further repair attempts in this iteration.")
+            else: # No error_traceback from validation (e.g. style score too low but otherwise valid, or duplicate without specific repair path)
+                print("Loop Step D/E (No Repair Path): Validation failed without a actionable traceback, or duplicate guard triggered generic error. No further repair attempts in this iteration.")
                 # If style is the only issue, and we don't have a specific re-denoise for style, we might break.
                 # Or, if a previous version was good enough, that might be selected later.
                 break # Break if no clear path to repair/improve
 
-            if i == max_iterations - 1:
-                print("Max iterations reached. Could not produce a valid and satisfactory script.")
-                # Fallback: return the best script from history based on validity and score.
+            if i == self.max_repair_attempts - 1 and not is_valid: # Check is_valid for the last attempt
+                print(f"Max repair attempts ({self.max_repair_attempts}) reached. Could not produce a valid and satisfactory script.")
+                # Log the last error that prevented success
+                last_error_for_failure = error_traceback if error_traceback else "Unknown error after max repair attempts."
+
+                # Fallback: Check if any script in history was valid and had a decent score
+                # This logic is already present for returning best from history if loop finishes
+                # But here we explicitly raise PhaseFailure
+
+                # Find best from history before failing
                 best_historical_script = None
                 best_historical_score = -1.0
                 was_valid_in_history = False
@@ -315,28 +338,90 @@ class CollaborativeAgentGroup:
                         best_historical_script = p_hist
                         best_historical_score = s_hist
 
-                if best_historical_script:
-                    print(f"Returning best script from history (Valid: {was_valid_in_history}, Score: {best_historical_score:.2f}).")
-                    return best_historical_script
-                return None # No suitable script found after all iterations
+                if best_historical_script: # This check is actually done after the loop by existing logic
+                    print(f"Best historical script was (Valid: {was_valid_in_history}, Score: {best_historical_score:.2f}), but phase still failed on last attempt.")
 
-        print("Exited refinement loop. No suitable script generated.")
-        return None # Should ideally return the best effort from history if loop finishes. Covered by above.
+                raise PhaseFailure(f"Failed to validate/repair patch after {self.max_repair_attempts} attempts. Last error: {last_error_for_failure}")
+
+        # After loop, if we exited due to success (is_valid became True and returned), this part is skipped.
+        # If loop finishes due to max_iterations and no valid patch was found and returned within the loop:
+        print("Exited refinement loop. Selecting best script from history or returning None.")
+        best_historical_script = None
+        best_historical_score = -1.0
+        was_valid_in_history = False
+        for p_hist, v_hist, s_hist, _tb_hist in self.patch_history:
+            if v_hist and s_hist > best_historical_score:
+                best_historical_script = p_hist
+                best_historical_score = s_hist
+                was_valid_in_history = True
+            elif not was_valid_in_history and s_hist > best_historical_score:
+                best_historical_script = p_hist
+                best_historical_score = s_hist
+
+        if best_historical_script:
+            print(f"Returning best script from history (Valid: {was_valid_in_history}, Score: {best_historical_score:.2f}).")
+            return best_historical_script
+
+        # If no script in history was ever good (e.g. all failed initial validation, no repairs worked)
+        # and loop finished without returning a valid one.
+        # This case should ideally be covered by the PhaseFailure exception if max_repair_attempts is the sole reason for exiting without success.
+        # However, if the loop breaks for other reasons (e.g., no repair path found before max_attempts), this is the final fallback.
+        if not self.patch_history or not any(h[1] for h in self.patch_history) : # if no history or no valid patch in history
+             # Ensure error_traceback is defined; it might not be if the loop was never fully entered or broke very early.
+             final_error_msg = error_traceback if 'error_traceback' in locals() and error_traceback else "No successful patch and no specific error traceback recorded."
+             raise PhaseFailure(f"No valid patch could be generated after loop. Last error: {final_error_msg}")
+
+        return None # Should be unreachable if PhaseFailure is raised or a script is returned.
 
 
     def generate_patch_preview(self) -> str:
-        """Placeholder: Generates a preview of the current patch candidate."""
-        if self.current_patch_candidate:
-            # In a real scenario, this would format the patch (e.g., as a diff)
-            return f"Preview of current patch candidate: {str(self.current_patch_candidate)[:200]}..."
-        return "Patch preview not yet implemented. No current patch candidate."
+        """Generates a mock preview of the current patch candidate (LibCST script)."""
+        target_file_name = "N/A"
+        if self._current_run_context_data:
+            target_file_name = self._current_run_context_data.get("phase_target_file", "N/A")
+
+        script_content_preview = "No patch candidate available."
+        if self.current_patch_candidate and isinstance(self.current_patch_candidate, str):
+            script_content_preview = self.current_patch_candidate[:1000] + ("..." if len(self.current_patch_candidate) > 1000 else "")
+        elif self.current_patch_candidate:
+            script_content_preview = f"Patch candidate is not a string (type: {type(self.current_patch_candidate)}). Preview unavailable."
+
+
+        preview = f"""
+Patch Preview (Mock):
+---------------------
+Target File: {target_file_name}
+Patch Type: LibCST Script (Python code to perform an edit)
+
+Script Content (first 1000 chars):
+{script_content_preview}
+
+(Note: This is a mock preview of the LibCST script.
+ A full preview would show a diff of the target file after applying this script.)
+"""
+        return preview.strip()
 
     def abort_and_rollback(self) -> None:
-        """Placeholder: Aborts the current operation and rolls back any changes."""
-        print("CollaborativeAgentGroup.abort_and_rollback called. Rolling back (placeholder).")
+        """Placeholder: Aborts the current operation and conceptually rolls back changes."""
+        patch_status_info = "No active patch candidate."
+        if self.current_patch_candidate and isinstance(self.current_patch_candidate, str):
+            patch_status_info = f"Current patch candidate (script) length: {len(self.current_patch_candidate)}."
+        elif self.current_patch_candidate:
+            patch_status_info = f"Current patch candidate type: {type(self.current_patch_candidate)}."
+
+        print(f"CollaborativeAgentGroup: Abort and Rollback called. {patch_status_info}")
+        print("  (Mock: No file operations to roll back at this stage as scripts are not yet applied.)")
+
+        # Reset internal state related to the current run
         self.current_patch_candidate = None
         self.patch_history = []
-        # Actual rollback logic would depend on how changes are staged/applied.
+        self._current_run_context_data = None # Clear the context of the aborted run
+
+        print("  Internal state (patch candidate, history, context) has been reset.")
+        # In a real scenario, this might involve:
+        # - Deleting temporary files
+        # - Reverting any applied changes in a sandbox environment
+        # - Signaling to other components that the phase was aborted
         pass
 
 # Example Usage (Conceptual - requires mock objects for Phase, Digester etc.)

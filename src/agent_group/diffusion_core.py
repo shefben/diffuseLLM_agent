@@ -60,22 +60,46 @@ class DiffusionCore:
 
         return completed_patch_script
 
-    def re_denoise_spans(self, patch_with_failed_validation: Any, affected_spans: List[Any], context_data: Dict[str, Any]) -> Any:
+    def re_denoise_spans(self,
+                         failed_patch_script: Optional[str],
+                         proposed_fix_script: Optional[str],
+                         context_data: Dict[str, Any]
+                         ) -> Optional[str]:
         """
-        Placeholder for re-denoising affected spans in a patch that failed validation.
+        Currently, this method passes through the proposed_fix_script from LLMCore.
+        Future enhancements could involve more sophisticated merging or diffusion-based refinement.
+
         Args:
-            patch_with_failed_validation: The patch that failed validation.
-            affected_spans: List of spans affected by the validation error.
+            failed_patch_script: The LibCST script that was polished and then failed validation.
+            proposed_fix_script: The new script suggested by LLMCore.propose_repair_diff.
             context_data: Comprehensive context data dictionary.
         Returns:
-            The re-denoised patch (or the original patch).
+            The script to be used for the next repair attempt (currently, proposed_fix_script).
         """
-        print(f"DiffusionCore.re_denoise_spans called. Context keys: {list(context_data.keys())}. Affected spans: {affected_spans}")
-        # Mock implementation - returns the patch as is
-        if isinstance(patch_with_failed_validation, dict) and "value" in patch_with_failed_validation:
-            # Ensure original comment exists before trying to replace
-            if "# Expanded by DiffusionCore" in patch_with_failed_validation["value"]:
-                patch_with_failed_validation["value"] = patch_with_failed_validation["value"].replace("# Expanded by DiffusionCore", "# Re-denoised by DiffusionCore")
-            else:
-                patch_with_failed_validation["value"] += "\n    # Re-denoised by DiffusionCore (original expansion comment not found)"
+        print(f"DiffusionCore.re_denoise_spans called. Context keys: {list(context_data.keys())}.")
+        # print(f"  Failed patch script (start): '{failed_patch_script[:100] if failed_patch_script else 'None'}...'")
+        # print(f"  Proposed fix script (start): '{proposed_fix_script[:100] if proposed_fix_script else 'None'}...'")
+
+        # Current pass-through implementation:
+        # The LLMCore.propose_repair_diff (via get_llm_code_fix_suggestion) is already tasked
+        # with returning a complete, revised script. So, re_denoise_spans will just pass this through.
+        # A more complex future version might:
+        # 1. Identify specific "spans" or "holes" in the original failed_patch_script that correspond
+        #    to the error described in the traceback (from context_data if needed).
+        # 2. Use the proposed_fix_script as a strong hint or guide.
+        # 3. Apply a diffusion model or another LLM to "in-fill" or "re-denoise" only those spans,
+        #    potentially merging the LLM's broad fix with the more structured parts of failed_patch_script.
+        # For now, the "repair" is wholesale replacement by the LLM's suggested script.
+
+        if proposed_fix_script is not None:
+            print(f"DiffusionCore: Passing through proposed fix script from LLMCore. Length: {len(proposed_fix_script)}")
+            return proposed_fix_script
+        else:
+            print("DiffusionCore: No proposed fix script from LLMCore. Returning the original failed script for retry if applicable.")
+            # This implies LLMCore couldn't suggest a fix. Returning the failed script might lead to a loop
+            # if not handled carefully in CollaborativeAgentGroup (e.g., by max_repair_attempts).
+            # However, CollaborativeAgentGroup's logic already handles None from propose_repair_diff by breaking the loop.
+            # So, this path (returning failed_patch_script if proposed_fix_script is None) might be less common.
+            # It's safer to return None if proposed_fix_script is None, aligning with LLMCore's inability to fix.
+            return None
         return patch_with_failed_validation

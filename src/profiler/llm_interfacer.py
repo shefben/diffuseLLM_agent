@@ -713,3 +713,95 @@ def get_deepseek_polished_json(
 #         print(f"\nFailed to parse polished JSON: {e}")
 #     except Exception as e_gen:
 #         print(f"\nAn error occurred with the polished JSON: {e_gen}")
+
+
+# --- New function for LLM Code Fix Suggestion ---
+def get_llm_code_fix_suggestion(
+    model_path: str, # Path to GGUF model
+    original_code_script: str, # The LibCST script that failed
+    error_traceback: str,
+    phase_description: str,
+    target_file: Optional[str],
+    additional_context: Optional[Dict[str, Any]], # e.g., style profile, snippets
+    n_gpu_layers: int = -1,
+    max_tokens: int = 1024, # Max tokens for the suggested script
+    temperature: float = 0.4, # Temperature for generation
+    verbose: bool = False
+) -> Optional[str]:
+    """
+    Uses a GGUF language model to suggest a fix for a failing LibCST script.
+    """
+    if Llama is None:
+        print("Error: llama-cpp-python not installed. Cannot get LLM code fix suggestion.")
+        # Return a mock suggestion that includes parts of the error and original script info
+        return f"# Mock fix for error: {error_traceback[:100]}...\n# Original script had {len(original_code_script)} chars.\npass # LLM disabled - Apply actual fix here"
+
+    try:
+        # Increased n_ctx for potentially longer prompts including code and traceback
+        llm = Llama(model_path=model_path, n_gpu_layers=n_gpu_layers, n_ctx=4096, verbose=verbose)
+    except Exception as e:
+        print(f"Error loading LLM model from {model_path}: {e}")
+        return f"# Mock fix due to model load error for: {error_traceback[:100]}...\npass"
+
+    # Construct a detailed prompt
+    prompt_parts = [
+        "You are an expert Python programmer and code assistant, specialized in writing and debugging LibCST refactoring scripts.",
+        "The following LibCST script was intended to perform a refactoring operation but failed validation or execution.",
+        f"Refactoring Operation Description: {phase_description}",
+        f"Target File for Refactoring: {target_file if target_file else 'N/A'}",
+    ]
+    if additional_context:
+        if 'style_profile' in additional_context and additional_context['style_profile']:
+            try:
+                style_profile_str = json.dumps(additional_context['style_profile'], indent=2)
+                prompt_parts.append(f"Project Style Profile (relevant parts for context):\n{style_profile_str}")
+            except (TypeError, OverflowError) as json_e:
+                 prompt_parts.append(f"Project Style Profile (relevant parts for context): Error serializing - {json_e}")
+
+        if 'code_snippets' in additional_context and additional_context['code_snippets']: # Assuming code_snippets is Dict[str, str]
+            for fname, snippet in additional_context['code_snippets'].items():
+                prompt_parts.append(f"Relevant code snippet from '{fname}':\n```python\n{snippet}\n```")
+
+    prompt_parts.extend([
+        "Original LibCST script that failed:",
+        "```python",
+        original_code_script,
+        "```",
+        "Validation Error Traceback or Description:",
+        "```text", # Marking traceback as text
+        error_traceback,
+        "```",
+        "Please provide a revised version of the LibCST script that fixes the error. Output only the complete, revised Python script for the LibCST code. Do not add any explanations or markdown formatting before or after the script block."
+    ])
+
+    full_prompt = "\n\n".join(prompt_parts)
+
+    if verbose: # Print more of the prompt if verbose is on
+        print(f"LLM Code Fix Prompt (first 1000 chars):\n{full_prompt[:1000]}...")
+    else:
+        print(f"LLM Code Fix Prompt (first 200 chars):\n{full_prompt[:200]}...")
+
+
+    try:
+        response = llm.create_completion(
+            prompt=full_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=["```python\n", "\n```\n", "\n```"], # More robust stopping, though model should just output script
+            echo=False # Don't echo the prompt in the completion
+        )
+
+        suggested_script = response['choices'][0]['text'].strip()
+
+        # Basic cleaning: Sometimes models might still include markdown even if asked not to.
+        if suggested_script.startswith("```python"):
+            suggested_script = suggested_script[len("```python"):].strip()
+        if suggested_script.startswith("```"): # Generic code block start
+             suggested_script = suggested_script[len("```"):].strip()
+        if suggested_script.endswith("```"):
+            suggested_script = suggested_script[:-len("```")].strip()
+
+        return suggested_script
+    except Exception as e:
+        print(f"Error during LLM code fix suggestion inference: {e}")
+        return f"# Mock fix due to inference error for: {error_traceback[:100]}...\n# Original script length: {len(original_code_script)}\npass"

@@ -60,8 +60,9 @@ class PhasePlanner:
         style_fingerprint_path: Path,
         digester: 'RepositoryDigester',
         scorer_model_config: Any, # Config for Phi-2 LLM scorer
-        naming_conventions_db_path: Path, # New argument
-        project_root_path: Path, # New argument
+        naming_conventions_db_path: Path,
+        project_root_path: Path,
+        llm_model_path: Optional[str] = None, # New: Path to GGUF model for AgentGroup
         refactor_op_map: Optional[Dict[str, BaseRefactorOperation]] = None,
         beam_width: int = 3 # Default beam_width to 3
     ):
@@ -109,7 +110,8 @@ class PhasePlanner:
             style_profile=self.style_fingerprint,
             naming_conventions_db_path=self.naming_conventions_db_path,
             llm_core_config=None,
-            diffusion_core_config=None
+            diffusion_core_config=None,
+            llm_model_path=llm_model_path # Pass down
         )
         print("PhasePlanner: CollaborativeAgentGroup initialized.")
 
@@ -418,7 +420,7 @@ Score:"""
 
             print("--- CollaborativeAgentGroup execution finished for all phases ---")
             print("Execution Summary:")
-            for summary_item in execution_summary:
+            for summary_item in execution_summary: # type: ignore
                 print(f"  - {summary_item}")
             # The method still returns the plan (List[Phase]).
             # The execution_summary is for logging/observation at this stage.
@@ -428,7 +430,8 @@ Score:"""
         return best_plan # Return the list of Phase objects as per original signature
 
 if __name__ == '__main__':
-    from unittest.mock import MagicMock # For __main__ example
+    # No MagicMock needed now as we are using more concrete (though still mock) classes
+    # from unittest.mock import MagicMock
     print("--- PhasePlanner Example Usage (Conceptual) ---")
 
     # Using the actual RepositoryDigester mock defined at the class level for TYPE_CHECKING
@@ -465,6 +468,9 @@ if __name__ == '__main__':
     dummy_project_root_main = Path("_temp_mock_project_root")
     dummy_project_root_main.mkdir(parents=True, exist_ok=True)
 
+    # Mock LLM model path for agent-based repair (can be a non-existent path for this test as LLM loading is mocked/guarded)
+    mock_llm_repair_model_path = "_temp_mock_repair_model.gguf"
+
 
     try:
         # Ensure Spec and Phase are imported or defined
@@ -475,8 +481,9 @@ if __name__ == '__main__':
             style_fingerprint_path=dummy_style_path_main,
             digester=dummy_digester_main,
             scorer_model_config=dummy_scorer_config_main,
-            naming_conventions_db_path=dummy_naming_db_path_main, # New
-            project_root_path=dummy_project_root_main,           # New
+            naming_conventions_db_path=dummy_naming_db_path_main,
+            project_root_path=dummy_project_root_main,
+            llm_model_path=mock_llm_repair_model_path, # New
             beam_width=2
         )
 

@@ -1,19 +1,34 @@
 from pathlib import Path
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional, List # Added List
+import json # Add json import for dumping dicts in prompt
+
+# Attempt to import the new LLM interfacer function
+try:
+    from src.profiler.llm_interfacer import get_llm_code_fix_suggestion
+except ImportError:
+    get_llm_code_fix_suggestion = None
+    print("LLMCore Warning: Failed to import get_llm_code_fix_suggestion. LLM-based repair will be disabled.")
+
 
 class LLMCore:
-    def __init__(self, style_profile: Dict[str, Any], naming_conventions_db_path: Path, config: Optional[Dict[str, Any]] = None):
+    def __init__(self,
+                 style_profile: Dict[str, Any],
+                 naming_conventions_db_path: Path,
+                 config: Optional[Dict[str, Any]] = None,
+                 llm_model_path: Optional[str] = None): # New parameter
         """
         Initializes the LLMCore.
         Args:
             style_profile: Dictionary containing style profile information.
             naming_conventions_db_path: Path to the naming conventions database.
             config: Optional dictionary for LLM core specific configurations.
+            llm_model_path: Optional path to GGUF model for repairs.
         """
         self.style_profile = style_profile
         self.naming_conventions_db_path = naming_conventions_db_path
         self.config = config if config else {}
-        print(f"LLMCore initialized with style_profile, naming_conventions_db_path: {naming_conventions_db_path}, config: {self.config}")
+        self.llm_model_path = llm_model_path # Store new parameter
+        print(f"LLMCore initialized with style_profile, naming_conventions_db_path: {naming_conventions_db_path}, config: {self.config}, llm_model_path: {self.llm_model_path}")
 
     def generate_scaffold_patch(self, context_data: Dict[str, Any]) -> Tuple[Optional[str], Optional[List[str]]]:
         """
@@ -281,11 +296,8 @@ Begin Polished Script:
 import libcst as cst
 class ReuseHelperInsteadCommand(cst.VisitorBasedCodemodCommand):
     DESCRIPTION = "Replaces a new function call with a call to an existing helper."
-    def __init__(self, context): super().__init__(context)
+    def __init__(self, context): super().__init__(context) # Simplified init
     def leave_Module(self, original_node, updated_node):
-        # In a real scenario, this would find where '{original_planned_func_name}' was supposed to be called
-        # and replace it with 'existing_helper_function_abc()'.
-        # For this mock, we just add a comment indicating the intent.
         comment = cst.Comment("# LLMCore: Code modified to use existing_helper_function_abc() instead of new {original_planned_func_name}().")
         new_body = list(updated_node.body) + [cst.EmptyLine(comment=comment)]
         return updated_node.with_changes(body=new_body)
@@ -293,17 +305,47 @@ class ReuseHelperInsteadCommand(cst.VisitorBasedCodemodCommand):
 '''
             return mock_reuse_script
 
-        elif "SyntaxError" in traceback_str:
-            print("LLMCore: Received SyntaxError. Proposing a generic syntax fix.")
-            mock_syntax_repair_script = f'''# Mock repair for SyntaxError in previous script by LLMCore.
-import libcst as cst
-class MinimalValidCommand(cst.VisitorBasedCodemodCommand):
-    DESCRIPTION = "Minimal valid command as a fallback syntax repair."
-    def leave_Module(self, original_node, updated_node):
-        return updated_node.with_changes(body=[cst.parse_statement("# Syntax error repaired with minimal valid script from LLMCore")])
-# Instantiation: MinimalValidCommand(CodemodContext())
-'''
-            return mock_syntax_repair_script
+        # Generic error handling using LLM if model path is configured
+        if not self.llm_model_path or get_llm_code_fix_suggestion is None:
+            print("LLMCore Warning: LLM model path not configured or get_llm_code_fix_suggestion not available. Falling back to generic mock fix for other errors.")
+            if "SyntaxError" in traceback_str: # Keep basic syntax error mock as fallback
+                print("LLMCore: Proposing a generic syntax fix (fallback).")
+                return f"# Mock syntax repair for: {traceback_str[:100]}\nimport libcst as cst\nclass MinimalSyntaxFix(cst.VisitorBasedCodemodCommand):\n    pass"
+            return f"# LLM model path not configured. Generic mock repair for: {traceback_str[:100]}"
 
-        print("LLMCore.propose_repair_diff: No specific repair logic for this traceback. Returning None.")
-        return None
+        print(f"LLMCore: Attempting LLM-based repair for traceback: {traceback_str[:200]}...")
+        current_failed_script = context_data.get('current_patch_candidate', '# No script provided in context_data["current_patch_candidate"]')
+        if not isinstance(current_failed_script, str): # Ensure it's a string
+            current_failed_script = str(current_failed_script)
+
+        phase_description = context_data.get("phase_description", "N/A")
+        target_file = context_data.get("phase_target_file")
+
+        # Prepare additional context for the fix suggestion more carefully
+        additional_llm_context = {
+            "style_profile": context_data.get("style_profile"),
+            "code_snippets": context_data.get("retrieved_code_snippets")
+            # Avoid passing the whole digester or complex objects like handles directly to LLM prompt
+        }
+
+        suggested_fix_script = get_llm_code_fix_suggestion(
+            model_path=self.llm_model_path,
+            original_code_script=current_failed_script,
+            error_traceback=traceback_str,
+            phase_description=phase_description,
+            target_file=target_file,
+            additional_context=additional_llm_context,
+            # n_gpu_layers, max_tokens, temperature can be sourced from self.config if needed
+            n_gpu_layers=self.config.get("llm_repair_n_gpu_layers", -1),
+            max_tokens=self.config.get("llm_repair_max_tokens", 1024),
+            temperature=self.config.get("llm_repair_temperature", 0.4),
+            verbose=self.config.get("llm_repair_verbose", False)
+        )
+
+        if suggested_fix_script:
+            print(f"LLMCore: LLM suggested a fix script (len: {len(suggested_fix_script)}).")
+            # print(f"  Suggested fix script preview:\n{suggested_fix_script[:300]}...") # For debugging
+        else:
+            print("LLMCore: LLM did not return a suggestion. Returning None.")
+
+        return suggested_fix_script
