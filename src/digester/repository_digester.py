@@ -1,41 +1,41 @@
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple # Added Tuple
 import libcst as cst
+import ast # Keep ast import
 from dataclasses import dataclass, field
-import sys # For manipulating sys.path if needed for pyanalyze
-import os  # For path manipulation
-import ast # For Pyanalyze integration
+import sys
+import os
+import re # For CallGraphVisitor._resolve_callee_fqn
+from collections import defaultdict
 
 # Tree-sitter imports
 try:
     from tree_sitter import Parser, Language
     from tree_sitter_languages import get_language, get_parser
-except ImportError: # Fallback definitions
-    Parser, Language, get_language, get_parser = None, None, None, None
-    # Warning for tree-sitter is now in __init__ if it fails there
+except ImportError:
+    Parser, Language, get_language, get_parser = None, None, None, None # type: ignore
 TreeSitterTree = Any
 if Language: # Check if Language was successfully imported
     from tree_sitter import Tree as TreeSitterTreeTypeActual # type: ignore
     TreeSitterTree = TreeSitterTreeTypeActual
 
-
-# Pyanalyze imports (guarded)
+# Pyanalyze imports
 try:
     import pyanalyze
-    from pyanalyze import name_check_visitor # Though not directly used in this placeholder, it's key for real impl.
+    from pyanalyze import name_check_visitor
     from pyanalyze.value import Value, KnownValue, TypedValue, dump_value as pyanalyze_dump_value
     from pyanalyze.checker import Checker
     from pyanalyze.config import Config
     from pyanalyze.options import Options
-    from pyanalyze.error_code import ErrorCode # Not used, but good to have for ref
 except ImportError:
-    pyanalyze = None # type: ignore
-    name_check_visitor = None # type: ignore
-    Checker = None # type: ignore
-    pyanalyze_dump_value = None # type: ignore
-    Config = None # type: ignore
-    Options = None # type: ignore
-    # Warning for pyanalyze is now in __init__
+    pyanalyze = None; name_check_visitor = None; Checker = None; pyanalyze_dump_value = None; Config = None; Options = None # type: ignore
+    print("Warning: pyanalyze library not found. Type inference via Pyanalyze will be disabled.")
+
+# NEW: Import from graph_structures
+from .graph_structures import CallGraph, ControlDependenceGraph, DataDependenceGraph, NodeID # NodeID might be a NewType
+# LibCST metadata providers for graph building
+from libcst.metadata import ParentNodeProvider, PositionProvider, QualifiedNameProvider, ScopeProvider
+
 
 @dataclass
 class ParsedFileResult:
@@ -46,16 +46,411 @@ class ParsedFileResult:
     libcst_error: Optional[str] = None
     treesitter_has_errors: bool = False
     treesitter_error_message: Optional[str] = None
-    type_info: Optional[Dict[str, Any]] = None # Field for type inference data
+    type_info: Optional[Dict[str, Any]] = None
 
+
+class DataDependenceVisitor(ast.NodeVisitor):
+    def __init__(self, file_id_prefix: str):
+        self.file_id_prefix: str = file_id_prefix
+        self.data_dependencies: DataDependenceGraph = defaultdict(set) # Use defaultdict
+
+        # Scope stack: list of dictionaries. Each dict maps var_name (str) to a list of def_node_ids.
+        # The list of NodeIDs for a var_name stores its current reaching definition(s) in that scope.
+        # For simplicity, we'll store only the most recent definition's NodeID.
+        self.scope_stack: List[Dict[str, NodeID]] = [{}] # Start with module-level scope
+
+    def _get_current_scope_defs(self) -> Dict[str, NodeID]:
+        return self.scope_stack[-1]
+
+    def _add_definition(self, var_name: str, def_node: ast.AST):
+        current_scope_defs = self._get_current_scope_defs()
+        def_node_id = _create_ast_node_id(self.file_id_prefix, def_node, f"{var_name}:def")
+        current_scope_defs[var_name] = def_node_id
+        # print(f"DEF: {var_name} at {def_node_id} in scope {len(self.scope_stack)-1}")
+
+
+    def _add_use_dependencies(self, use_node: ast.AST, var_name: str):
+        use_node_id = _create_ast_node_id(self.file_id_prefix, use_node, f"{var_name}:use")
+        # Search for definition from innermost scope outwards
+        for i in range(len(self.scope_stack) - 1, -1, -1):
+            scope_defs = self.scope_stack[i]
+            if var_name in scope_defs:
+                def_node_id = scope_defs[var_name]
+                self.data_dependencies[use_node_id].add(def_node_id)
+                # print(f"USE: {var_name} at {use_node_id} depends on def at {def_node_id} from scope {i}")
+                return # Found in this scope (or outer), stop.
+        # print(f"Warning: No definition found for use of '{var_name}' at {use_node_id} (might be global/builtin or undefined)")
+
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        # Function name itself is a definition in the outer scope
+        self._add_definition(node.name, node) # Consider the FunctionDef node as the def site for its name
+
+        # Decorators are expressions evaluated in outer scope
+        for decorator in node.decorator_list: self.visit(decorator)
+        # Default arguments (expressions evaluated in outer scope at def time)
+        for default_expr in node.args.defaults: self.visit(default_expr)
+        for default_expr_kwonly in node.args.kw_defaults:
+            if default_expr_kwonly: self.visit(default_expr_kwonly)
+        # Visit annotations in outer scope as well (parameter annotations, return annotation)
+        if node.returns: self.visit(node.returns)
+        for arg_node in node.args.args: # ast.arg
+            if arg_node.annotation: self.visit(arg_node.annotation)
+        for kwarg_node_only in node.args.kwonlyargs:
+            if kwarg_node_only.annotation: self.visit(kwarg_node_only.annotation)
+        if node.args.vararg and node.args.vararg.annotation: self.visit(node.args.vararg.annotation)
+        if node.args.kwarg and node.args.kwarg.annotation: self.visit(node.args.kwarg.annotation)
+
+
+        # New scope for function body and parameters
+        self.scope_stack.append({})
+        for arg_node in node.args.args: # ast.arg
+            self._add_definition(arg_node.arg, arg_node) # Parameters are definitions in func scope
+        if node.args.vararg: self._add_definition(node.args.vararg.arg, node.args.vararg)
+        if node.args.kwarg: self._add_definition(node.args.kwarg.arg, node.args.kwarg)
+        for kwarg_node_only in node.args.kwonlyargs:
+            self._add_definition(kwarg_node_only.arg, kwarg_node_only)
+
+        # Visit body
+        for stmt in node.body: self.visit(stmt)
+
+        self.scope_stack.pop()
+        # Do not call generic_visit(node) as we've manually handled relevant parts.
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        self.visit_FunctionDef(node) # Treat same as FunctionDef
+
+    def visit_Lambda(self, node: ast.Lambda):
+        # Default arguments are evaluated in outer scope
+        for default_expr in node.args.defaults: self.visit(default_expr)
+        for default_expr_kwonly in node.args.kw_defaults:
+            if default_expr_kwonly: self.visit(default_expr_kwonly)
+
+        # New scope for lambda parameters and body
+        self.scope_stack.append({})
+        for arg_node in node.args.args: self._add_definition(arg_node.arg, arg_node)
+        if node.args.vararg: self._add_definition(node.args.vararg.arg, node.args.vararg)
+        if node.args.kwarg: self._add_definition(node.args.kwarg.arg, node.args.kwarg)
+        for kwarg_node_only in node.args.kwonlyargs:
+            self._add_definition(kwarg_node_only.arg, kwarg_node_only)
+
+        self.visit(node.body) # Visit lambda body expression
+        self.scope_stack.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        # Class name is a definition in the outer scope
+        self._add_definition(node.name, node)
+
+        # Decorators are expressions evaluated in outer scope
+        for decorator in node.decorator_list: self.visit(decorator)
+        # Base classes are expressions evaluated in outer scope
+        for base in node.bases: self.visit(base)
+        for keyword in node.keywords: self.visit(keyword.value)
+
+        # New scope for class body (for class variables, methods)
+        self.scope_stack.append({})
+        for stmt in node.body: self.visit(stmt)
+        self.scope_stack.pop()
+
+    def visit_Name(self, node: ast.Name):
+        if isinstance(node.ctx, ast.Load):
+            self._add_use_dependencies(node, node.id)
+        # ast.Store context for simple names is handled by visit_Assign/AnnAssign targets
+        # ast.Del context could be a "kill" of definitions, not handled yet.
+        self.generic_visit(node) # Should not be needed if all contexts are handled
+
+    def visit_Assign(self, node: ast.Assign):
+        # RHS (value) is visited first (contains uses)
+        self.visit(node.value)
+        # Then LHS (targets) are definitions
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self._add_definition(target.id, target)
+            elif isinstance(target, ast.Attribute):
+                self.visit(target.value) # Visit the object part (e.g., 'self') for uses
+            elif isinstance(target, (ast.Tuple, ast.List)): # Unpacking assignment
+                for elt in target.elts:
+                    if isinstance(elt, ast.Name): self._add_definition(elt.id, elt)
+                    else: self.visit(elt)
+            else:
+                self.visit(target)
+
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        # Annotation is visited first (may contain uses)
+        if node.annotation: self.visit(node.annotation)
+        # Value (RHS) is visited next (may contain uses)
+        if node.value: self.visit(node.value)
+        # Target (LHS) is a definition
+        if isinstance(node.target, ast.Name):
+            self._add_definition(node.target.id, node.target)
+        elif isinstance(node.target, ast.Attribute):
+            self.visit(node.target.value) # Visit object part for uses
+        else:
+            self.visit(node.target)
+
+
+    def visit_For(self, node: ast.For):
+        # Iterable is evaluated first (uses)
+        self.visit(node.iter)
+
+        # Loop variables are definitions.
+        # Create a new scope for the loop body if targets are complex, or handle in current.
+        # For simplicity, new definitions shadow previous ones in the current scope.
+        if isinstance(node.target, ast.Name):
+            self._add_definition(node.target.id, node.target)
+        elif isinstance(node.target, (ast.Tuple, ast.List)):
+            for elt in node.target.elts:
+                if isinstance(elt, ast.Name): self._add_definition(elt.id, elt)
+                else: self.visit(elt)
+        else:
+            self.visit(node.target)
+
+        for stmt in node.body: self.visit(stmt)
+        if node.orelse:
+            for stmt_else in node.orelse: self.visit(stmt_else)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor):
+        self.visit_For(node)
+
+    def _visit_comprehension_generator(self, generator: ast.comprehension):
+        # Iter is evaluated in the scope where the comprehension appears.
+        self.visit(generator.iter)
+
+        # Target is defined. In Python 3, comps have their own scope for targets.
+        # This simplified visitor adds defs to the current function/lambda scope.
+        if isinstance(generator.target, ast.Name):
+            self._add_definition(generator.target.id, generator.target)
+        elif isinstance(generator.target, (ast.Tuple, ast.List)):
+             for elt in generator.target.elts:
+                if isinstance(elt, ast.Name): self._add_definition(elt.id, elt)
+                else: self.visit(elt)
+        else:
+            self.visit(generator.target)
+
+        for if_expr in generator.ifs: self.visit(if_expr) # Conditions are uses
+
+    def visit_ListComp(self, node: ast.ListComp):
+        # Comps run in a new scope in Python 3. This visitor simplifies.
+        # Generators are processed first (iter uses, target defs)
+        for generator in node.generators: self._visit_comprehension_generator(generator)
+        # Element expression uses vars defined in generators
+        self.visit(node.elt)
+
+    def visit_SetComp(self, node: ast.SetComp):
+        for generator in node.generators: self._visit_comprehension_generator(generator)
+        self.visit(node.elt)
+
+    def visit_DictComp(self, node: ast.DictComp):
+        for generator in node.generators: self._visit_comprehension_generator(generator)
+        self.visit(node.key); self.visit(node.value)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp):
+        for generator in node.generators: self._visit_comprehension_generator(generator)
+        self.visit(node.elt)
+
+    def visit_If(self, node: ast.If):
+        self.visit(node.test) # Uses in condition
+        for stmt in node.body: self.visit(stmt)
+        if node.orelse:
+            for stmt_else in node.orelse: self.visit(stmt_else)
+
+    def visit_While(self, node: ast.While):
+        self.visit(node.test) # Uses in condition
+        for stmt in node.body: self.visit(stmt)
+        if node.orelse:
+            for stmt_else in node.orelse: self.visit(stmt_else)
+
+    def visit_With(self, node: ast.With):
+        for item in node.items:
+            self.visit(item.context_expr) # Uses in context expression
+            if item.optional_vars: # Definitions from 'as var'
+                if isinstance(item.optional_vars, ast.Name):
+                    self._add_definition(item.optional_vars.id, item.optional_vars)
+                elif isinstance(item.optional_vars, (ast.Tuple, ast.List)):
+                    for elt in item.optional_vars.elts:
+                         if isinstance(elt, ast.Name): self._add_definition(elt.id, elt)
+                         else: self.visit(elt)
+                else:
+                    self.visit(item.optional_vars)
+        for stmt in node.body: self.visit(stmt)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith):
+        self.visit_With(node)
+
+    def visit_Try(self, node: ast.Try):
+        for stmt in node.body: self.visit(stmt)
+        for handler in node.handlers:
+            if handler.type: self.visit(handler.type)
+            if handler.name: # 'as e' variable is a definition
+                self._add_definition(handler.name, handler) # handler node itself as def site for 'e'
+            for stmt_handler in handler.body: self.visit(stmt_handler)
+        if node.orelse:
+            for stmt_else in node.orelse: self.visit(stmt_else)
+        if node.finalbody:
+            for stmt_finally in node.finalbody: self.visit(stmt_finally)
+
+# Helper to create a unique ID for an AST node based on file and location
+# This should be at module level or a static method if it doesn't need 'self'.
+# Making it module level for now.
+def _create_ast_node_id(file_path_str: str, node: ast.AST, category_suffix: str = "") -> NodeID:
+    """Creates a unique string ID for an AST node."""
+    node_name_part = ""
+    # Attempt to get a 'name' attribute if it exists
+    if hasattr(node, 'name') and isinstance(node.name, str):
+        node_name_part = node.name
+    elif isinstance(node, ast.Name): # For ast.Name nodes, the name is in 'id'
+        node_name_part = node.id
+    elif isinstance(node, ast.Attribute): # For ast.Attribute, use 'attr'
+        node_name_part = node.attr
+    elif isinstance(node, ast.arg): # NEW: Handle function parameters
+        node_name_part = node.arg
+    # Add more specific name extractions if needed for other node types.
+
+    base_id = f"{file_path_str}:{node.lineno}:{node.col_offset}:{type(node).__name__}"
+    if node_name_part:
+        base_id += f":{node_name_part}"
+    if category_suffix:
+        base_id += f":{category_suffix}"
+    return NodeID(base_id)
+
+
+class ControlDependenceVisitor(ast.NodeVisitor):
+    def __init__(self, file_path_str: str):
+        self.file_path_str: str = file_path_str
+        self.control_dependencies: ControlDependenceGraph = {}
+        self.current_control_stack: List[NodeID] = []
+
+    def _add_dependence(self, dependent_node: ast.AST, dependent_category_suffix: str = "statement"):
+        if self.current_control_stack: # If there is an active controller
+            controller_node_id = self.current_control_stack[-1]
+            dependent_node_id = _create_ast_node_id(self.file_path_str, dependent_node, dependent_category_suffix)
+            self.control_dependencies.setdefault(controller_node_id, set()).add(dependent_node_id)
+
+    def _process_body_and_orelse(self, node_with_body: Union[ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try]):
+        """Helper to process body and orelse blocks for a given controlling node."""
+        for child_node in node_with_body.body:
+            self._add_dependence(child_node)
+            self.visit(child_node)
+
+        if hasattr(node_with_body, 'orelse') and node_with_body.orelse:
+            # For Try nodes, orelse is handled specially, so skip here.
+            # For other nodes (If, For, While), orelse depends on the same primary condition/controller.
+            if not isinstance(node_with_body, ast.Try):
+                 for child_node in node_with_body.orelse:
+                    self._add_dependence(child_node)
+                    self.visit(child_node)
+
+    def visit_If(self, node: ast.If):
+        # The 'test' (condition) is the controller
+        controller_id = _create_ast_node_id(self.file_path_str, node.test, "if_condition")
+        self.current_control_stack.append(controller_id)
+        self._process_body_and_orelse(node) # Processes node.body and node.orelse
+        self.current_control_stack.pop()
+        # Do not call self.generic_visit(node) as children are handled by _process_body_and_orelse
+
+    def visit_For(self, node: ast.For):
+        # The iterable (node.iter) and target (node.target) define the control
+        # For simplicity, let's make the For node itself (or its iter) the controller.
+        controller_id = _create_ast_node_id(self.file_path_str, node.iter, "for_iterable") # or node itself
+        self.current_control_stack.append(controller_id)
+        self._process_body_and_orelse(node)
+        self.current_control_stack.pop()
+
+    def visit_AsyncFor(self, node: ast.AsyncFor):
+        controller_id = _create_ast_node_id(self.file_path_str, node.iter, "asyncfor_iterable") # or node itself
+        self.current_control_stack.append(controller_id)
+        self._process_body_and_orelse(node)
+        self.current_control_stack.pop()
+
+    def visit_While(self, node: ast.While):
+        controller_id = _create_ast_node_id(self.file_path_str, node.test, "while_condition")
+        self.current_control_stack.append(controller_id)
+        self._process_body_and_orelse(node)
+        self.current_control_stack.pop()
+
+    def visit_Try(self, node: ast.Try):
+        try_construct_id = _create_ast_node_id(self.file_path_str, node, "try_construct")
+
+        # Body of try (depends on the try_construct_id, meaning "entry into try")
+        self.current_control_stack.append(try_construct_id)
+        for child_node in node.body:
+            self._add_dependence(child_node)
+            self.visit(child_node)
+        self.current_control_stack.pop()
+
+        # Except handlers
+        for handler in node.handlers: # ast.ExceptHandler
+            # The handler's type (exception type) or the handler itself if type is None, is the condition
+            condition_node_for_handler = handler.type if handler.type else handler
+            handler_controller_id = _create_ast_node_id(self.file_path_str, condition_node_for_handler, "except_handler_condition")
+
+            self.current_control_stack.append(handler_controller_id)
+            for child_node in handler.body:
+                self._add_dependence(child_node)
+                self.visit(child_node)
+            self.current_control_stack.pop()
+
+        # Orelse block (depends on no exception from try body, so controlled by try_construct_id "success" path)
+        if node.orelse:
+            self.current_control_stack.append(try_construct_id)
+            for child_node in node.orelse:
+                self._add_dependence(child_node, "orelse_statement_after_try")
+                self.visit(child_node)
+            self.current_control_stack.pop()
+
+        # Finally block (always executes, but its execution is tied to the try construct scope)
+        # It's not strictly "controlled" by a condition in the same way as an If body,
+        # but rather its execution is guaranteed upon exiting the try-except-orelse structure.
+        # For CDG, we can consider it dependent on the try_construct_id.
+        if node.finalbody:
+            self.current_control_stack.append(try_construct_id)
+            for child_node in node.finalbody:
+                # Using a distinct suffix to clarify its nature if needed
+                self._add_dependence(child_node, "finally_statement")
+                self.visit(child_node)
+            self.current_control_stack.pop()
+
+    def visit_With(self, node: ast.With):
+        # Each 'withitem's context_expr can be seen as controlling the body.
+        # For simplicity, make the With node itself the controller for the body.
+        # The items are part of the setup.
+        with_controller_id = _create_ast_node_id(self.file_path_str, node, "with_block")
+
+        # Visit context expressions and optional_vars as they are evaluated before body
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars:
+                self.visit(item.optional_vars) # These are assignments, not typically controllers for the body
+
+        # Body depends on the successful setup of all with items.
+        self.current_control_stack.append(with_controller_id)
+        for child_node in node.body:
+            self._add_dependence(child_node)
+            self.visit(child_node)
+        self.current_control_stack.pop()
+
+    def visit_AsyncWith(self, node: ast.AsyncWith):
+        async_with_controller_id = _create_ast_node_id(self.file_path_str, node, "async_with_block")
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars:
+                self.visit(item.optional_vars)
+
+        self.current_control_stack.append(async_with_controller_id)
+        for child_node in node.body:
+            self._add_dependence(child_node)
+            self.visit(child_node)
+        self.current_control_stack.pop()
+
+# Reverted PyanalyzeTypeExtractionVisitor to simpler version
 class PyanalyzeTypeExtractionVisitor(ast.NodeVisitor):
     def __init__(self, file_path_str: str):
-        self.file_path_str = file_path_str # For creating unique keys
+        self.file_path_str = file_path_str
         self.type_info_map: Dict[str, str] = {}
-        # pyanalyze_dump_value should be available from the global scope of repository_digester
         self.dump_value_func = pyanalyze_dump_value
 
-    def _add_type_info(self, node: ast.AST, name: str, category: str = "variable"):
+    def _add_type_info(self, node: ast.AST, name: str, category: str):
         if hasattr(node, 'inferred_value') and self.dump_value_func:
             inferred_val = getattr(node, 'inferred_value')
             if inferred_val is not None:
@@ -65,20 +460,14 @@ class PyanalyzeTypeExtractionVisitor(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name):
         if isinstance(node.ctx, ast.Store):
-            self._add_type_info(node, node.id, "variable_def")
+            self._add_type_info(node, node.id, "variable_definition")
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
-        if node.returns:
-            self._add_type_info(node.returns, node.name, "function_return_annotation")
         for arg_node in node.args.args:
             self._add_type_info(arg_node, f"{node.name}.{arg_node.arg}", "parameter")
-        if node.args.vararg:
-            self._add_type_info(node.args.vararg, f"{node.name}.*{node.args.vararg.arg}", "parameter_vararg")
-        if node.args.kwarg:
-            self._add_type_info(node.args.kwarg, f"{node.name}.**{node.args.kwarg.arg}", "parameter_kwarg")
-        for kwarg_node_only in node.args.kwonlyargs:
-             self._add_type_info(kwarg_node_only, f"{node.name}.{kwarg_node_only.arg}", "parameter_kwonly")
+        if node.returns:
+             self._add_type_info(node.returns, f"{node.name}.<return_annotation>", "function_return_annotation")
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
@@ -86,22 +475,103 @@ class PyanalyzeTypeExtractionVisitor(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef):
         for child in node.body:
-            if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
-                self._add_type_info(child.target, f"{node.name}.{child.target.id}", "class_variable")
-            elif isinstance(child, ast.Assign):
-                for target in child.targets:
-                    if isinstance(target, ast.Name):
-                         self._add_type_info(target, f"{node.name}.{target.id}", "class_variable")
+            if isinstance(child, (ast.Assign, ast.AnnAssign)):
+                target = child.target if isinstance(child, ast.AnnAssign) else (child.targets[0] if child.targets else None)
+                if isinstance(target, ast.Name):
+                    self._add_type_info(target, f"{node.name}.{target.id}", "class_variable")
         self.generic_visit(node)
+
+class CallGraphVisitor(cst.CSTVisitor):
+    METADATA_DEPENDENCIES = (ParentNodeProvider, PositionProvider, QualifiedNameProvider, ScopeProvider)
+
+    def __init__(self, module_qname: str, file_path: Path, type_info: Optional[Dict[str, Any]], project_call_graph_ref: CallGraph):
+        super().__init__()
+        self.module_qname: str = module_qname
+        self.file_path: Path = file_path
+        self.type_info: Dict[str, Any] = type_info if type_info else {} # Ensure it's a dict
+        self.project_call_graph: CallGraph = project_call_graph_ref
+        self.current_fqn_stack: List[str] = [module_qname]
+
+    def _get_current_caller_fqn(self) -> Optional[NodeID]:
+        if not self.current_fqn_stack or len(self.current_fqn_stack) == 1 and self.current_fqn_stack[0] == self.module_qname:
+            return None
+        return NodeID(".".join(self.current_fqn_stack))
+
+    def _resolve_callee_fqn(self, call_node: cst.Call) -> Optional[NodeID]:
+        func_expr = call_node.func
+        # Simplified: using unparse for now. Will be refined with QualifiedNameProvider & type_info.
+        try:
+            # Attempt to create a string representation of the function/method being called
+            # This is highly heuristic and needs proper symbol resolution.
+            if isinstance(func_expr, cst.Name):
+                # Could be local func, class constructor, or imported func/class
+                # Check type_info for this name at this location for a more qualified name
+                # For now: assume it's in the current module or a globally known name
+                # This is a simplified key for lookup, actual key format from PyanalyzeTypeExtractionVisitor is different.
+                # This part needs careful alignment with how types are stored by Pyanalyze visitor.
+                # For now, assume callee_name is either module-local or already qualified if imported.
+                callee_name = func_expr.value
+                # If type_info suggests it's a class instantiation, point to __init__
+                # This requires a more structured type_info than just strings.
+                # For now, if it looks like a class name (PascalCase), assume constructor.
+                if re.match(r"^[A-Z]", callee_name): # Heuristic for class
+                    return NodeID(f"{self.module_qname}.{callee_name}.__init__")
+                return NodeID(f"{self.module_qname}.{callee_name}")
+            elif isinstance(func_expr, cst.Attribute): # obj.method()
+                # This is where type_info for 'obj' (func_expr.value) would be crucial.
+                # For now, try to unparse it.
+                obj_str = cst.Module([func_expr.value]).code.strip()
+                method_name = func_expr.attr.value
+                if obj_str == "self":
+                    if len(self.current_fqn_stack) > 1 and self.current_fqn_stack[-1] != self.module_qname:
+                        class_fqn_from_stack_parts = [p for p in self.current_fqn_stack if p != self.module_qname]
+                        if len(class_fqn_from_stack_parts) > 1: # module.class.method -> module.class
+                             class_context = ".".join(self.current_fqn_stack[:-1])
+                             return NodeID(f"{class_context}.{method_name}")
+                # Fallback: try to use unparsed object string. This is very approximate.
+                return NodeID(f"{self.module_qname}.{obj_str}.{method_name}") # Assuming obj_str is a class in same module
+        except Exception:
+            return None # Could not resolve
+        return None
+
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
+        fqn_parts = [self.module_qname]
+        if self.current_fqn_stack[-1] != self.module_qname : # Inside a class
+             fqn_parts.append(self.current_fqn_stack[-1])
+        fqn_parts.append(node.name.value)
+        # This constructed FQN is for the *definition*. We push only the local name.
+        self.current_fqn_stack.append(node.name.value)
+
+    def leave_FunctionDef(self, original_node: cst.FunctionDef) -> None:
+        if self.current_fqn_stack and self.current_fqn_stack[-1] == original_node.name.value:
+            self.current_fqn_stack.pop()
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        self.current_fqn_stack.append(node.name.value)
+
+    def leave_ClassDef(self, original_node: cst.ClassDef) -> None:
+        if self.current_fqn_stack and self.current_fqn_stack[-1] == original_node.name.value:
+            self.current_fqn_stack.pop()
+
+    def visit_Call(self, node: cst.Call) -> None:
+        caller_fqn = self._get_current_caller_fqn()
+        if caller_fqn:
+            callee_fqn = self._resolve_callee_fqn(node)
+            if callee_fqn:
+                self.project_call_graph.setdefault(caller_fqn, set()).add(callee_fqn)
 
 class RepositoryDigester:
     def __init__(self, repo_path: Union[str, Path]):
         self.repo_path = Path(repo_path).resolve()
         if not self.repo_path.is_dir():
             raise ValueError(f"Repository path {self.repo_path} is not a valid directory.")
-
         self._all_py_files: List[Path] = []
         self.digested_files: Dict[Path, ParsedFileResult] = {}
+
+        self.project_call_graph: CallGraph = {}
+        self.project_control_dependence_graph: ControlDependenceGraph = {}
+        self.project_data_dependence_graph: DataDependenceGraph = defaultdict(set) # NEW
 
         self.ts_parser: Optional[Parser] = None
         if Parser and get_language:
@@ -109,29 +579,38 @@ class RepositoryDigester:
                 if get_parser: self.ts_parser = get_parser('python')
                 else:
                     PYTHON_LANGUAGE = get_language('python')
-                    self.ts_parser = Parser()
-                    self.ts_parser.set_language(PYTHON_LANGUAGE)
-            except Exception as e:
-                print(f"Warning: Failed to initialize Tree-sitter Python parser: {e}.")
-                self.ts_parser = None
-        else:
-            print("Warning: tree-sitter or tree-sitter-languages not found during RepositoryDigester init. Tree-sitter parsing disabled.")
-            self.ts_parser = None
+                    self.ts_parser = Parser(); self.ts_parser.set_language(PYTHON_LANGUAGE) # type: ignore
+            except Exception as e: print(f"Warning: Failed to initialize Tree-sitter Python parser: {e}."); self.ts_parser = None
+        else: print("Warning: tree-sitter or tree-sitter-languages not found. Tree-sitter parsing disabled."); self.ts_parser = None
 
         self.pyanalyze_checker: Optional[Checker] = None
         if pyanalyze and Checker and Config and Options:
             try:
-                pyanalyze_options = Options(paths=[str(self.repo_path)])
-                pyanalyze_config = Config.from_options(pyanalyze_options)
-                self.pyanalyze_checker = Checker(config=pyanalyze_config)
-                print("Pyanalyze Checker initialized.")
-            except Exception as e:
-                print(f"Warning: Failed to initialize Pyanalyze Checker: {e}. Type inference will be disabled.")
-                self.pyanalyze_checker = None
-        else:
-            if not pyanalyze:
-                 print("Warning: pyanalyze library components not found. Type inference via Pyanalyze will be disabled.")
-            self.pyanalyze_checker = None
+                pyanalyze_options = Options(paths=[str(self.repo_path)]) # Corrected
+                pyanalyze_config = Config.from_options(pyanalyze_options) # Corrected
+                self.pyanalyze_checker = Checker(config=pyanalyze_config) # Corrected
+            except Exception as e: print(f"Warning: Failed to initialize Pyanalyze Checker: {e}."); self.pyanalyze_checker = None
+        elif not (pyanalyze and Checker and Config and Options): # Corrected
+             print("Warning: Pyanalyze library or its core components not found. Type inference disabled.") # Corrected
+             self.pyanalyze_checker = None
+
+    @staticmethod
+    def _get_module_qname_from_path(file_path: Path, project_root: Path) -> str:
+        try:
+            relative_path = file_path.relative_to(project_root)
+            return ".".join(relative_path.with_suffix("").parts)
+        except ValueError: return file_path.stem
+
+    @staticmethod
+    def _get_fqn_for_ast_node(node: ast.AST, module_qname: str, current_class_name: Optional[str] = None) -> Optional[NodeID]:
+        # This static method is for AST nodes, primarily for the graph building context later if needed.
+        # CallGraphVisitor uses its own internal stack for LibCST FQN generation.
+        node_name: Optional[str] = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            node_name = node.name
+        if not node_name: return None
+        if current_class_name: return NodeID(f"{module_qname}.{current_class_name}.{node_name}")
+        else: return NodeID(f"{module_qname}.{node_name}")
 
     def discover_python_files(self, ignored_dirs: Optional[List[str]] = None, ignored_files: Optional[List[str]] = None):
         self._all_py_files = []
@@ -148,125 +627,150 @@ class RepositoryDigester:
         print(f"RepositoryDigester: Discovered {len(self._all_py_files)} Python files.")
 
     def _infer_types_with_pyanalyze(self, file_path: Path, source_code: str) -> Optional[Dict[str, Any]]:
-        if not (pyanalyze and hasattr(pyanalyze, 'ast_annotator') and hasattr(pyanalyze.ast_annotator, 'annotate_code') and pyanalyze_dump_value):
-            print(f"Pyanalyze (or ast_annotator/dump_value) not available, skipping type inference for {file_path.name}.")
+        if not (self.pyanalyze_checker and pyanalyze and hasattr(pyanalyze, 'ast_annotator') and hasattr(pyanalyze.ast_annotator, 'annotate_code') and pyanalyze_dump_value):
             return {"info": "Pyanalyze components unavailable."}
-
         original_sys_path = list(sys.path)
-        file_dir_str = str(file_path.parent.resolve())
-        repo_path_str = str(self.repo_path.resolve())
-
+        file_dir_str = str(file_path.parent.resolve()); repo_path_str = str(self.repo_path)
         paths_to_add = []
         if file_dir_str not in sys.path: paths_to_add.append(file_dir_str)
         if repo_path_str not in sys.path and repo_path_str != file_dir_str: paths_to_add.append(repo_path_str)
-
-        for p_add in reversed(paths_to_add):
-            sys.path.insert(0, p_add)
-
+        for p_add in reversed(paths_to_add): sys.path.insert(0, p_add)
         type_info_map: Dict[str, Any] = {}
         try:
-            print(f"Pyanalyze: Annotating AST for {file_path.name}...")
-
-            if not source_code.strip():
-                 return {"info": "Empty source code, Pyanalyze not run."}
-
-            annotated_ast = pyanalyze.ast_annotator.annotate_code(source_code, str(file_path), show_errors=False, verbose=False)
-
+            if not source_code.strip(): return {"info": "Empty source code, Pyanalyze not run."}
+            annotated_ast = pyanalyze.ast_annotator.annotate_code(source_code, filename=str(file_path), show_errors=False, verbose=False) # type: ignore
             if annotated_ast:
-                print(f"Pyanalyze: Extracting types from annotated AST for {file_path.name}...")
                 visitor = PyanalyzeTypeExtractionVisitor(str(file_path))
                 visitor.visit(annotated_ast)
-                type_info_map = visitor.type_info_map
-                if not type_info_map:
-                    type_info_map = {"info": "Pyanalyze ran but no types extracted by visitor."}
-            else:
-                type_info_map = {"error": "Pyanalyze annotate_code returned None."}
-
-        except Exception as e:
-            print(f"Error during Pyanalyze processing for {file_path.name}: {e}")
-            type_info_map = {"error": f"Pyanalyze processing failed: {e}"}
+                type_info_map = visitor.type_info_map # type: ignore
+                if not type_info_map: type_info_map = {"info": "Pyanalyze ran but no types extracted by basic visitor."}
+            else: type_info_map = {"error": "Pyanalyze annotate_code returned None."}
+        except Exception as e: type_info_map = {"error": f"Pyanalyze processing failed: {e}"}
         finally:
-            new_sys_path = []
-            current_sys_path = list(sys.path)
-            for p in current_sys_path:
-                if p not in paths_to_add:
-                    new_sys_path.append(p)
-            sys.path = new_sys_path
-
-        return type_info_map if type_info_map else None
+            for p_remove in paths_to_add:
+                if sys.path and sys.path[0] == p_remove: sys.path.pop(0)
+                elif p_remove in sys.path: sys.path.remove(p_remove)
+        return type_info_map
 
     def parse_file(self, file_path: Path) -> ParsedFileResult:
-        source_code = ""
+        source_code = ""; libcst_module_obj=None; libcst_error_str=None; treesitter_tree_obj=None; treesitter_errors_flag=False; treesitter_error_msg=None; file_type_info=None
         try:
             with open(file_path, "r", encoding="utf-8") as f: source_code = f.read()
-        except Exception as e:
-            return ParsedFileResult(file_path=file_path, source_code="",
-                                    libcst_error=f"File read error: {e}",
-                                    treesitter_has_errors=True, treesitter_error_message=f"File read error: {e}",
-                                    type_info={"error": f"File read error: {e}"})
-
-        libcst_module_obj: Optional[cst.Module] = None
-        libcst_error_str: Optional[str] = None
-        try:
-            libcst_module_obj = cst.parse_module(source_code)
-        except cst.ParserSyntaxError as e_libcst_syntax:
-            libcst_error_str = f"LibCST ParserSyntaxError: {e_libcst_syntax.message} (lines {e_libcst_syntax.lines})"
-        except Exception as e_libcst_general:
-            libcst_error_str = f"LibCST general error: {e_libcst_general}"
-
-        treesitter_tree_obj: Optional[TreeSitterTree] = None
-        treesitter_errors_flag: bool = False
-        treesitter_error_msg: Optional[str] = None
+        except Exception as e: return ParsedFileResult(file_path, "", libcst_error=f"FRE: {e}", treesitter_has_errors=True, treesitter_error_message=f"FRE: {e}", type_info={"error": f"FRE: {e}"})
+        try: libcst_module_obj = cst.parse_module(source_code)
+        except cst.ParserSyntaxError as e_cs: libcst_error_str = f"LCST PSE: {e_cs.message}"
+        except Exception as e_cg: libcst_error_str = f"LCST Err: {e_cg}" # type: ignore
         if self.ts_parser:
             try:
                 treesitter_tree_obj = self.ts_parser.parse(bytes(source_code, "utf8"))
-                if treesitter_tree_obj.root_node.has_error:
-                    treesitter_errors_flag = True
-                    treesitter_error_msg = "Tree-sitter found syntax errors in the file."
-            except Exception as e_ts:
-                 treesitter_errors_flag = True; treesitter_error_msg = f"Tree-sitter parsing exception: {e_ts}"
-        else:
-            treesitter_errors_flag = True; treesitter_error_msg = "Tree-sitter parser not initialized."
+                if treesitter_tree_obj.root_node.has_error: treesitter_errors_flag=True; treesitter_error_msg="TS errors."
+            except Exception as e_ts: treesitter_errors_flag=True; treesitter_error_msg = f"TS Ex: {e_ts}"
+        else: treesitter_errors_flag=True; treesitter_error_msg = "TS not init."
+        if not libcst_error_str and source_code.strip():
+            try: file_type_info = self._infer_types_with_pyanalyze(file_path, source_code)
+            except Exception as e_ti: file_type_info = {"error": f"TypeInf Ex: {e_ti}"}
+        elif not source_code.strip(): file_type_info = {"info": "TypeInf skip empty."}
+        else: file_type_info = {"info": "TypeInf skip LCST err."}
+        return ParsedFileResult(file_path,source_code,libcst_module_obj,treesitter_tree_obj,libcst_error_str,treesitter_errors_flag,treesitter_error_msg,file_type_info)
 
-        file_type_info: Optional[Dict[str, Any]] = None
-        if not libcst_error_str and source_code.strip() :
-            try:
-                file_type_info = self._infer_types_with_pyanalyze(file_path, source_code)
-            except Exception as e_typeinf:
-                print(f"Error calling type inference for {file_path.name}: {e_typeinf}")
-                file_type_info = {"error": f"Type inference call failed: {e_typeinf}"}
-        elif not source_code.strip():
-             file_type_info = {"info": "Type inference skipped for empty file."}
-        else:
-            file_type_info = {"info": "Type inference skipped due to LibCST parsing errors."}
+    def _build_call_graph_for_file(self, file_path: Path, parsed_result: ParsedFileResult) -> None:
+        if not parsed_result.libcst_module:
+            print(f"Skipping call graph for {file_path.name} due to missing LibCST module.")
+            return
+        print(f"Building call graph for {file_path.name}...")
+        module_qname = self._get_module_qname_from_path(file_path, self.repo_path)
+        try:
+            visitor = CallGraphVisitor(module_qname, file_path, parsed_result.type_info, self.project_call_graph)
+            parsed_result.libcst_module.visit(visitor)
+        except Exception as e:
+            print(f"Error building call graph for {file_path.name}: {e}")
 
-        return ParsedFileResult(
-            file_path=file_path, source_code=source_code,
-            libcst_module=libcst_module_obj, treesitter_tree=treesitter_tree_obj,
-            libcst_error=libcst_error_str,
-            treesitter_has_errors=treesitter_errors_flag, treesitter_error_message=treesitter_error_msg,
-            type_info=file_type_info
-        )
+    def _build_control_dependencies_for_file(self, file_path: Path, parsed_result: ParsedFileResult) -> None:
+        if not parsed_result.source_code:
+            print(f"Skipping control dependence graph for {file_path.name} due to missing source code.")
+            return
+
+        # Determine a consistent file identifier for NodeIDs
+        file_id_prefix = ""
+        try:
+            # Use relative path from repo_path if possible, otherwise just the filename.
+            file_id_prefix = str(file_path.relative_to(self.repo_path))
+        except ValueError: # Not under repo_path (e.g. during isolated testing)
+            file_id_prefix = file_path.name
+
+        print(f"Building control dependence graph for {file_id_prefix}...")
+
+        try:
+            # Python's AST is generally sufficient for control flow structures
+            py_ast_module = ast.parse(parsed_result.source_code, filename=str(file_path))
+
+            visitor = ControlDependenceVisitor(file_id_prefix) # Pass the chosen file identifier string
+            visitor.visit(py_ast_module)
+
+            if visitor.control_dependencies:
+                 print(f"  Found {sum(len(deps) for deps in visitor.control_dependencies.values())} control dependencies in {file_id_prefix}.")
+
+            # Merge file-specific CDG into project-wide CDG
+            for controller_node_id, dependent_nodes_set in visitor.control_dependencies.items():
+                self.project_control_dependence_graph.setdefault(controller_node_id, set()).update(dependent_nodes_set)
+
+        except SyntaxError as e:
+            print(f"SyntaxError parsing {file_id_prefix} with ast for control dependence: {e}. Skipping CDG for this file.")
+        except Exception as e:
+            print(f"Error building control dependence graph for {file_id_prefix}: {e}")
+
+    def _build_data_dependencies_for_file(self, file_path: Path, parsed_result: ParsedFileResult) -> None:
+        if not parsed_result.source_code:
+            print(f"Skipping data dependence graph for {file_path.name} due to missing source code.")
+            return
+
+        file_id_prefix = str(file_path.relative_to(self.repo_path)) if file_path.is_absolute() and self.repo_path in file_path.parents else file_path.name
+        print(f"Building data dependence graph for {file_id_prefix}...")
+
+        try:
+            py_ast_module = ast.parse(parsed_result.source_code, filename=str(file_path))
+
+            visitor = DataDependenceVisitor(file_id_prefix)
+            visitor.visit(py_ast_module)
+
+            if visitor.data_dependencies:
+                 print(f"  Found {sum(len(deps) for deps in visitor.data_dependencies.values())} data dependencies in {file_id_prefix}.")
+
+            # Merge file-specific dependencies into the project-wide graph
+            for use_node_id, def_nodes_set in visitor.data_dependencies.items():
+                self.project_data_dependence_graph.setdefault(use_node_id, set()).update(def_nodes_set)
+
+        except SyntaxError as e:
+            print(f"SyntaxError parsing {file_id_prefix} with ast for data dependence: {e}. Skipping DDG for this file.")
+        except Exception as e:
+            print(f"Error building data dependence graph for {file_id_prefix}: {e}")
 
     def digest_repository(self):
         self.discover_python_files()
-        if not self._all_py_files:
-            print("RepositoryDigester: No Python files to digest.")
-            return
+        if not self._all_py_files: print("RepoDigester: No Python files."); return
         num_total_files = len(self._all_py_files)
-        print(f"RepositoryDigester: Starting digestion of {num_total_files} Python files...")
-
+        print(f"RepoDigester: Starting digestion: {num_total_files} files...")
         for i, py_file in enumerate(self._all_py_files):
-            print(f"RepositoryDigester: Processing file {i+1}/{num_total_files}: {py_file.name}...")
-            if py_file not in self.digested_files:
-                parse_result = self.parse_file(py_file)
-                self.digested_files[py_file] = parse_result
-        print(f"RepositoryDigester: Digestion complete.")
-        files_fully_ok_both_parsers = sum(1 for res in self.digested_files.values() if res.libcst_module and not res.libcst_error and res.treesitter_tree and not res.treesitter_has_errors)
-        files_with_any_libcst_error = sum(1 for res in self.digested_files.values() if res.libcst_error)
+            print(f"RepoDigester: File {i+1}/{num_total_files}: {py_file.name}...")
+            parsed_result = self.digested_files.get(py_file)
+            if not parsed_result:
+                parsed_result = self.parse_file(py_file) # parse_file now includes type inference attempt
+                self.digested_files[py_file] = parsed_result
+
+            # Ensure primary parsing (LibCST or TreeSitter) was somewhat successful before graph building
+            if parsed_result.libcst_module or (self.ts_parser and parsed_result.treesitter_tree):
+                self._build_call_graph_for_file(py_file, parsed_result)
+                self._build_control_dependencies_for_file(py_file, parsed_result)
+                # For DDG, we need source_code that is ast-parsable.
+                # _build_data_dependencies_for_file handles its own ast.parse errors.
+                if parsed_result.source_code: # Check if there's source to attempt parsing for DDG
+                    self._build_data_dependencies_for_file(py_file, parsed_result)
+
+        print(f"RepoDigester: Digestion complete. Processed files: {len(self.digested_files)}")
+        files_fully_ok_both_parsers = sum(1 for r in self.digested_files.values() if r.libcst_module and not r.libcst_error and r.treesitter_tree and not r.treesitter_has_errors) # Corrected
+        files_with_any_libcst_error = sum(1 for res in self.digested_files.values() if res.libcst_error) # Corrected
         files_with_any_treesitter_issue = sum(1 for res in self.digested_files.values() if res.treesitter_has_errors)
         files_with_type_info = sum(1 for res in self.digested_files.values() if res.type_info and not res.type_info.get("error") and not res.type_info.get("info"))
-
         print(f"  Total Python files found: {len(self._all_py_files)}")
         print(f"  Files for which parsing was attempted: {len(self.digested_files)}")
         print(f"  Files successfully parsed by LibCST & Tree-sitter (no errors): {files_fully_ok_both_parsers}")
@@ -299,16 +803,11 @@ if __name__ == '__main__':
         print(f"    TreeSitter Has Errors: {result.treesitter_has_errors}")
         print(f"    Type Info: {result.type_info}")
 
-    # Restore sys.path carefully
     paths_to_remove_main = []
     if str(dummy_repo.resolve()) in sys.path and str(dummy_repo.resolve()) not in original_sys_path_main :
          paths_to_remove_main.append(str(dummy_repo.resolve()))
 
-    cleaned_sys_path = [p for p in sys.path if p not in paths_to_remove_main]
-    # If original_sys_path had paths that are not in cleaned_sys_path now (e.g. due to other manipulations)
-    # this simple removal might not be perfect. A more robust way is to restore to original_sys_path_main
-    # if we are sure no other thread/part of program expects changes to sys.path.
-    # For this script's __main__, direct restoration is likely fine.
+    new_sys_path = [p for p in sys.path if p not in paths_to_remove_main] # type: ignore
     sys.path = original_sys_path_main
 
     import shutil
