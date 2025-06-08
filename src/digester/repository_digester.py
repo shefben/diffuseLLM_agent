@@ -1320,6 +1320,59 @@ class RepositoryDigester:
         else:
             print(f"Warning: Unknown event type '{event_type}' for path {abs_src_path}.")
 
+    # --- Methods for Phase 5 Context Broadcast ---
+    def get_code_snippets_for_phase(self, phase_ctx: Any) -> Dict[str, str]:
+        """
+        Mock: Retrieves code snippets relevant to the phase.
+        For now, returns the content of the target file if available, else a mock snippet.
+        """
+        # phase_ctx is 'Phase' from src.planner.phase_model, but using Any to avoid direct import if problematic
+        print(f"RepositoryDigester.get_code_snippets_for_phase: Mock for phase: {getattr(phase_ctx, 'operation_name', 'UnknownOp')}")
+        target_file_path_str = getattr(phase_ctx, 'target_file', None)
+        if target_file_path_str:
+            target_file_path = Path(target_file_path_str)
+            # Ensure we use the same path format as in self.digested_files (absolute or relative to repo_path)
+            # Assuming self.digested_files uses absolute paths or paths relative to self.repo_path
+            # For simplicity, let's try to match based on the name or relative path if target_file_path_str is not absolute.
+
+            # Attempt to find the file in digested_files
+            # This logic might need to be more robust depending on how target_file_path is stored/passed
+            found_parsed_result = None
+            for abs_path_key, parsed_file_res in self.digested_files.items():
+                if str(abs_path_key).endswith(target_file_path_str): # Simple endswith match
+                    found_parsed_result = parsed_file_res
+                    break
+
+            if found_parsed_result and found_parsed_result.source_code:
+                print(f"  Returning source code for: {target_file_path_str}")
+                return {str(target_file_path_str): found_parsed_result.source_code}
+            else:
+                print(f"  Target file {target_file_path_str} not found in digested files or no source. Returning mock snippet.")
+                return {str(target_file_path_str) if target_file_path_str else "mock_target.py": "def mock_function_from_get_code_snippets():\n    pass # Target not found"}
+        else:
+            print("  No target file in phase_ctx. Returning generic mock snippet.")
+            return {"mock_file.py": "def foo():\n    pass # No target file specified"}
+
+    def get_pdg_slice_for_phase(self, phase_ctx: Any) -> Dict[str, Any]:
+        """
+        Mock: Retrieves a program dependence graph (PDG) slice relevant to the phase.
+        """
+        # phase_ctx is 'Phase' from src.planner.phase_model
+        print(f"RepositoryDigester.get_pdg_slice_for_phase: Mock for phase: {getattr(phase_ctx, 'operation_name', 'UnknownOp')}")
+        # In a real implementation, this would query self.project_control_dependence_graph and self.project_data_dependence_graph
+        # based on the phase_ctx (e.g., target file, specific functions/lines from phase_ctx.parameters)
+        return {
+            "nodes": [
+                {"id": "node1", "label": "var x = 1", "file": getattr(phase_ctx, 'target_file', 'unknown.py')},
+                {"id": "node2", "label": "print(x)", "file": getattr(phase_ctx, 'target_file', 'unknown.py')}
+            ],
+            "edges": [
+                {"from": "node1", "to": "node2", "type": "data_dependency"}
+            ],
+            "info": "Mock PDG slice relevant to the phase context."
+        }
+
+
 if __name__ == '__main__':
     current_script_dir = Path(__file__).parent
     dummy_repo = current_script_dir / "_temp_dummy_repo_for_digester_"
