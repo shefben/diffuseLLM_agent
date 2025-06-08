@@ -84,15 +84,69 @@ class PhasePlanner:
         return hashlib.md5(spec_json_str.encode('utf-8')).hexdigest()
 
     def _get_graph_statistics(self) -> Dict[str, Any]:
-        graph_stats = {}
+        graph_stats = {
+            "num_call_graph_nodes": 0,
+            "num_call_graph_edges": 0,
+            "cg_density": 0.0,
+            "num_cdg_nodes": 0,
+            "num_cdg_edges": 0,
+            "cdg_density": 0.0,
+            "num_ddg_nodes": 0,
+            "num_ddg_edges": 0,
+            "ddg_density": 0.0,
+        }
+
+        # Call Graph (CG) statistics
         if hasattr(self.digester, 'project_call_graph') and self.digester.project_call_graph is not None:
-            graph_stats["num_call_graph_nodes"] = len(self.digester.project_call_graph)
-            graph_stats["num_call_graph_edges"] = sum(len(edges) for edges in self.digester.project_call_graph.values())
-        else:
-            graph_stats["num_call_graph_nodes"] = 0
-            graph_stats["num_call_graph_edges"] = 0
-        print(f"PhasePlanner: Generated graph stats for scorer: {graph_stats}")
-        return graph_stats
+            cg_nodes = self.digester.project_call_graph
+            graph_stats["num_call_graph_nodes"] = len(cg_nodes)
+            graph_stats["num_call_graph_edges"] = sum(len(edges) for edges in cg_nodes.values())
+            if graph_stats["num_call_graph_nodes"] > 1:
+                v = graph_stats["num_call_graph_nodes"]
+                e = graph_stats["num_call_graph_edges"]
+                graph_stats["cg_density"] = e / (v * (v - 1))
+            else:
+                graph_stats["cg_density"] = 0.0
+
+        # Control Dependence Graph (CDG) statistics
+        if hasattr(self.digester, 'project_control_dependence_graph') and self.digester.project_control_dependence_graph is not None:
+            cdg_nodes = self.digester.project_control_dependence_graph
+            graph_stats["num_cdg_nodes"] = len(cdg_nodes)
+            graph_stats["num_cdg_edges"] = sum(len(edges) for edges in cdg_nodes.values()) # Assuming similar structure to CG
+            if graph_stats["num_cdg_nodes"] > 1:
+                v = graph_stats["num_cdg_nodes"]
+                e = graph_stats["num_cdg_edges"]
+                graph_stats["cdg_density"] = e / (v * (v - 1))
+            else:
+                graph_stats["cdg_density"] = 0.0
+
+        # Data Dependence Graph (DDG) statistics
+        if hasattr(self.digester, 'project_data_dependence_graph') and self.digester.project_data_dependence_graph is not None:
+            ddg_nodes = self.digester.project_data_dependence_graph
+            graph_stats["num_ddg_nodes"] = len(ddg_nodes)
+            graph_stats["num_ddg_edges"] = sum(len(edges) for edges in ddg_nodes.values()) # Assuming similar structure to CG
+            if graph_stats["num_ddg_nodes"] > 1:
+                v = graph_stats["num_ddg_nodes"]
+                e = graph_stats["num_ddg_edges"]
+                graph_stats["ddg_density"] = e / (v * (v - 1))
+            else:
+                graph_stats["ddg_density"] = 0.0
+
+        # Ensure all keys are present even if graphs are missing
+        final_stats = {
+            "num_call_graph_nodes": graph_stats.get("num_call_graph_nodes", 0),
+            "num_call_graph_edges": graph_stats.get("num_call_graph_edges", 0),
+            "cg_density": graph_stats.get("cg_density", 0.0),
+            "num_cdg_nodes": graph_stats.get("num_cdg_nodes", 0),
+            "num_cdg_edges": graph_stats.get("num_cdg_edges", 0),
+            "cdg_density": graph_stats.get("cdg_density", 0.0),
+            "num_ddg_nodes": graph_stats.get("num_ddg_nodes", 0),
+            "num_ddg_edges": graph_stats.get("num_ddg_edges", 0),
+            "ddg_density": graph_stats.get("ddg_density", 0.0),
+        }
+
+        print(f"PhasePlanner: Generated graph stats for scorer: {final_stats}")
+        return final_stats
 
     def _score_candidate_plan_with_llm(self, candidate_plan: List['Phase'], graph_stats: Dict[str, Any]) -> float:
         if not self.phi2_scorer or self.phi2_scorer != "mock_phi2_scorer_initialized":
