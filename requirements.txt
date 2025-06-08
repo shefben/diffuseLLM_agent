@@ -14,3 +14,8 @@ sentencepiece
 
 # For code parsing and modification (identifier renaming)
 libcst
+
+# For Phase 2: Repository Digestion (Parsing & Type Inference)
+tree-sitter
+tree-sitter-python
+pyright
