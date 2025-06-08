@@ -1,5 +1,5 @@
 # src/planner/phase_planner.py
-from typing import List, Dict, Any, Union, Optional, TYPE_CHECKING, Type # Added Type
+from typing import List, Dict, Any, Union, Optional, TYPE_CHECKING, Type, Tuple, Callable # Added Type, Tuple, Callable
 from pathlib import Path
 import json
 import hashlib
@@ -20,19 +20,48 @@ from .refactor_grammar import BaseRefactorOperation, REFACTOR_OPERATION_INSTANCE
 # Fallback for RepositoryDigester if not available (e.g. in isolated subtask)
 # This is primarily for type hinting if RepositoryDigester cannot be imported directly.
 # The actual instance is passed to __init__.
+if TYPE_CHECKING:
+    from src.agent_group.collaborative_agent_group import CollaborativeAgentGroup
+    # Ensure Phase is available for type hints if not already.
+    from .phase_model import Phase
+
 if TYPE_CHECKING or 'RepositoryDigester' not in globals(): # Keep this for RepositoryDigester hint
     class RepositoryDigester: # type: ignore
         project_call_graph: Dict
-        # Add other attributes if _get_graph_statistics accesses them directly.
+        project_control_dependence_graph: Optional[Dict] = None
+        project_data_dependence_graph: Optional[Dict] = None
+        # Add methods expected by CollaborativeAgentGroup.run context_data population
+        def get_project_overview(self) -> Dict[str, Any]:
+            print("MockDigester.get_project_overview called")
+            return {"mock_overview": True}
+        def get_file_content(self, path: Path) -> Optional[str]:
+            print(f"MockDigester.get_file_content called for {path}")
+            return f"# Mock content for {path}" if path else None
         pass # Ensure class body is not empty
 
 
 class PhasePlanner:
+    @staticmethod
+    def mock_validator_handle(patch: Any, digester: 'RepositoryDigester', phase_ctx: 'Phase') -> Tuple[bool, Any, Optional[str]]:
+        print(f"PhasePlanner.mock_validator_handle: Validating patch: {str(patch)[:100]} for phase: {phase_ctx.operation_name}")
+        if isinstance(patch, dict) and patch.get("value") and "FAIL_VALIDATION" in str(patch.get("value")): # Check actual value
+            return False, {"reason": "Simulated validation failure triggered by FAIL_VALIDATION string"}, "Traceback: Contains FAIL_VALIDATION"
+        return True, {"detail": "Mock validation successful"}, None
+
+    @staticmethod
+    def mock_score_style_handle(patch: Any, style_profile: Dict[str, Any]) -> float:
+        print(f"PhasePlanner.mock_score_style_handle: Scoring style for patch: {str(patch)[:100]} with profile keys: {list(style_profile.keys())}")
+        if isinstance(patch, dict) and patch.get("value") and "BAD_STYLE" in str(patch.get("value")): # Check actual value
+            return 0.3 # Low score for bad style
+        return 0.9 # Default high score
+
     def __init__(
         self,
         style_fingerprint_path: Path,
         digester: 'RepositoryDigester',
         scorer_model_config: Any, # Config for Phi-2 LLM scorer
+        naming_conventions_db_path: Path, # New argument
+        project_root_path: Path, # New argument
         refactor_op_map: Optional[Dict[str, BaseRefactorOperation]] = None,
         beam_width: int = 3 # Default beam_width to 3
     ):
@@ -50,7 +79,10 @@ class PhasePlanner:
              print(f"Warning: Could not load style fingerprint from {style_fingerprint_path} due to: {e_gen}. Using empty fingerprint.")
 
         self.digester = digester
-        self.scorer_model_config = scorer_model_config # Store config
+        self.scorer_model_config = scorer_model_config
+        self.naming_conventions_db_path = naming_conventions_db_path # Store
+        self.project_root_path = project_root_path # Store
+
         self.refactor_op_map: Dict[str, BaseRefactorOperation] = refactor_op_map if refactor_op_map is not None else REFACTOR_OPERATION_INSTANCES
 
         self.beam_width = beam_width
@@ -70,6 +102,21 @@ class PhasePlanner:
         else:
             print("Info: LLM scorer is disabled or no config provided for planner. Falling back to random scoring.")
             self.phi2_scorer = None
+
+        # Import and Initialize CollaborativeAgentGroup
+        from src.agent_group.collaborative_agent_group import CollaborativeAgentGroup
+        self.agent_group: 'CollaborativeAgentGroup' = CollaborativeAgentGroup(
+            style_profile=self.style_fingerprint,
+            naming_conventions_db_path=self.naming_conventions_db_path,
+            llm_core_config=None,
+            diffusion_core_config=None
+        )
+        print("PhasePlanner: CollaborativeAgentGroup initialized.")
+
+        # Store mock handles from static methods
+        self.validator_handle: Callable[[Any, 'RepositoryDigester', 'Phase'], Tuple[bool, Any, Optional[str]]] = PhasePlanner.mock_validator_handle
+        self.score_style_handle: Callable[[Any, Dict[str, Any]], float] = PhasePlanner.mock_score_style_handle
+        print("PhasePlanner: Mock validator and style scorer handles configured.")
 
         self.plan_cache: Dict[str, List[Phase]] = {}
         # self.phi2_scorer_cache: Dict[str, float] = {} # Optional cache
@@ -334,37 +381,102 @@ Score:"""
         best_plan = self._beam_search_for_plan(spec, graph_stats)
 
         if best_plan:
-            self.plan_cache[cache_key] = best_plan
+            self.plan_cache[cache_key] = best_plan # Cache the plan (list of Phase objects)
             print("PhasePlanner: Plan generated and cached.")
+
+            print("\n--- Running CollaborativeAgentGroup for each phase in the best plan ---")
+            execution_summary = [] # To store results of agent_group.run for each phase
+            for phase_obj in best_plan: # best_plan is List[Phase]
+                print(f"Executing phase: {phase_obj.operation_name} on {phase_obj.target_file or 'repo-level'}")
+                try:
+                    # The CollaborativeAgentGroup's run method signature is:
+                    # run(self, phase_ctx: 'Phase', digester: 'RepositoryDigester',
+                    #     validator_handle: Callable, score_style_handle: Callable) -> Optional[Any]:
+                    # It uses its own initialized style_profile and naming_conventions_db_path.
+                    validated_patch = self.agent_group.run(
+                        phase_ctx=phase_obj,
+                        digester=self.digester,
+                        validator_handle=self.validator_handle,
+                        score_style_handle=self.score_style_handle
+                    )
+
+                    if validated_patch:
+                        print(f"Phase {phase_obj.operation_name}: Successfully generated patch: {str(validated_patch)[:100]}...")
+                        execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "success", "patch_preview": str(validated_patch)[:100]})
+                    else:
+                        print(f"Phase {phase_obj.operation_name}: Failed to generate a patch (returned None).")
+                        execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "failed_no_patch"})
+                        # Decide if planning should stop if a phase fails to produce a patch.
+                        # For now, continue with other phases.
+                except Exception as e:
+                    print(f"Error running agent group for phase {phase_obj.operation_name}: {type(e).__name__} - {e}")
+                    import traceback
+                    traceback.print_exc() # Print full traceback for debugging
+                    execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "error", "error_message": str(e)})
+                    # Decide if planning should stop if a phase errors.
+                    # For now, continue with other phases.
+
+            print("--- CollaborativeAgentGroup execution finished for all phases ---")
+            print("Execution Summary:")
+            for summary_item in execution_summary:
+                print(f"  - {summary_item}")
+            # The method still returns the plan (List[Phase]).
+            # The execution_summary is for logging/observation at this stage.
+            # Future: Might return a more complex object bundling plan and execution results.
         else:
-            print("PhasePlanner: Failed to generate a plan.")
-        return best_plan
+            print("PhasePlanner: Failed to generate a plan (beam search returned empty).")
+        return best_plan # Return the list of Phase objects as per original signature
 
 if __name__ == '__main__':
     from unittest.mock import MagicMock # For __main__ example
     print("--- PhasePlanner Example Usage (Conceptual) ---")
 
-    class MockDigesterForPlannerMain:
+    # Using the actual RepositoryDigester mock defined at the class level for TYPE_CHECKING
+    # This ensures methods like get_project_overview are available if called by agent_group
+    class MockDigesterForPlannerMain(RepositoryDigester): # Inherit from the placeholder to ensure methods
         def __init__(self):
+            super().__init__() # Call super if it has an init
             self.project_call_graph = {"module.func_a": {"module.func_b"}}
+            self.project_control_dependence_graph = {}
+            self.project_data_dependence_graph = {}
+        # Override mock methods if more specific behavior is needed for main example
+        def get_project_overview(self) -> Dict[str, Any]:
+            print("__main__ MockDigester.get_project_overview called")
+            return {"files_in_project": 5, "main_language": "python"}
+        def get_file_content(self, path: Path) -> Optional[str]:
+            content = f"# __main__ Mock Content for {path}\n# BAD_STYLE example\n# FAIL_VALIDATION example"
+            print(f"__main__ MockDigester.get_file_content for {path} returning: '{content[:50]}...'")
+            return content if path else None
+
 
     dummy_digester_main = MockDigesterForPlannerMain()
 
     dummy_style_path_main = Path("_temp_dummy_style_main.json")
     with open(dummy_style_path_main, "w") as f:
-        json.dump({"line_length": 99, "preferred_quotes": "double"}, f)
+        json.dump({"line_length": 99, "preferred_quotes": "double", "indent": 4}, f)
 
-    dummy_scorer_config_main = {"model_path": "path/to/phi2/model_placeholder"}
+    dummy_scorer_config_main = {"model_path": "path/to/phi2/model_placeholder", "enabled": True}
+
+    dummy_naming_db_path_main = Path("_temp_dummy_naming_db.json")
+    if not dummy_naming_db_path_main.exists():
+        with open(dummy_naming_db_path_main, "w") as f:
+            json.dump({"function_name_style": "snake_case"}, f)
+
+    dummy_project_root_main = Path("_temp_mock_project_root")
+    dummy_project_root_main.mkdir(parents=True, exist_ok=True)
+
 
     try:
-        if 'Spec' not in globals() or not hasattr(Spec, 'model_fields') or \
-           'Phase' not in globals() or not hasattr(Phase, 'model_fields'):
-             raise ImportError("Spec or Phase Pydantic models not correctly defined for __main__.")
+        # Ensure Spec and Phase are imported or defined
+        # from .spec_model import Spec # (already imported at top)
+        # from .phase_model import Phase # (already imported at top)
 
         planner = PhasePlanner(
             style_fingerprint_path=dummy_style_path_main,
-            digester=dummy_digester_main, # type: ignore
-            scorer_model_config=dummy_scorer_config_main, # Pass the config
+            digester=dummy_digester_main,
+            scorer_model_config=dummy_scorer_config_main,
+            naming_conventions_db_path=dummy_naming_db_path_main, # New
+            project_root_path=dummy_project_root_main,           # New
             beam_width=2
         )
 
@@ -384,22 +496,39 @@ if __name__ == '__main__':
         print(f"\nPlanning for spec: {spec_instance_main.issue_description}")
         plan_phases_list_main = planner.plan_phases(spec_instance_main)
 
-        print("\nGenerated Plan Phases:")
+        print("\n--- Post-execution: Generated Plan Phases (from planner return) ---")
         if plan_phases_list_main:
-            for p_main in plan_phases_list_main:
+            for i, p_main in enumerate(plan_phases_list_main):
+                print(f"Details for Planned Phase {i+1}:")
                 if hasattr(p_main, 'model_dump_json'):
                     print(p_main.model_dump_json(indent=2))
                 else:
-                    print(f"  Phase ID: {p_main.id}, Op: {p_main.operation}, Target: {p_main.target}, Payload: {p_main.payload}")
+                    # Fallback for older/non-Pydantic Phase models
+                    print(f"  Operation: {getattr(p_main, 'operation_name', 'N/A')}, Target: {getattr(p_main, 'target_file', 'N/A')}, Params: {getattr(p_main, 'parameters', {})}")
         else:
-            print("  No plan generated.")
+            print("  No plan was generated by the planner.")
 
-        print(f"\nRequesting plan again for the same spec (should be cached):")
-        _ = planner.plan_phases(spec_instance_main)
+        # print(f"\nRequesting plan again for the same spec (should be cached):")
+        # plan_phases_list_cached = planner.plan_phases(spec_instance_main)
+        # print(f"Cached plan request returned {len(plan_phases_list_cached) if plan_phases_list_cached else 0} phases.")
+        # Note: Agent group execution would re-run unless caching is implemented after agent execution.
 
+    except ImportError as e_imp:
+        print(f"ImportError in PhasePlanner __main__ example: {e_imp}. Check imports for Spec, Phase, or other dependencies.")
     except Exception as e_main:
         print(f"Error in PhasePlanner __main__ example: {type(e_main).__name__}: {e_main}")
+        import traceback
+        traceback.print_exc()
     finally:
         if dummy_style_path_main.exists():
             dummy_style_path_main.unlink()
+        if dummy_naming_db_path_main.exists():
+            dummy_naming_db_path_main.unlink()
+        if dummy_project_root_main.exists():
+            import shutil # Import shutil here for cleanup
+            try:
+                shutil.rmtree(dummy_project_root_main)
+                print(f"Cleaned up dummy project root: {dummy_project_root_main}")
+            except OSError as e_ose:
+                print(f"Error removing directory {dummy_project_root_main}: {e_ose}")
     print("\n--- PhasePlanner Example Done ---")
