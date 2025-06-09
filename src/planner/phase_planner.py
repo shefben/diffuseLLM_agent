@@ -21,7 +21,8 @@ from .refactor_grammar import BaseRefactorOperation, REFACTOR_OPERATION_INSTANCE
 from src.validator.validator import Validator
 from src.builder.commit_builder import CommitBuilder
 from src.agent_group.exceptions import PhaseFailure
-from src.profiler.llm_interfacer import get_llm_score_for_text # New import
+from src.profiler.llm_interfacer import get_llm_score_for_text
+from src.utils.memory_logger import log_successful_patch # For Success Memory Logging
 
 # REFACTOR_OPERATION_CLASSES is not directly used by PhasePlanner logic, REFACTOR_OPERATION_INSTANCES is.
 
@@ -71,10 +72,13 @@ class PhasePlanner:
         llm_model_path: Optional[str] = None,
         refactor_op_map: Optional[Dict[str, BaseRefactorOperation]] = None,
         beam_width: int = 3,
-        verbose: bool = False # Added verbose flag
+        verbose: bool = False,
+        data_dir_path: Optional[Path] = None # For Success Memory
     ):
         self.style_fingerprint: Dict[str, Any] = {}
-        self.verbose = verbose # Store verbose flag
+        self.verbose = verbose
+        self.data_dir_path = data_dir_path if data_dir_path else project_root_path / ".agent_data" # Default data_dir_path
+        if self.verbose: print(f"PhasePlanner: Data directory for logs (e.g. success memory): {self.data_dir_path}")
         try:
             if style_fingerprint_path.exists():
                 with open(style_fingerprint_path, "r", encoding="utf-8") as f:
@@ -410,143 +414,162 @@ Score:"""
                 try:
                     # The CollaborativeAgentGroup's run method signature is:
                     # run(self, phase_ctx: 'Phase', digester: 'RepositoryDigester',
-                    #     validator_handle: Callable, score_style_handle: Callable) -> Optional[Any]:
+                    #     validator_handle: Callable, score_style_handle: Callable) -> Tuple[Optional[str], Optional[str]]:
                     # It uses its own initialized style_profile and naming_conventions_db_path.
-                    validated_patch = self.agent_group.run(
+                    validated_patch_script, patch_source = self.agent_group.run( # Expects two return values now
                         phase_ctx=phase_obj,
                         digester=self.digester,
-                        validator_handle=self.validator_handle,
+                        validator_handle=self.validator_handle, # This is self.validator.validate_patch
                         score_style_handle=self.score_style_handle
                     )
 
-                    if validated_patch:
-                        print(f"Phase {phase_obj.operation_name}: Successfully generated patch: {str(validated_patch)[:100]}...")
-                        execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "success", "patch_preview": str(validated_patch)[:100]})
-                    else:
-                        print(f"Phase {phase_obj.operation_name}: Failed to generate a patch (returned None).")
-                        execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "failed_no_patch"})
-                        # Decide if planning should stop if a phase fails to produce a patch.
-                        # For now, continue with other phases.
-                except Exception as e:
-                    print(f"Error running agent group for phase {phase_obj.operation_name}: {type(e).__name__} - {e}")
-                    import traceback
-                    traceback.print_exc() # Print full traceback for debugging
-                    execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "error", "error_message": str(e)})
-                    # Decide if planning should stop if a phase errors.
-                    # For now, continue with other phases.
-                    # For this subtask, process only the first successful patch
-                    if validated_patch: # A patch script was successfully generated and (mock) validated by agent group
-                        print("\nPhasePlanner: Phase successful. Preparing for CommitBuilder integration.")
-
-                        print("\nPhasePlanner: Phase successful. Preparing for CommitBuilder integration.")
-
-                        # 1. Real Patch Application & Diff Summary Generation
+                    if validated_patch_script:
+                        print(f"Phase {phase_obj.operation_name}: Successfully generated patch script (source: {patch_source}). Preview: {str(validated_patch_script)[:100]}...")
+                        execution_summary.append({
+                            "phase_operation": phase_obj.operation_name,
+                            "target": phase_obj.target_file,
+                            "status": "success",
+                            "patch_preview": str(validated_patch_script)[:100],
+                            "patch_source": patch_source
+                        })
+                        # --- Start: Real Patch Application & CommitBuilder Integration ---
                         target_file_path_str = phase_obj.target_file
+                        # target_file_path is the relative path from project_root
                         target_file_path = Path(target_file_path_str) if target_file_path_str else None
                         modified_content: Optional[str] = None
-                        diff_summary = "Diff generation skipped: No target file, patch script, or patch application failed." # Default
+                        diff_summary = "Diff generation skipped: No target file or patch application failed."
 
                         if not target_file_path:
-                            print("PhasePlanner Warning: Phase target_file is None. Cannot apply patch or proceed with CommitBuilder for this phase.")
-                            execution_summary.append({"phase_operation": phase_obj.operation_name, "target": "None", "status": "error", "error_message": "Target file was None"})
-                            continue
+                            print(f"PhasePlanner Warning: Phase target_file is None for phase '{phase_obj.operation_name}'. Cannot apply patch or proceed with CommitBuilder.")
+                            execution_summary.append({"phase_operation": phase_obj.operation_name, "target": "None", "status": "error", "error_message": "Target file was None for CommitBuilder step", "patch_source": patch_source})
+                            continue # Skip to next phase_obj
 
-                        # Ensure target_file_path is relative for map keys, but absolute for digester.get_file_content
                         abs_target_file_path = self.project_root_path / target_file_path
+                        original_content = self.digester.get_file_content(abs_target_file_path)
+                        if original_content is None:
+                            original_content = ""
+                            if self.verbose: print(f"PhasePlanner: Target file '{abs_target_file_path}' is new or content not found. Applying patch to empty content.")
 
-                        if validated_patch: # validated_patch is the LibCST script string
-                            original_content = self.digester.get_file_content(abs_target_file_path)
-                            if original_content is None:
-                                original_content = ""
-                                if self.verbose: print(f"PhasePlanner: Target file '{abs_target_file_path}' is new or content not found. Applying patch to empty content.")
+                        try:
+                            if self.verbose: print(f"PhasePlanner: Applying validated LibCST script to '{abs_target_file_path}' (source: {patch_source})...")
+                            modified_content = apply_libcst_codemod_script(original_content, validated_patch_script)
+                            if self.verbose: print(f"PhasePlanner: LibCST script applied successfully to '{target_file_path}'.")
 
-                            try:
-                                if self.verbose: print(f"PhasePlanner: Applying validated LibCST script to '{abs_target_file_path}'...")
-                                modified_content = apply_libcst_codemod_script(original_content, validated_patch)
+                            diff_lines = list(difflib.unified_diff(
+                                original_content.splitlines(keepends=True),
+                                modified_content.splitlines(keepends=True),
+                                fromfile=f"a/{target_file_path.name}",
+                                tofile=f"b/{target_file_path.name}"
+                            ))
+                            if diff_lines:
+                                diff_summary = "".join(diff_lines)
+                            else:
+                                diff_summary = f"No textual changes detected for '{target_file_path}' after patch application."
+                            if self.verbose: print(f"PhasePlanner: Diff summary generated for '{target_file_path}' (length {len(diff_summary)}).")
 
-                                if self.verbose: print(f"PhasePlanner: LibCST script applied successfully to '{target_file_path}'.")
+                        except PatchApplicationError as pae:
+                            print(f"PhasePlanner Error: Failed to apply validated patch script for {abs_target_file_path}: {pae}")
+                            # Update execution_summary for this specific failure point
+                            last_summary_item = execution_summary[-1]
+                            last_summary_item["status"] = "error"
+                            last_summary_item["error_message"] = f"Patch application failed: {pae}"
+                            continue # Skip CommitBuilder for this phase
+                        except Exception as e_apply:
+                            print(f"PhasePlanner Error: Unexpected error during patch application or diff for {abs_target_file_path}: {e_apply}")
+                            last_summary_item = execution_summary[-1]
+                            last_summary_item["status"] = "error"
+                            last_summary_item["error_message"] = f"Unexpected patch application/diff error: {e_apply}"
+                            continue # Skip CommitBuilder for this phase
 
-                                diff_lines = list(difflib.unified_diff(
-                                    original_content.splitlines(keepends=True),
-                                    modified_content.splitlines(keepends=True),
-                                    fromfile=f"a/{target_file_path.name}", # Use relative name for diff
-                                    tofile=f"b/{target_file_path.name}"
-                                ))
-                                if diff_lines:
-                                    diff_summary = "".join(diff_lines)
-                                    if self.verbose: print(f"PhasePlanner: Generated diff summary for '{target_file_path}' (length {len(diff_summary)}).")
-                                else:
-                                    diff_summary = f"No textual changes detected by difflib for '{target_file_path}' after patch application."
-                                    if self.verbose: print(f"PhasePlanner: {diff_summary}")
-
-                            except PatchApplicationError as pae:
-                                print(f"PhasePlanner Error: Failed to apply validated patch script for {abs_target_file_path}: {pae}")
-                                execution_summary.append({"phase_operation": phase_obj.operation_name, "target": target_file_path_str, "status": "error", "error_message": f"Patch application failed: {pae}"})
-                                continue
-                            except Exception as e_apply:
-                                print(f"PhasePlanner Error: Unexpected error during patch application or diff for {abs_target_file_path}: {e_apply}")
-                                execution_summary.append({"phase_operation": phase_obj.operation_name, "target": target_file_path_str, "status": "error", "error_message": f"Unexpected patch application/diff error: {e_apply}"})
-                                continue
-                        else: # No validated_patch script from agent_group
-                            print(f"PhasePlanner: No validated patch script from agent group for phase targeting '{target_file_path}'. Skipping CommitBuilder.")
-                            execution_summary.append({"phase_operation": phase_obj.operation_name, "target": target_file_path_str, "status": "skipped", "reason": "No script from agent"})
+                        if modified_content is None: # Should be caught by exceptions above, but as a safeguard
+                            print(f"PhasePlanner: Skipping CommitBuilder for phase targeting '{target_file_path}' due to no modified content.")
+                            last_summary_item = execution_summary[-1]
+                            last_summary_item["status"] = "skipped"
+                            last_summary_item["reason"] = "No modified content after application attempt"
                             continue
 
-                        if modified_content is None:
-                            print(f"PhasePlanner: Skipping CommitBuilder for phase targeting '{target_file_path}' due to patch application failure or no script.")
-                            continue
+                        validated_patch_content_map = {target_file_path: modified_content} # Key is relative path
 
-                        # Use relative path for the map key
-                        validated_patch_content_map = {target_file_path: modified_content}
-                        print(f"PhasePlanner: Created validated_patch_content_map for CommitBuilder. Key: '{target_file_path}'")
-
-                        # 3. Validator Results Summary (already good from previous steps)
-                        validator_results_summary = "Mock validator results: All checks passed on final attempt by agent group." # Default
+                        validator_results_summary = "Validation results summary not available (agent history structure might have changed or was empty)."
                         if self.agent_group.patch_history:
                             try:
-                                last_attempt_info = self.agent_group.patch_history[-1] # (script, is_valid, score, error_traceback)
-                                last_error_tb = last_attempt_info[3] if len(last_attempt_info) > 3 else "N/A"
-                                validator_results_summary = f"Final validation in agent: Valid={last_attempt_info[1]}, Score={last_attempt_info[2]:.2f}, Last Error='{str(last_error_tb)[:50]}...'"
+                                last_attempt_info = self.agent_group.patch_history[-1]
+                                last_error_tb_info = last_attempt_info[3] if len(last_attempt_info) > 3 else "N/A"
+                                validator_results_summary = f"Final validation in agent: Valid={last_attempt_info[1]}, Score={last_attempt_info[2]:.2f}, Last Error='{str(last_error_tb_info)[:50]}...'"
                             except Exception as e_hist:
-                                print(f"PhasePlanner: Error accessing patch_history: {e_hist}")
-                                validator_results_summary = "Could not retrieve detailed validator summary from agent_group.patch_history."
-                        print(f"PhasePlanner: (Mock) Gathered validator_results_summary: '{validator_results_summary}'.")
+                                print(f"PhasePlanner: Error accessing patch_history for validator summary: {e_hist}")
 
-                        # 4. Define branch_name and commit_title
-                        # Ensure random is imported if not already: import random at the top of the file
-                        branch_name = f"feature/auto-patch-{spec.issue_description[:20].replace(' ', '-').lower()}-{random.randint(1000,9999)}"
-                        commit_title = f"Auto-apply patch for '{spec.issue_description[:40]}...'"
-                        print(f"PhasePlanner: Defined branch: '{branch_name}', title: '{commit_title}'.")
+                        branch_name_suffix = getattr(spec, 'issue_id', None) or spec.issue_description[:20].replace(' ', '-').lower()
+                        branch_name = f"feature/auto-patch-{branch_name_suffix}-{random.randint(1000,9999)}"
+                        commit_title = f"Auto-apply patch for '{spec.issue_description[:40]}...' (Source: {patch_source})"
 
-                        # 5. Call CommitBuilder
-                        print("PhasePlanner: Calling CommitBuilder.process_and_submit_patch...")
-                        self.commit_builder.process_and_submit_patch(
+                        if self.verbose: print("PhasePlanner: Calling CommitBuilder.process_and_submit_patch...")
+                        saved_patch_set_path = self.commit_builder.process_and_submit_patch(
                             validated_patch_content_map=validated_patch_content_map,
                             spec=spec,
                             diff_summary=diff_summary,
                             validator_results_summary=validator_results_summary,
                             branch_name=branch_name,
                             commit_title=commit_title,
-                            project_root=self.project_root_path
+                            project_root=self.project_root_path,
+                            patch_source=patch_source
                         )
-                        print("PhasePlanner: CommitBuilder call finished.")
-                        # For this subtask, break after processing the first successful patch
-                        print("PhasePlanner: Breaking after first successful phase patch submission (mock).")
-                        break
+
+                        if saved_patch_set_path:
+                            print(f"PhasePlanner: CommitBuilder successfully saved patch set to: {saved_patch_set_path}")
+                            # --- Log to Success Memory ---
+                            if self.data_dir_path and validated_patch_script: # Ensure there's a script and path
+                                log_success = log_successful_patch(
+                                    data_directory=self.data_dir_path,
+                                    spec=spec, # The overall spec for the plan
+                                    diff_summary=diff_summary,
+                                    successful_script_str=validated_patch_script,
+                                    patch_source=patch_source,
+                                    verbose=self.verbose
+                                )
+                                if log_success:
+                                    if self.verbose: print(f"PhasePlanner: Successfully logged patch to success memory in {self.data_dir_path}.")
+                                elif self.verbose: # Only print warning if verbose, as it's non-critical
+                                    print(f"PhasePlanner Warning: Failed to log patch to success memory in {self.data_dir_path}.")
+                            elif self.verbose:
+                                print(f"PhasePlanner: Success memory logging skipped (data_dir_path not set or no script).")
+                            # --- End Log to Success Memory ---
+                            if self.verbose: print("PhasePlanner: Breaking after first successful phase patch processing for this subtask.")
+                            break # Process only the first successful phase
+                        else: # CommitBuilder failed to save
+                            print(f"PhasePlanner: CommitBuilder failed to save patch set for phase {phase_obj.operation_name}.")
+                            # Ensure last_summary_item is correctly referenced if execution_summary was just updated for success
+                            if execution_summary and execution_summary[-1]["status"] == "success":
+                                execution_summary[-1]["status"] = "error" # Update status
+                                execution_summary[-1]["error_message"] = "CommitBuilder failed to save patch set"
+                            else: # If summary was not updated for success yet, add new error entry
+                                execution_summary.append({
+                                    "phase_operation": phase_obj.operation_name,
+                                    "target": phase_obj.target_file,
+                                    "status": "error",
+                                    "error_message": "CommitBuilder failed to save patch set after successful patch generation",
+                                    "patch_source": patch_source
+                                })
+                        # --- End: Real Patch Application & CommitBuilder Integration ---
+                    else: # validated_patch_script is None
+                        print(f"Phase {phase_obj.operation_name}: Failed to generate a patch script (returned None). Source info: {patch_source}")
+                        execution_summary.append({
+                            "phase_operation": phase_obj.operation_name,
+                            "target": phase_obj.target_file,
+                            "status": "failed_no_patch",
+                            "patch_source": patch_source
+                        })
+
                 except PhaseFailure as pf_e:
                     print(f"PhasePlanner: CollaborativeAgentGroup reported PhaseFailure for phase {phase_obj.operation_name}: {pf_e}")
-                    execution_summary.append({"phase": phase_obj.operation_name, "status": "PhaseFailure", "error": str(pf_e)})
-                    # Decide if we should stop the whole plan if one phase fails critically
+                    execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "PhaseFailure", "error_message": str(pf_e)})
                     print("PhasePlanner: Stopping plan execution due to PhaseFailure.")
                     break
                 except Exception as e:
                     print(f"Error running agent group for phase {phase_obj.operation_name}: {type(e).__name__} - {e}")
                     import traceback
-                    traceback.print_exc() # Print full traceback for debugging
-                    execution_summary.append({"phase": phase_obj.operation_name, "status": "error", "error_message": str(e)})
-                    # Optionally, break here:
-                    # print("Stopping further phase execution due to error.")
-                    # break
+                    traceback.print_exc()
+                    execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "error", "error_message": str(e)})
 
             print("--- CollaborativeAgentGroup execution finished for all phases (or broke early) ---")
             print("Execution Summary (from planner):")
@@ -599,12 +622,15 @@ if __name__ == '__main__':
 
     # Mock LLM model path for agent-based repair (can be a non-existent path for this test as LLM loading is mocked/guarded)
     mock_llm_repair_model_path = "_temp_mock_repair_model.gguf"
+    # For success memory logging in __main__
+    temp_data_dir_for_main = Path("_temp_agent_data_main")
 
 
     try:
         # Ensure Spec and Phase are imported or defined
         # from .spec_model import Spec # (already imported at top)
         # from .phase_model import Phase # (already imported at top)
+        temp_data_dir_for_main.mkdir(parents=True, exist_ok=True) # Create temp data dir for test
 
         planner = PhasePlanner(
             style_fingerprint_path=dummy_style_path_main,
@@ -612,8 +638,10 @@ if __name__ == '__main__':
             scorer_model_config=dummy_scorer_config_main,
             naming_conventions_db_path=dummy_naming_db_path_main,
             project_root_path=dummy_project_root_main,
-            llm_model_path=mock_llm_repair_model_path, # New
-            beam_width=2
+            llm_model_path=mock_llm_repair_model_path,
+            beam_width=2,
+            verbose=True, # Enable verbose for __main__ test
+            data_dir_path=temp_data_dir_for_main # Pass data_dir for success memory
         )
 
         # Example Spec using the imported spec_model.Spec structure
@@ -660,6 +688,16 @@ if __name__ == '__main__':
             dummy_style_path_main.unlink()
         if dummy_naming_db_path_main.exists():
             dummy_naming_db_path_main.unlink()
+
+        # Cleanup for temp_data_dir_for_main
+        if temp_data_dir_for_main.exists():
+            import shutil # Ensure shutil is imported for rmtree
+            try:
+                shutil.rmtree(temp_data_dir_for_main)
+                print(f"Cleaned up temporary data directory: {temp_data_dir_for_main}")
+            except OSError as e_ose_data:
+                print(f"Error removing temporary data directory {temp_data_dir_for_main}: {e_ose_data}")
+
         if dummy_project_root_main.exists():
             import shutil # Import shutil here for cleanup
             try:

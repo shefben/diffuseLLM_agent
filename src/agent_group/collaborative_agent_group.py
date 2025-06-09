@@ -182,14 +182,16 @@ class CollaborativeAgentGroup:
         self,
         phase_ctx: 'Phase',
         digester: 'RepositoryDigester',
-        validator_handle: Callable[[Any, 'RepositoryDigester', 'Phase'], Tuple[bool, Any, Optional[str]]],
+        validator_handle: Callable[[Optional[str], Path, 'RepositoryDigester', Path], Tuple[bool, Optional[str]]], # Updated signature from R5.7
         score_style_handle: Callable[[Any, Dict[str, Any]], float]
-    ) -> Optional[Any]:
-        # Initialize variables to store outputs from agent calls
-        scaffold_patch_script: Optional[str] = None
-        edit_summary_list: Optional[List[str]] = None
-        completed_patch_script: Optional[str] = None # For output of diffusion pass
-        # self.current_patch_candidate is initialized in __init__ and will hold the evolving script/patch
+    ) -> Tuple[Optional[str], Optional[str]]: # Returns (script_string, source_info_string)
+        final_patch_script: Optional[str] = None
+        patch_source_info: Optional[str] = None
+
+        # self.current_patch_candidate will hold the LibCST SCRIPT string.
+        # It's initialized to None in __init__.
+        # Patch history stores (script_str, is_valid, score, error_traceback_str)
+        # For this subtask, patch_source_info is not added to patch_history records yet.
 
         """
         Main execution loop for the agent group to generate and refine a patch.
@@ -243,35 +245,23 @@ class CollaborativeAgentGroup:
 
         if scaffold_patch_script is None or edit_summary_list is None:
             print("LLMCore failed to generate an initial scaffold script or edit summary. Aborting.")
-            return None
+            return None, "LLMCore_scaffold_failed" # Return None script, source info
+        patch_source_info = "LLMCore_scaffold_v1"
 
-        print(f"Step 2: LLM scaffolding pass complete. Received script (len: {len(scaffold_patch_script)}) and summary (items: {len(edit_summary_list)}).")
-        print(f"   Edit Summary: {edit_summary_list}")
-        # print(f"   Scaffold Script:\n{scaffold_patch_script}") # Potentially very long
+        print(f"Step 2: LLM scaffolding pass complete. Script len: {len(scaffold_patch_script)}, Summary: {edit_summary_list}")
 
-        # --- Phase 5: Step 2 (continued, now Step 3 in Phase 5 doc): Diffusion Core expands scaffold ---
-        # Ensure edit_summary_list is passed correctly (e.g. as a string or processed if needed by expand_scaffold)
-        # DiffusionCore.expand_scaffold expects edit_summary as str. Let's join the list.
+        # --- Diffusion Core expands scaffold ---
         diffusion_edit_summary_str = "; ".join(edit_summary_list) if edit_summary_list else ""
-
-        # Call expand_scaffold
         completed_patch_script = self.diffusion_agent.expand_scaffold(scaffold_patch_script, diffusion_edit_summary_str, context_data)
 
         if completed_patch_script is None:
             print("DiffusionCore failed to expand/complete the scaffold script. Aborting.")
-            return None
-        print(f"Step 3: Diffusion expansion pass complete. Completed script (len: {len(completed_patch_script)}).")
-        # print(f"   Completed Script:\n{completed_patch_script}") # Potentially very long
+            return None, patch_source_info # Keep last known source
 
-        # At this point, completed_patch_script is a string (the LibCST script).
-        # For the iterative refinement loop, self.current_patch_candidate needs to be
-        # the actual patch object/data structure that the validator_handle expects.
-        # For now, the placeholder validator_handle in PhasePlanner might accept this string,
-        # or we assume a (not-yet-implemented) step here to "execute" or "interpret" this script
-        # to produce a patch object.
-        # Let's assume for this subtask, current_patch_candidate will store the script string.
-        # This will need adjustment in Phase 5 Step 3 (Validate Patch).
+        if completed_patch_script != scaffold_patch_script : # Update source if script changed
+            patch_source_info = "DiffusionCore_expansion_v1"
         self.current_patch_candidate = completed_patch_script
+        print(f"Step 3: Diffusion expansion pass complete. Script len: {len(self.current_patch_candidate)}. Source: {patch_source_info}")
 
         # --- Iterative Refinement Loop ---
         # self.max_repair_attempts defined in __init__
@@ -391,21 +381,52 @@ class CollaborativeAgentGroup:
                     is_valid = False # Mark as not valid to trigger repair or end loop
                     # Skip directly to repair logic or end of loop processing
                 else:
-                    final_is_valid, validation_payload, final_error_traceback = validator_handle(self.current_patch_candidate, digester, phase_ctx)
-                    final_style_score = score_style_handle(self.current_patch_candidate, self.style_profile)
-                    print(f"Loop Step C.1 (Post-Polish Validation): Valid: {final_is_valid}, Style: {final_style_score:.2f}")
+                    # Validator_handle now expects: (modified_code_content: str, target_file: Path, digester: 'RepositoryDigester', project_root: Path)
+                    # We need to apply the polished script first.
+                    # This re-application logic is similar to the start of the loop.
 
-                    # Update history with the polished attempt
+                    temp_error_applying_polished: Optional[str] = None
+                    modified_content_after_polish: Optional[str] = None
+                    if target_file_str: # target_file_str defined at the start of the loop
+                        try:
+                            # original_content was fetched at the start of the loop iteration.
+                            # If current_patch_candidate (polished script) is None, this block is skipped.
+                            modified_content_after_polish = apply_libcst_codemod_script(original_content if original_content is not None else "", self.current_patch_candidate)
+                        except PatchApplicationError as pae_polish:
+                            temp_error_applying_polished = f"PatchApplicationError after polish: {pae_polish}"
+                        except Exception as e_polish_apply:
+                             temp_error_applying_polished = f"Unexpected error applying polished script: {e_polish_apply}"
+                    else: # Should not happen if initial checks for target_file_str are done
+                        temp_error_applying_polished = "Target file string was missing for post-polish validation."
+
+                    if temp_error_applying_polished:
+                        final_is_valid = False
+                        final_error_traceback = temp_error_applying_polished
+                        final_style_score = 0.0 # Or previous score
+                        print(f"CollaborativeAgentGroup Error: {final_error_traceback}")
+                    elif modified_content_after_polish is not None and target_file_str:
+                        final_is_valid, final_error_traceback = validator_handle( # type: ignore
+                            modified_content_after_polish, Path(target_file_str), digester, digester.repo_path
+                        )
+                        final_style_score = score_style_handle(self.current_patch_candidate, self.style_profile) # Score the script
+                    else: # Should not be reached if logic is correct
+                        final_is_valid = False
+                        final_error_traceback = "Internal error: Could not re-apply polished script for final validation."
+                        final_style_score = 0.0
+                        print(f"CollaborativeAgentGroup Error: {final_error_traceback}")
+
+
+                    print(f"Loop Step C.1 (Post-Polish Validation): Valid: {final_is_valid}, Style: {final_style_score:.2f}")
                     self.patch_history.append((self.current_patch_candidate, final_is_valid, final_style_score, final_error_traceback))
-                    is_valid = final_is_valid # Update is_valid based on post-polish validation
-                    error_traceback = final_error_traceback if final_error_traceback else error_traceback # Persist new error if any
+                    is_valid = final_is_valid
+                    error_traceback = final_error_traceback if final_error_traceback else error_traceback
 
                     if final_is_valid:
                         print(f"Polished script is valid. Final style score: {final_style_score:.2f}. This script is the result of this phase.")
-                        return self.current_patch_candidate
+                        patch_source_info = f"LLMCore_polish_iteration_{i + 1}" # Or more specific based on pre-repair/post-repair
+                        return self.current_patch_candidate, patch_source_info
                     else:
                         print("Polished script failed validation.")
-                        # error_traceback should be set from final_error_traceback for the repair step
                         # Fall through to repair logic for the polished_but_failed_script
 
             # If not valid after initial check, or if polish made it invalid / returned None:

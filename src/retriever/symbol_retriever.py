@@ -1,14 +1,24 @@
 # src/retriever/symbol_retriever.py
-from typing import List, Optional, TYPE_CHECKING, Set, Any # Added Set and Any
+from typing import List, Optional, TYPE_CHECKING, Set, Any, Dict # Added Set, Any, Dict
 import numpy as np
+from pathlib import Path # Added Path
+import re # For basic keyword splitting
+
+# Attempt to import load_success_memory, handle if not available (e.g. during isolated testing)
+try:
+    from src.utils import load_success_memory
+except ImportError:
+    load_success_memory = None
+    print("SymbolRetriever Warning: Failed to import load_success_memory. Success memory retrieval will be disabled.")
+
 
 if TYPE_CHECKING:
-    from src.digester.repository_digester import RepositoryDigester # To avoid circular import if used only for type hint
+    from src.digester.repository_digester import RepositoryDigester
 
 class SymbolRetriever:
-    def __init__(self, digester: 'RepositoryDigester', verbose: bool = False):
+    def __init__(self, digester: 'RepositoryDigester', data_dir_path: Optional[Path] = None, verbose: bool = False):
         """
-        Initializes the SymbolRetriever with a RepositoryDigester instance.
+        Initializes the SymbolRetriever.
 
         Args:
             digester: An instance of RepositoryDigester that has already processed
@@ -29,14 +39,14 @@ class SymbolRetriever:
             print("SymbolRetriever Warning: Numpy not found globally. Some operations might fail if not using digester.np_module.")
 
         self.digester = digester
-        self.embedding_model = digester.embedding_model # Might be None
-        self.faiss_index = digester.faiss_index       # Might be None
-        self.faiss_id_to_metadata = digester.faiss_id_to_metadata # Might be empty
-        self.np_module = np # Uses the global np imported in this file for its own operations
+        self.embedding_model = digester.embedding_model
+        self.faiss_index = digester.faiss_index
+        self.faiss_id_to_metadata = digester.faiss_id_to_metadata
+        self.np_module = np
+        self.data_dir_path = data_dir_path # Store data_dir_path
         self.verbose = verbose
         if self.verbose:
-            print(f"SymbolRetriever initialized. Embedding model ready: {bool(self.embedding_model)}, FAISS index ready: {bool(self.faiss_index)}")
-
+            print(f"SymbolRetriever initialized. Embedding model: {bool(self.embedding_model)}, FAISS: {bool(self.faiss_index)}, DataDir: {self.data_dir_path}")
 
     def _l2_normalize_vector(self, vector: np.ndarray) -> np.ndarray:
         """L2 normalizes a vector."""
@@ -124,15 +134,15 @@ class SymbolRetriever:
         print(f"SymbolRetriever: Constructed symbol_bag: '{symbol_bag_string[:200]}...'")
         return symbol_bag_string
 
-    def get_context_symbols_for_spec_fusion(self, max_symbols: Optional[int] = 500) -> List[str]:
+    def _get_repository_fqns_for_context(self, max_symbols: Optional[int] = 500) -> List[str]:
         """
-        Retrieves a list of FQNs for context, prioritizing relevant item types.
-        This implementation primarily uses faiss_id_to_metadata.
+        Retrieves a list of FQNs from the repository digest for general context,
+        prioritizing relevant item types.
         """
-        if self.verbose: print("SymbolRetriever: Retrieving context symbols for spec fusion...")
+        if self.verbose: print("SymbolRetriever: Retrieving repository FQNs for context...")
 
         if not hasattr(self.digester, 'faiss_id_to_metadata') or not self.digester.faiss_id_to_metadata:
-            if self.verbose: print("  SymbolRetriever Warning: faiss_id_to_metadata is empty or not available in digester. No symbols to retrieve.")
+            if self.verbose: print("  SymbolRetriever Warning: faiss_id_to_metadata is empty or not available in digester. No repository FQNs to retrieve.")
             return []
 
         collected_fqns: Set[str] = set()
@@ -163,8 +173,76 @@ class SymbolRetriever:
             if self.verbose: print(f"  SymbolRetriever: Truncating symbol list from {len(sorted_fqns)} to {max_symbols}.")
             return sorted_fqns[:max_symbols]
 
-        if self.verbose: print(f"  SymbolRetriever: Returning {len(sorted_fqns)} context symbols.")
+        if self.verbose: print(f"  SymbolRetriever: Returning {len(sorted_fqns)} repository FQNs for context.")
         return sorted_fqns
+
+    def get_enriched_context_for_spec_fusion(
+        self,
+        raw_issue_text: str,
+        max_fqns: int = 300,
+        max_success_examples: int = 2
+    ) -> Dict[str, Any]:
+        """
+        Retrieves relevant FQNs from the codebase and examples from success memory
+        to provide enriched context for spec fusion.
+        """
+        if self.verbose:
+            print(f"SymbolRetriever: Getting enriched context for spec fusion. Issue: '{raw_issue_text[:100]}...'")
+
+        # 1. Get FQNs from repository digest
+        repo_fqn_list = self._get_repository_fqns_for_context(max_symbols=max_fqns)
+
+        # 2. Get success examples from memory
+        success_examples_for_prompt: List[Dict[str, str]] = []
+        if self.data_dir_path and load_success_memory:
+            all_success_entries = load_success_memory(self.data_dir_path, verbose=self.verbose)
+
+            if all_success_entries:
+                # Basic keyword search (simplified)
+                # Split by non-alphanumeric to get words, then lowercase, filter short words
+                issue_keywords = set(
+                    word for word in re.split(r'\W+', raw_issue_text.lower()) if len(word) > 2
+                )
+                if not issue_keywords and self.verbose:
+                    print("  SymbolRetriever: No suitable keywords from issue text for success memory search.")
+
+                scored_entries = []
+                for entry in all_success_entries:
+                    entry_desc = entry.get("spec_issue_description", "")
+                    if not entry_desc: continue # Skip entries with no description
+
+                    entry_keywords = set(
+                        word for word in re.split(r'\W+', entry_desc.lower()) if len(word) > 2
+                    )
+                    overlap = len(issue_keywords.intersection(entry_keywords))
+
+                    if overlap > 1: # Require at least 2 matching keywords
+                        scored_entries.append({"score": overlap, "entry": entry})
+
+                # Sort by score (descending) then by timestamp (descending, for recency)
+                scored_entries.sort(key=lambda x: (x["score"], x["entry"].get("timestamp_utc", "")), reverse=True)
+
+                if self.verbose:
+                    print(f"  SymbolRetriever: Found {len(scored_entries)} potentially relevant success memory entries (score > 1).")
+
+                for scored_item in scored_entries[:max_success_examples]:
+                    entry_data = scored_item["entry"]
+                    # Truncate script preview to keep context manageable
+                    script_preview = entry_data.get("successful_script", "")
+                    if len(script_preview) > 300 : script_preview = script_preview[:300] + "..."
+
+                    success_examples_for_prompt.append({
+                        "issue": entry_data.get("spec_issue_description", "N/A"),
+                        "script_preview": script_preview,
+                        "source": entry_data.get("patch_source", "Unknown"),
+                        "score_DEBUG": scored_item["score"] # For debugging relevance
+                    })
+        elif self.verbose:
+            if not self.data_dir_path: print("  SymbolRetriever: No data_dir_path for success memory.")
+            if not load_success_memory: print("  SymbolRetriever: load_success_memory function not available.")
+
+        return {"fqns": repo_fqn_list, "success_examples": success_examples_for_prompt}
+
 
 # Example Usage (conceptual, as it needs a populated RepositoryDigester)
 if __name__ == '__main__':

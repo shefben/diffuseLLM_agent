@@ -67,31 +67,49 @@ class SpecFusion:
         if self.verbose:
             print(f"\nSpecFusion: Normalizing request: '{raw_issue_text[:100]}...'")
 
-        # 1. Retrieve Context Symbols
-        context_symbols_list: Optional[List[str]] = None
-        context_symbols_string: Optional[str] = "No context symbols retrieved." # Default message
+        # 1. Retrieve Enriched Context (FQNs and Success Examples)
+        fqn_list: List[str] = []
+        success_examples: List[Dict[str, str]] = []
+        context_symbols_string = "No specific context symbols or examples retrieved." # Default
 
         if self.symbol_retriever:
             try:
-                if self.verbose: print("SpecFusion: Retrieving context symbols for spec fusion...")
-                # Call the new method, assuming a default max_symbols or make it configurable if needed.
-                context_symbols_list = self.symbol_retriever.get_context_symbols_for_spec_fusion()
+                if self.verbose: print("SpecFusion: Retrieving enriched context (FQNs and examples)...")
+                # Max_fqns and max_success_examples can be made configurable if needed.
+                retrieved_context = self.symbol_retriever.get_enriched_context_for_spec_fusion(raw_issue_text)
 
-                if context_symbols_list:
-                    context_symbols_string = ", ".join(context_symbols_list)
-                    if self.verbose:
-                        print(f"SpecFusion: Retrieved {len(context_symbols_list)} context symbols. Preview (first 200 chars): '{context_symbols_string[:200]}...'")
+                fqn_list = retrieved_context.get("fqns", [])
+                success_examples = retrieved_context.get("success_examples", [])
+
+                context_parts = []
+                if fqn_list:
+                    context_parts.append("Relevant Project Symbols FQNs: " + ", ".join(fqn_list))
+                    if self.verbose: print(f"SpecFusion: Retrieved {len(fqn_list)} FQNs.")
+
+                if success_examples:
+                    example_strs = ["Previously successful related examples:"]
+                    for i, ex in enumerate(success_examples, 1):
+                        example_strs.append(f"Example {i}:\n  Issue: {ex.get('issue')}\n  Successful Script Preview: {ex.get('script_preview')}")
+                    context_parts.append("\n".join(example_strs))
+                    if self.verbose: print(f"SpecFusion: Retrieved {len(success_examples)} success examples.")
+
+                if context_parts:
+                    context_symbols_string = "\n\n".join(context_parts)
+
+                if self.verbose and context_symbols_string != "No specific context symbols or examples retrieved.":
+                     print(f"SpecFusion: Enriched context string preview (first 300 chars): '{context_symbols_string[:300]}...'")
                 elif self.verbose:
-                    print("SpecFusion: SymbolRetriever returned no context symbols.")
+                    print("SpecFusion: No FQNs or success examples retrieved to form context string.")
+
             except Exception as e_retrieval:
-                print(f"SpecFusion Warning: Error during symbol retrieval: {e_retrieval}. Proceeding with limited/no symbol context.")
-                context_symbols_string = f"Error retrieving symbols: {str(e_retrieval)[:100]}" # Short error summary
+                print(f"SpecFusion Warning: Error during enriched context retrieval: {e_retrieval}. Proceeding with limited/no context.")
+                context_symbols_string = f"Error retrieving enriched context: {str(e_retrieval)[:100]}"
         elif self.verbose:
-            print("SpecFusion: SymbolRetriever not available. Proceeding without symbol context.")
+            print("SpecFusion: SymbolRetriever not available. Proceeding without enriched context.")
 
         # 2. Call T5Client
         if self.verbose: print("SpecFusion: Requesting YAML spec from T5Client...")
-        yaml_spec_str = self.t5_client.request_spec_from_text(raw_issue_text, context_symbols_string)
+        yaml_spec_str = self.t5_client.request_spec_from_text(raw_issue_text, context_symbols_string) # Pass the enriched context
 
         if yaml_spec_str is None:
             print("SpecFusion Error: T5Client failed to generate YAML spec string (returned None).")

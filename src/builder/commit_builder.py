@@ -250,7 +250,8 @@ class CommitBuilder:
         changelog_entry: str,
         spec: 'Spec',
         commit_title: Optional[str] = None,
-        validator_results_summary: Optional[str] = None
+        validator_results_summary: Optional[str] = None,
+        patch_source: Optional[str] = None # New parameter
     ) -> Optional[Path]:
         """
         Saves the formatted patch content, changelog, metadata, and other info to the filesystem.
@@ -329,6 +330,7 @@ class CommitBuilder:
                 "commit_title": commit_title if commit_title else "N/A",
                 "original_spec": spec_data,
                 "validator_results_summary": validator_results_summary if validator_results_summary else "N/A",
+                "patch_source": patch_source if patch_source else "Unknown", # Added patch_source
                 "generation_timestamp_utc": datetime.utcnow().isoformat() + "Z",
                 "commit_builder_version": "0.1.0" # Example version
             }
@@ -350,10 +352,11 @@ class CommitBuilder:
         spec: 'Spec',
         diff_summary: str,
         validator_results_summary: str,
-        branch_name: str, # Used as patch_set_name
-        commit_title: str, # Can be part of metadata or a README in the patch set
-        project_root: Path # Used to determine default output_base_dir
-    ) -> Optional[Path]: # Returns path to the saved patch set directory or None
+        branch_name: str,
+        commit_title: str,
+        project_root: Path,
+        patch_source: Optional[str] = None # New parameter
+    ) -> Optional[Path]:
         """
         Processes validated patches, generates changelog and metadata,
         and saves everything to the filesystem.
@@ -401,8 +404,9 @@ class CommitBuilder:
             formatted_content_map=formatted_content_map,
             changelog_entry=changelog_text,
             spec=spec,
-            commit_title=commit_title, # Pass through
-            validator_results_summary=validator_results_summary # Pass through
+            commit_title=commit_title,
+            validator_results_summary=validator_results_summary,
+            patch_source=patch_source # Pass through
         )
 
         if saved_patch_dir:
