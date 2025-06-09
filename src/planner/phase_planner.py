@@ -1,9 +1,12 @@
 # src/planner/phase_planner.py
-from typing import List, Dict, Any, Union, Optional, TYPE_CHECKING, Type, Tuple, Callable # Added Type, Tuple, Callable
+import difflib # For generating diff summaries
+from typing import List, Dict, Any, Union, Optional, TYPE_CHECKING, Type, Tuple, Callable
 from pathlib import Path
 import json
 import hashlib
 import random # For dummy scorer and branch names
+
+from src.transformer import apply_libcst_codemod_script, PatchApplicationError # For real patch application
 
 # Forward references for type hints if full imports are problematic
 if TYPE_CHECKING:
@@ -62,14 +65,16 @@ class PhasePlanner:
         self,
         style_fingerprint_path: Path,
         digester: 'RepositoryDigester',
-        scorer_model_config: Any, # Config for Phi-2 LLM scorer
+        scorer_model_config: Any,
         naming_conventions_db_path: Path,
         project_root_path: Path,
-        llm_model_path: Optional[str] = None, # New: Path to GGUF model for AgentGroup
+        llm_model_path: Optional[str] = None,
         refactor_op_map: Optional[Dict[str, BaseRefactorOperation]] = None,
-        beam_width: int = 3 # Default beam_width to 3
+        beam_width: int = 3,
+        verbose: bool = False # Added verbose flag
     ):
         self.style_fingerprint: Dict[str, Any] = {}
+        self.verbose = verbose # Store verbose flag
         try:
             if style_fingerprint_path.exists():
                 with open(style_fingerprint_path, "r", encoding="utf-8") as f:
@@ -433,58 +438,70 @@ Score:"""
                     if validated_patch: # A patch script was successfully generated and (mock) validated by agent group
                         print("\nPhasePlanner: Phase successful. Preparing for CommitBuilder integration.")
 
-                        # 1. Mock Patch Application & Create validated_patch_content_map
-                        if not phase_obj.target_file:
-                            print("PhasePlanner Warning: Phase target_file is None. Cannot proceed with CommitBuilder for this phase.")
-                            continue # Or handle as an error depending on expected behavior
+                        print("\nPhasePlanner: Phase successful. Preparing for CommitBuilder integration.")
 
-                        target_file_path = Path(phase_obj.target_file)
-                        # validated_patch is the LibCST script string.
-                        # In a real scenario, this script would be applied to the original content.
-                        # For this mock, we assume validated_patch IS the new full content.
-                        # This aligns with how validator's _apply_patch_script mock currently behaves
-                        # if we assume the script itself is the content to be validated.
-                        # This is a known simplification point.
+                        # 1. Real Patch Application & Diff Summary Generation
+                        target_file_path_str = phase_obj.target_file
+                        target_file_path = Path(target_file_path_str) if target_file_path_str else None
+                        modified_content: Optional[str] = None
+                        diff_summary = "Diff generation skipped: No target file, patch script, or patch application failed." # Default
 
-                        # If validated_patch is a script, we need to simulate its application.
-                        # Let's use the validator's _apply_patch_script for this simulation.
-                        original_content = self.digester.get_file_content(self.project_root_path / target_file_path)
-                        if original_content is None and not target_file_path.exists(): # New file scenario
-                            print(f"PhasePlanner: Original content for {target_file_path} not found, assuming new file for mock application.")
-                            original_content = ""
-
-                        if original_content is not None:
-                             # The validator's _apply_patch_script needs to be accessible or replicated here.
-                             # Or, we assume validated_patch is already the final content.
-                             # Let's assume validated_patch (script) IS the final content for simplicity here,
-                             # acknowledging this is a mock simplification.
-                             # If validated_patch is a script, it should be *applied* by a proper mechanism.
-                             # For now, let's pass the script itself as the content.
-                             # This means validator should have been validating the script string directly.
-
-                             # If CollaborativeAgentGroup returns the script, then this is the script.
-                             # If it's supposed to return applied content, then this is content.
-                             # Current return from agent_group.run is the script string.
-                             # So, for CommitBuilder, we need the *final content*.
-                             # We will use the validator's _apply_patch_script to *simulate* this.
-
-                            print(f"PhasePlanner: (Mock) Simulating application of patch script for {target_file_path}...")
-                            final_content_for_commit = self.validator._apply_patch_script(original_content, validated_patch) # type: ignore
-
-                            validated_patch_content_map = {target_file_path: final_content_for_commit}
-                            print(f"PhasePlanner: (Mock) Created validated_patch_content_map for {target_file_path}.")
-                        else:
-                            print(f"PhasePlanner Error: Could not get original content for {target_file_path} to simulate patch application.")
+                        if not target_file_path:
+                            print("PhasePlanner Warning: Phase target_file is None. Cannot apply patch or proceed with CommitBuilder for this phase.")
+                            execution_summary.append({"phase_operation": phase_obj.operation_name, "target": "None", "status": "error", "error_message": "Target file was None"})
                             continue
 
+                        # Ensure target_file_path is relative for map keys, but absolute for digester.get_file_content
+                        abs_target_file_path = self.project_root_path / target_file_path
 
-                        # 2. Mock diff_summary
-                        # In a real scenario, this would come from comparing original_content and final_content_for_commit
-                        diff_summary = f"Mock diff summary for {target_file_path}: Applied agent-generated script."
-                        print(f"PhasePlanner: (Mock) Generated diff_summary: '{diff_summary}'.")
+                        if validated_patch: # validated_patch is the LibCST script string
+                            original_content = self.digester.get_file_content(abs_target_file_path)
+                            if original_content is None:
+                                original_content = ""
+                                if self.verbose: print(f"PhasePlanner: Target file '{abs_target_file_path}' is new or content not found. Applying patch to empty content.")
 
-                        # 3. Mock validator_results_summary
-                        validator_results_summary = "Mock validator results: All checks passed on final attempt by agent group."
+                            try:
+                                if self.verbose: print(f"PhasePlanner: Applying validated LibCST script to '{abs_target_file_path}'...")
+                                modified_content = apply_libcst_codemod_script(original_content, validated_patch)
+
+                                if self.verbose: print(f"PhasePlanner: LibCST script applied successfully to '{target_file_path}'.")
+
+                                diff_lines = list(difflib.unified_diff(
+                                    original_content.splitlines(keepends=True),
+                                    modified_content.splitlines(keepends=True),
+                                    fromfile=f"a/{target_file_path.name}", # Use relative name for diff
+                                    tofile=f"b/{target_file_path.name}"
+                                ))
+                                if diff_lines:
+                                    diff_summary = "".join(diff_lines)
+                                    if self.verbose: print(f"PhasePlanner: Generated diff summary for '{target_file_path}' (length {len(diff_summary)}).")
+                                else:
+                                    diff_summary = f"No textual changes detected by difflib for '{target_file_path}' after patch application."
+                                    if self.verbose: print(f"PhasePlanner: {diff_summary}")
+
+                            except PatchApplicationError as pae:
+                                print(f"PhasePlanner Error: Failed to apply validated patch script for {abs_target_file_path}: {pae}")
+                                execution_summary.append({"phase_operation": phase_obj.operation_name, "target": target_file_path_str, "status": "error", "error_message": f"Patch application failed: {pae}"})
+                                continue
+                            except Exception as e_apply:
+                                print(f"PhasePlanner Error: Unexpected error during patch application or diff for {abs_target_file_path}: {e_apply}")
+                                execution_summary.append({"phase_operation": phase_obj.operation_name, "target": target_file_path_str, "status": "error", "error_message": f"Unexpected patch application/diff error: {e_apply}"})
+                                continue
+                        else: # No validated_patch script from agent_group
+                            print(f"PhasePlanner: No validated patch script from agent group for phase targeting '{target_file_path}'. Skipping CommitBuilder.")
+                            execution_summary.append({"phase_operation": phase_obj.operation_name, "target": target_file_path_str, "status": "skipped", "reason": "No script from agent"})
+                            continue
+
+                        if modified_content is None:
+                            print(f"PhasePlanner: Skipping CommitBuilder for phase targeting '{target_file_path}' due to patch application failure or no script.")
+                            continue
+
+                        # Use relative path for the map key
+                        validated_patch_content_map = {target_file_path: modified_content}
+                        print(f"PhasePlanner: Created validated_patch_content_map for CommitBuilder. Key: '{target_file_path}'")
+
+                        # 3. Validator Results Summary (already good from previous steps)
+                        validator_results_summary = "Mock validator results: All checks passed on final attempt by agent group." # Default
                         if self.agent_group.patch_history:
                             try:
                                 last_attempt_info = self.agent_group.patch_history[-1] # (script, is_valid, score, error_traceback)
