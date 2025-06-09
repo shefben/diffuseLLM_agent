@@ -1,8 +1,12 @@
 # src/builder/commit_builder.py
-from typing import Optional, Dict, Any, TYPE_CHECKING
+import subprocess
+import tempfile
+import os
+import json # For patch_meta.json
+from datetime import datetime # For timestamp in patch_meta.json
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
 from pathlib import Path
-import subprocess # For actual git operations later
-import shutil # For file operations or cleanup later
+# import shutil
 
 if TYPE_CHECKING:
     from src.planner.spec_model import Spec
@@ -12,43 +16,109 @@ class CommitBuilder:
         """
         Initializes the CommitBuilder.
         Args:
-            config: Optional dictionary for configurations (e.g., git username, email, diff tool).
+            config: Optional dictionary for configurations.
+                    Expected keys: "verbose" (bool), "black_path" (str), "ruff_path" (str).
         """
         self.config = config if config else {}
-        print(f"CommitBuilder initialized. Config: {self.config}")
+        self.verbose = self.config.get("verbose", False)
+        self.black_path = self.config.get("black_path", "black")
+        self.ruff_path = self.config.get("ruff_path", "ruff")
+        self.config = config if config else {}
+        self.verbose = self.config.get("verbose", False)
+        self.black_path = self.config.get("black_path", "black")
+        self.ruff_path = self.config.get("ruff_path", "ruff")
+        self.output_base_dir_config = self.config.get("output_base_dir") # Store for later use
+        print(f"CommitBuilder initialized. Black: '{self.black_path}', Ruff: '{self.ruff_path}', Verbose: {self.verbose}. Output Base Dir from config: {self.output_base_dir_config}. Config: {self.config}")
 
     def reformat_patch(
         self,
-        file_path: Path, # Path of the file being reformatted
+        file_path: Path, # Path of the file being reformatted (used for logging)
         applied_patch_content: str # String content of the file after patch application
     ) -> str:
         """
-        Mocks re-formatting file content using Black and Ruff --fix.
+        Re-formats file content using Black and then Ruff --fix.
         """
-        print(f"\nCommitBuilder: Reformatting content for file: {file_path}")
+        current_content = applied_patch_content
+        if self.verbose:
+            print(f"\nCommitBuilder: Starting reformatting for file: {file_path} (initial length: {len(current_content)})")
 
-        # Mock Black Formatting
-        black_formatted_content = applied_patch_content
-        # Simulate Black's behavior: ensure content is stripped and ends with a single newline.
-        black_formatted_content = f"# Mock Black formatting applied by CommitBuilder\n{black_formatted_content.strip()}\n"
-        print("  CommitBuilder: (Mock) Black formatting applied.")
+        # --- Black Formatting ---
+        tmp_black_file_path_str: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False, encoding='utf-8') as tmp_black_file:
+                tmp_black_file.write(current_content)
+                tmp_black_file_path_str = tmp_black_file.name
 
-        # Mock Ruff --fix Formatting
-        ruff_fixed_content = black_formatted_content
-        # Simulate a simple Ruff fix, e.g., replacing a hypothetical common pattern.
-        # This is highly dependent on what Ruff might actually fix.
-        # For a generic mock, let's assume it might fix a quote style or remove unused vars.
-        # Example: Replace a magic comment or a specific pattern.
-        pattern_to_fix = "some_common_pattern_ruff_might_fix" # Example pattern
-        if pattern_to_fix in ruff_fixed_content:
-            ruff_fixed_content = ruff_fixed_content.replace(pattern_to_fix, "# FIXED_PATTERN by mock Ruff --fix")
-            print(f"  CommitBuilder: (Mock) Ruff --fix applied specific pattern replacement for '{pattern_to_fix}'.")
+            black_command = [self.black_path, tmp_black_file_path_str]
+            if self.verbose: print(f"CommitBuilder: Running Black: {' '.join(black_command)}")
+            result_black = subprocess.run(black_command, capture_output=True, text=True, check=False)
 
-        ruff_fixed_content = f"# Mock Ruff --fix applied by CommitBuilder (on top of Black's output)\n{ruff_fixed_content}"
-        print("  CommitBuilder: (Mock) Ruff --fix general comment added.")
+            if result_black.returncode == 0:
+                with open(tmp_black_file_path_str, "r", encoding='utf-8') as f_read:
+                    current_content = f_read.read()
+                if self.verbose: print(f"CommitBuilder: Black formatting successful for {file_path}.")
+            else:
+                # Black exit codes: 1 for errors like syntax error, 123 for internal error.
+                # It modifies in place and exits 0 if no syntax error and formatting applied/not needed.
+                print(f"CommitBuilder Warning: Black exited with code {result_black.returncode} for {file_path}.")
+                if result_black.stderr: print(f"Black stderr for {file_path}:\n{result_black.stderr.strip()}")
+                if result_black.stdout and self.verbose: print(f"Black stdout for {file_path}:\n{result_black.stdout.strip()}")
+                # If Black fails (e.g. syntax error), it doesn't modify the file.
+                # We proceed with the content as it was before this Black step (i.e., current_content is unchanged).
+        except FileNotFoundError:
+            print(f"CommitBuilder Warning: Black executable not found at '{self.black_path}'. Skipping Black formatting for {file_path}.")
+        except Exception as e_black:
+            print(f"CommitBuilder Warning: Error during Black formatting for {file_path}: {e_black}. Skipping Black formatting.")
+        finally:
+            if tmp_black_file_path_str and Path(tmp_black_file_path_str).exists():
+                os.remove(tmp_black_file_path_str)
 
-        print(f"CommitBuilder: Reformatting complete for file: {file_path}")
-        return ruff_fixed_content
+        # --- Ruff --fix Formatting (on Black-formatted content) ---
+        tmp_ruff_file_path_str: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False, encoding='utf-8') as tmp_ruff_file:
+                tmp_ruff_file.write(current_content) # Write content potentially modified by Black
+                tmp_ruff_file_path_str = tmp_ruff_file.name
+
+            ruff_command = [self.ruff_path, "check", "--fix", "--no-cache", "--quiet", tmp_ruff_file_path_str]
+            # Using "check --fix" for lint-fixing. "ruff format" could be an alternative if only formatting is desired.
+            # Consider adding specific rules to --select if needed, e.g., "--select=I" for isort.
+
+            if self.verbose: print(f"CommitBuilder: Running Ruff --fix: {' '.join(ruff_command)} for {file_path}")
+            result_ruff = subprocess.run(ruff_command, capture_output=True, text=True, check=False)
+
+            # Ruff exit codes: 0 if no errors/no fixes or if fixes were applied without errors.
+            # 1 if errors were found (and potentially fixed by --fix, but some might remain or new ones introduced by fix).
+            # For --fix, a return code of 0 means either "no issues" or "issues found and fixed successfully".
+            # A return code of 1 means "issues found, and after fixing, some issues might still remain".
+            # We always read the file content back as Ruff modifies in place with --fix.
+
+            with open(tmp_ruff_file_path_str, "r", encoding='utf-8') as f_read:
+                current_content = f_read.read()
+
+            if result_ruff.returncode == 0:
+                if self.verbose: print(f"CommitBuilder: Ruff --fix successful (no outstanding errors/lint issues) for {file_path}.")
+            elif result_ruff.returncode == 1:
+                if self.verbose: print(f"CommitBuilder: Ruff --fix applied changes for {file_path}, but some lint issues might remain or were reported. Output:\n{result_ruff.stdout.strip()}")
+                # Even if Ruff reports issues (exit 1), we use the fixed content.
+                # The primary purpose here is auto-fixing; validation of remaining issues is separate.
+            else: # Other Ruff errors (e.g., config error, internal error)
+                print(f"CommitBuilder Warning: Ruff --fix exited with code {result_ruff.returncode} for {file_path}.")
+                if result_ruff.stderr: print(f"Ruff stderr for {file_path}:\n{result_ruff.stderr.strip()}")
+                if result_ruff.stdout: print(f"Ruff stdout for {file_path}:\n{result_ruff.stdout.strip()}")
+                # If Ruff has a more critical error, we proceed with content as it was before this Ruff step.
+                # However, current_content was already updated from tmp_ruff_file_path_str. This is acceptable.
+        except FileNotFoundError:
+            print(f"CommitBuilder Warning: Ruff executable not found at '{self.ruff_path}'. Skipping Ruff --fix for {file_path}.")
+        except Exception as e_ruff:
+            print(f"CommitBuilder Warning: Error during Ruff --fix for {file_path}: {e_ruff}. Skipping Ruff --fix.")
+        finally:
+            if tmp_ruff_file_path_str and Path(tmp_ruff_file_path_str).exists():
+                os.remove(tmp_ruff_file_path_str)
+
+        if self.verbose:
+            print(f"CommitBuilder: Reformatting complete for file: {file_path} (final length: {len(current_content)})")
+        return current_content
 
     def generate_changelog_entry(
         self,
@@ -170,93 +240,177 @@ class CommitBuilder:
         # 6. Open Pull Request (Conceptual)
         print(f"  7. (Conceptual) Would open a pull request for branch '{branch_name}' against the main branch (e.g., via GitHub CLI or API).")
 
-        print("CommitBuilder: (Mock) Git submission process outlined.")
+        print("CommitBuilder: (Mock) Git submission process outlined.") # This line belongs to the old submit_via_git
+
+    def save_patch_to_filesystem(
+        self,
+        output_base_dir_param: Path,
+        patch_set_name: str,
+        formatted_content_map: Dict[Path, str],
+        changelog_entry: str,
+        spec: 'Spec',
+        commit_title: Optional[str] = None,
+        validator_results_summary: Optional[str] = None
+    ) -> Optional[Path]:
+        """
+        Saves the formatted patch content, changelog, metadata, and other info to the filesystem.
+        Args:
+            output_base_dir_param: The base directory where the patch set directory will be created.
+            patch_set_name: Name for the patch set directory (e.g., derived from branch name).
+            formatted_content_map: Dictionary mapping project-relative file paths to their new content.
+            changelog_entry: The generated changelog entry string.
+            spec: The original Spec object.
+        Returns:
+            The Path to the created patch_set directory, or None on failure.
+        """
+        if self.verbose:
+            print(f"\nCommitBuilder: Saving patch set '{patch_set_name}' to base directory '{output_base_dir_param}'...")
+
+        patch_output_dir = Path(output_base_dir_param) / patch_set_name
+
+        try:
+            patch_output_dir.mkdir(parents=True, exist_ok=True)
+            if self.verbose: print(f"CommitBuilder: Ensured output directory exists: {patch_output_dir}")
+        except OSError as e_mkdir:
+            print(f"CommitBuilder Error: Could not create output directory {patch_output_dir}: {e_mkdir}")
+            return None
+
+        # Write Formatted Files
+        if self.verbose: print(f"CommitBuilder: Writing {len(formatted_content_map)} formatted file(s) to {patch_output_dir}...")
+        for relative_file_path, content_str in formatted_content_map.items():
+            output_file_path: Optional[Path] = None # Define for use in exception messages
+            try:
+                # Ensure relative_file_path is treated as relative to the patch_output_dir
+                # It should not be an absolute path.
+                if Path(relative_file_path).is_absolute():
+                    print(f"CommitBuilder Warning: Received absolute path '{relative_file_path}' in formatted_content_map. This is unexpected. Attempting to use filename only.")
+                    # This handling might need refinement based on how these paths are generated.
+                    # For safety, place it at the root of patch_output_dir.
+                    output_file_path = patch_output_dir / Path(relative_file_path).name
+                else:
+                    output_file_path = patch_output_dir / relative_file_path
+
+                output_file_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_file_path, "w", encoding='utf-8') as f:
+                    f.write(content_str)
+                if self.verbose: print(f"  - Wrote {output_file_path}")
+            except IOError as e_io_file:
+                print(f"CommitBuilder Error: Could not write file {output_file_path if output_file_path else relative_file_path}: {e_io_file}")
+            except Exception as e_gen_file:
+                print(f"CommitBuilder Error: Unexpected error writing file {output_file_path if output_file_path else relative_file_path}: {e_gen_file}")
+
+        # Write Changelog File
+        changelog_file_path: Optional[Path] = None
+        try:
+            changelog_file_path = patch_output_dir / "CHANGELOG_PATCH.md"
+            with open(changelog_file_path, "w", encoding='utf-8') as f:
+                f.write(changelog_entry)
+            if self.verbose: print(f"CommitBuilder: Wrote changelog to {changelog_file_path}")
+        except IOError as e_io_cl:
+            print(f"CommitBuilder Error: Could not write changelog file {changelog_file_path if changelog_file_path else 'CHANGELOG_PATCH.md'}: {e_io_cl}")
+
+        # Write Metadata File (patch_meta.json)
+        meta_file_path: Optional[Path] = None
+        try:
+            meta_file_path = patch_output_dir / "patch_meta.json"
+            spec_data = {}
+            if hasattr(spec, 'model_dump'):
+                spec_data = spec.model_dump(mode='json')
+            elif hasattr(spec, 'dict'):
+                spec_data = spec.dict()
+            else:
+                spec_data = {"issue_description": getattr(spec, 'issue_description', "N/A"),
+                             "target_files": getattr(spec, 'target_files', []),
+                             "operations": getattr(spec, 'operations', []),
+                             "acceptance_tests": getattr(spec, 'acceptance_tests', [])}
+
+            metadata_to_save = {
+                "patch_set_name": patch_set_name,
+                "commit_title": commit_title if commit_title else "N/A",
+                "original_spec": spec_data,
+                "validator_results_summary": validator_results_summary if validator_results_summary else "N/A",
+                "generation_timestamp_utc": datetime.utcnow().isoformat() + "Z",
+                "commit_builder_version": "0.1.0" # Example version
+            }
+            with open(meta_file_path, "w", encoding='utf-8') as f:
+                json.dump(metadata_to_save, f, indent=2)
+            if self.verbose: print(f"CommitBuilder: Wrote metadata to {meta_file_path}")
+        except IOError as e_io_meta:
+            print(f"CommitBuilder Error: Could not write metadata file {meta_file_path if meta_file_path else 'patch_meta.json'}: {e_io_meta}")
+        except TypeError as e_type_meta:
+             print(f"CommitBuilder Error: Could not serialize metadata for {meta_file_path if meta_file_path else 'patch_meta.json'}: {e_type_meta}")
+
+        if self.verbose: print(f"CommitBuilder: Finished saving patch set '{patch_set_name}'.")
+        return patch_output_dir
 
 
     def process_and_submit_patch(
         self,
-        validated_patch_content_map: Dict[Path, str], # Maps target file path to its new content
+        validated_patch_content_map: Dict[Path, str], # Keys are project-relative paths
         spec: 'Spec',
-        diff_summary: str, # Summary of changes from LLM or other source
-        validator_results_summary: str, # Summary of validation tool outputs
-        branch_name: str,
-        commit_title: str,
-        project_root: Path
-    ) -> None:
+        diff_summary: str,
+        validator_results_summary: str,
+        branch_name: str, # Used as patch_set_name
+        commit_title: str, # Can be part of metadata or a README in the patch set
+        project_root: Path # Used to determine default output_base_dir
+    ) -> Optional[Path]: # Returns path to the saved patch set directory or None
         """
-        Placeholder for processing validated patches, generating commit messages,
-        and performing git operations.
+        Processes validated patches, generates changelog and metadata,
+        and saves everything to the filesystem.
         """
-        print(f"\nCommitBuilder: Received request to process and submit for branch '{branch_name}'.")
-        print(f"  Commit Title: {commit_title}")
-        print(f"  Project Root: {project_root}")
-        print(f"  Number of files in patch map: {len(validated_patch_content_map)}")
-        if validated_patch_content_map:
-            print(f"  Files to be modified/created: {list(validated_patch_content_map.keys())}")
+        if self.verbose:
+            print(f"\nCommitBuilder: Received request to process and save patch set '{branch_name}'.")
+            print(f"  Commit Title (for metadata): {commit_title}")
+            print(f"  Project Root (for default output base): {project_root}")
+            print(f"  Number of files in patch map: {len(validated_patch_content_map)}")
 
-        print(f"  Spec Description (first 100 chars): {spec.issue_description[:100] if hasattr(spec, 'issue_description') else 'N/A'}...")
-        print(f"  Diff Summary (first 100 chars): {diff_summary[:100]}...")
-        print(f"  Validator Results Summary (first 100 chars): {validator_results_summary[:100]}...")
-
-        # --- Conceptual integration of reformat_patch ---
-        print("\nCommitBuilder: Starting patch re-formatting (mock)...")
+        # --- Reformat Patch Content ---
+        if self.verbose: print("\nCommitBuilder: Starting patch re-formatting...")
         formatted_content_map: Dict[Path, str] = {}
         if not validated_patch_content_map:
             print("  No files in patch map to reformat.")
         else:
-            for file_p, content in validated_patch_content_map.items():
-                # Ensure content is a string, as reformat_patch expects it.
+            for file_rel_path, content in validated_patch_content_map.items():
                 if isinstance(content, str):
-                    formatted_content_map[file_p] = self.reformat_patch(file_p, content)
+                    # reformat_patch uses file_path for logging purposes only.
+                    # The actual path for writing is constructed in save_patch_to_filesystem.
+                    formatted_content_map[file_rel_path] = self.reformat_patch(file_rel_path, content)
                 else:
-                    print(f"  Warning: Content for {file_p} is not a string (type: {type(content)}), skipping reformat.")
-                    formatted_content_map[file_p] = str(content) # Or handle error more robustly
+                    print(f"  Warning: Content for {file_rel_path} is not a string (type: {type(content)}), skipping reformat.")
+                    formatted_content_map[file_rel_path] = str(content)
+        if self.verbose: print("CommitBuilder: All files processed for re-formatting.\n")
 
-        print("CommitBuilder: All files processed for re-formatting (mock).\n")
-        # In a real implementation, formatted_content_map would be used for subsequent steps.
-        # For example, writing these contents to the actual files in the worktree.
-        if formatted_content_map:
-            print("  Formatted content map (example of one file):")
-            if formatted_content_map: # Ensure not empty before trying to get iter
-                example_file, example_content = next(iter(formatted_content_map.items()))
-                print(f"    File: {example_file}")
-                print(f"    Content (first 200 chars):\n{example_content[:200]}...")
-        # --- End conceptual integration ---
-
-        # --- Conceptual integration of generate_changelog_entry ---
-        print("\nCommitBuilder: Generating changelog (mock)...")
+        # --- Generate Changelog ---
+        if self.verbose: print("CommitBuilder: Generating changelog...")
         changelog_text = self.generate_changelog_entry(spec, diff_summary)
-        print(f"CommitBuilder: Generated changelog:\n---\n{changelog_text}\n---")
-        # --- End conceptual integration ---
+        if self.verbose: print(f"CommitBuilder: Generated changelog (length {len(changelog_text)} chars).")
 
-        # --- Construct full commit message and call submit_via_git ---
-        print("\nCommitBuilder: Preparing full commit message...")
-        # commit_title is already an arg to process_and_submit_patch
-        # validator_results_summary is also an arg
-
-        full_commit_msg_parts = [commit_title, "\n\n", changelog_text]
-        if validator_results_summary and validator_results_summary.strip():
-            full_commit_msg_parts.extend(["\n\nValidator Results:\n", validator_results_summary])
+        # --- Determine Output Base Directory ---
+        output_base_dir: Path
+        if self.output_base_dir_config:
+            output_base_dir = Path(self.output_base_dir_config)
         else:
-            full_commit_msg_parts.extend(["\n\nValidator Results: All checks passed or no summary provided."])
+            output_base_dir = project_root / ".autopatches" # Default if not in config
 
-        full_commit_message = "".join(full_commit_msg_parts)
-        print(f"CommitBuilder: Full commit message prepared (length {len(full_commit_message)}). Preview (first 200 chars):\n{full_commit_message[:200]}...")
+        # --- Save Patch to Filesystem ---
+        if self.verbose: print(f"CommitBuilder: Initiating save to filesystem. Base dir: {output_base_dir}, Patch set name: {branch_name}")
 
-        print("\nCommitBuilder: Initiating Git submission (mock)...")
-        # formatted_content_map was prepared in the reformatting step
-        # Ensure formatted_content_map is used here, not validated_patch_content_map
-        self.submit_via_git(
-            branch_name,
-            full_commit_message,
-            formatted_content_map,
-            project_root
+        saved_patch_dir = self.save_patch_to_filesystem(
+            output_base_dir_param=output_base_dir,
+            patch_set_name=branch_name,
+            formatted_content_map=formatted_content_map,
+            changelog_entry=changelog_text,
+            spec=spec,
+            commit_title=commit_title, # Pass through
+            validator_results_summary=validator_results_summary # Pass through
         )
-        print("CommitBuilder: (Mock) Git submission process completed.")
-        # --- End Git submission ---
 
-        print("\n  (CommitBuilder Placeholder: Actual git operations were mocked. No real changes made.)")
-        pass
+        if saved_patch_dir:
+            print(f"CommitBuilder: Patch set successfully saved to: {saved_patch_dir}")
+        else:
+            print(f"CommitBuilder: Failed to save patch set '{branch_name}'.")
+
+        return saved_patch_dir
 
 if __name__ == '__main__':
     print("--- CommitBuilder Example Usage (Conceptual) ---")

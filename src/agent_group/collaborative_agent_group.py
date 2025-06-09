@@ -432,53 +432,26 @@ class CollaborativeAgentGroup:
                         )
 
                     if heuristically_fixed_script:
-                        print("CollaborativeAgentGroup: Validator proposed a heuristic fix. Applying and re-validating.")
+                        print("CollaborativeAgentGroup: Validator proposed a heuristic fix. Updating current_patch_candidate and restarting iteration for re-validation.")
+                        # Add a history entry for the heuristic attempt itself.
+                        # The outcome of this attempt will be recorded in the next iteration's main validation.
+                        # Use previous style score as a placeholder, or a specific marker.
+                        previous_style_score = self.patch_history[-1][2] if self.patch_history else 0.0
+                        self.patch_history.append((
+                            heuristically_fixed_script, # The script *after* heuristic fix
+                            "pending_revalidation",     # Validation status
+                            previous_style_score,       # Placeholder score
+                            "Heuristic fix applied, pending re-validation" # Traceback
+                        ))
                         self.current_patch_candidate = heuristically_fixed_script
-                        # Record this heuristic attempt and re-validation result
-                        # For simplicity in this step, we'll re-validate and then the main loop's logic will handle it.
-                        # A more granular history might distinguish this.
-                        # Re-validate immediately:
-                        print("Loop Step D.2 (Post-Heuristic Validation): Re-validating heuristically fixed script.")
-                        project_root = self.digester.repo_path # Get project_root for validator_handle
-                        is_valid, new_validation_payload, new_error_traceback = validator_handle( # validator_handle is self.validator.validate_patch
-                            patch_script_str=self.current_patch_candidate,
-                            target_file_path_str=target_file_str,
-                            digester=digester,
-                            project_root=project_root
-                        )
-                        # Update error_traceback and is_valid based on this new validation
-                        error_traceback = new_error_traceback
-                        validation_payload = new_validation_payload # update for potential use by LLM repair if heuristic fails
+                        continue # Restart the loop to re-evaluate the heuristically fixed script from the top
 
-                        # Update patch history with the result of the heuristic fix attempt and its validation
-                        # For score, we can use a neutral score or re-score if needed, here using previous style_score or 0.0
-                        current_style_score = self.patch_history[-1][2] if self.patch_history else 0.0
-                        self.patch_history.append((self.current_patch_candidate, is_valid, current_style_score, error_traceback))
-
-                        if is_valid:
-                            print("CollaborativeAgentGroup: Heuristic fix was successful! Proceeding to polish this version.")
-                            # The loop will continue, and this now valid script will go through polish again.
-                            # This is slightly redundant polishing but ensures consistency.
-                            # Alternatively, could return here if polish is not deemed necessary for heuristic fixes.
-                            # For now, let it go through the standard "if is_valid:" path at the start of the next iteration.
-                            # NO, if it's valid, it should go to the polish step of *this* iteration.
-                            # The main `if is_valid:` check at the top of the loop handles this.
-                            # So, if heuristic fix makes it valid, the next iteration will start, `is_valid` will be true,
-                            # and it will go to polish.
-                            # Let's adjust the flow slightly: if heuristic makes it valid, we should re-enter the polish phase of the current iteration.
-                            # This means we might need a sub-loop or a goto-like structure, or restructure the main loop.
-                            # For now, let the main loop re-evaluate. If heuristic fix is valid, the next iteration starts,
-                            # it gets polished, then validated. If still valid, it's returned.
-                            # This seems acceptable. The `error_traceback` is updated, so LLM repair won't be triggered if `is_valid` is true.
-                        else:
-                            print("CollaborativeAgentGroup: Heuristic fix did not pass validation. Proceeding to LLM repair with new traceback if any.")
-                            # error_traceback is already updated from the failed heuristic fix.
-
-                    # --- LLM-based Repair (Original Step D) ---
-                    # Only proceed to LLM repair if no successful heuristic fix occurred that made the script valid.
-                    if not is_valid and error_traceback: # error_traceback might have been updated by failed heuristic
-                        print("Loop Step D.3 (LLM Repair Attempt): No successful heuristic fix or heuristic fix failed. Attempting LLM repair.")
-                        llm_proposed_fix_script = self.llm_agent.propose_repair_diff(error_traceback, context_data_for_repair)
+                    # If no heuristic fix was applied or successful, proceed to LLM-based repair
+                    # This 'if' condition is implicitly met if 'continue' was not hit.
+                    # The 'is_valid' and 'error_traceback' are from the original failure (or failed polish)
+                    # that triggered this repair block.
+                    print("Loop Step D.2 (LLM Repair Attempt): No heuristic fix applied or taken. Attempting LLM repair.")
+                    llm_proposed_fix_script = self.llm_agent.propose_repair_diff(error_traceback, context_data_for_repair)
 
                         if llm_proposed_fix_script:
                             print(f"LLMCore proposed a fix script (len: {len(llm_proposed_fix_script)}).")

@@ -23,7 +23,9 @@ class Validator:
         self.ruff_path = self.config.get("ruff_path", "ruff")
         self.black_path = self.config.get("black_path", "black")
         self.pyright_path = self.config.get("pyright_path", "pyright")
-        # TODO: Add path for pytest when it is unmocked
+        self.pytest_path = self.config.get("pytest_path", "pytest")
+        self.default_pytest_target_dir = self.config.get("default_pytest_target_dir", "tests")
+
 
         self.common_stdlib_modules = [
             "os", "sys", "math", "re", "json", "collections", "pathlib",
@@ -32,7 +34,7 @@ class Validator:
             "glob", "io", "pickle", "base64", "hashlib", "hmac", "uuid", "functools", "itertools",
             "operator", "typing", "dataclasses", "enum", "inspect", "gc", "weakref"
         ]
-        print(f"Validator initialized. Ruff: '{self.ruff_path}', Black: '{self.black_path}', Pyright: '{self.pyright_path}', Verbose: {self.verbose}. Known stdlib: {len(self.common_stdlib_modules)}")
+        print(f"Validator initialized. Ruff: '{self.ruff_path}', Black: '{self.black_path}', Pyright: '{self.pyright_path}', Pytest: '{self.pytest_path}', Default Pytest Dir: '{self.default_pytest_target_dir}', Verbose: {self.verbose}. Known stdlib: {len(self.common_stdlib_modules)}")
 
     def attempt_heuristic_fixes(
         self,
@@ -287,51 +289,88 @@ class Validator:
             if tmp_file_path_str and Path(tmp_file_path_str).exists():
                 os.remove(tmp_file_path_str)
 
-    def _run_pytest(self, target_file_path: Path, project_root: Path, digester: 'RepositoryDigester') -> Optional[str]:
+    def _run_pytest(self, target_file_path: Path, project_root: Path, digester: 'RepositoryDigester', modified_content_for_target_file: str) -> Optional[str]:
         """
-        Mock for running Pytest.
-        This mock assumes that if the target_file_path is a test file itself,
-        we check its content for a fail marker. Otherwise, it might try to find
-        related tests (which is too complex for this mock).
+        Runs Pytest. This is a simplified version that runs tests either on the
+        modified file if it's a test file, or on a default test directory.
+        A full implementation would require setting up a temporary project copy with the
+        modified file to ensure tests run against the exact changes in full project context.
         """
-        print(f"Validator._run_pytest: Running mock Pytest for target {target_file_path.name} within project {project_root}.")
-        # This mock is very simplified. A real version would:
-        # 1. Identify relevant tests to run based on the target_file_path and project structure (using digester?).
-        # 2. Execute pytest in a subprocess.
-        # 3. Parse pytest output for failures.
+        if self.verbose:
+            print(f"Validator: Preparing to run Pytest for target file '{target_file_path}' within project '{project_root}'.")
+            print(f"Validator: Modified content length for target file: {len(modified_content_for_target_file)}.")
 
-        # For now, if the modified file is a test file, check its content.
-        if target_file_path.name.startswith("test_") or target_file_path.name.endswith("_test.py"):
-            # We need the content of the test file. The `validate_patch` method has the modified content
-            # if target_file_path is the file being patched. If it's a *different* test file,
-            # this mock would need to fetch its current (potentially modified by a previous phase) content.
-            # This detail is skipped for this mock's simplicity.
-            # Let's assume for now this method is called with the content of the test file itself if it's the target.
-            # The current signature doesn't pass content directly, which is a limitation.
+        tmp_target_file_pytest_path_str: Optional[str] = None
 
-            # To make this mock testable with current signature, we'd need to get content via digester
-            # if target_file_path is the one being validated.
-            # However, validate_patch calls this with the *target_file_path* of the patch,
-            # not necessarily the test file path.
-            # This mock will assume if a *production* file is changed, some generic test might fail if a magic string exists.
-            # This is not realistic but makes the mock function.
+        try:
+            # Write the modified content to a temporary file.
+            # This file will be the one pytest potentially runs against if target_file_path is a test file.
+            # We create it outside project_root to avoid polluting the original project.
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False, encoding='utf-8') as tmp_target_file_for_pytest:
+                tmp_target_file_for_pytest.write(modified_content_for_target_file)
+                tmp_target_file_pytest_path_str = tmp_target_file_for_pytest.name
 
-            # A better mock: if the *patched file* (whose content led to this pytest call)
-            # contains a specific marker, assume a related test fails.
-            # This requires passing modified_content to _run_pytest, or making it part of the class state,
-            # which is not ideal. Let's stick to the current signature and simplify the mock's trigger.
+            pytest_target_str: str
+            # Check if the original target_file_path (relative to project_root) indicates a test file.
+            # target_file_path is already absolute here. We need its path relative to project_root for this check.
+            relative_target_path_str = str(target_file_path.relative_to(project_root))
 
-            # Simplification: We don't have the *modified_content* of the *test file* here easily
-            # unless target_file_path *is* the test file.
-            # For a generic mock, let's assume if the target_file_path (the file being patched)
-            # implies a feature that has a test, that test could fail.
-            if "FEATURE_WITH_FAILING_TEST" in digester.get_file_content(target_file_path) if digester and target_file_path else "":
-                 return f"Pytest error: Mock test failed for changes in {target_file_path.name} (due to FEATURE_WITH_FAILING_TEST marker)"
+            if relative_target_path_str.startswith(self.default_pytest_target_dir) or \
+               "test" in target_file_path.name.lower():
+                # If the modified file itself is a test file, run pytest on the temporary version of this modified file.
+                pytest_target_str = tmp_target_file_pytest_path_str
+                if self.verbose: print(f"Validator: Pytest target is the modified test file (as temp file): {pytest_target_str}")
+            else:
+                # Otherwise, run tests in the default test directory within the original project.
+                # This won't directly test the 'modified_content_for_target_file' unless tests are designed
+                # to pick up changes from the original file location which this temporary file doesn't update.
+                # This is a key simplification.
+                default_test_dir_abs = project_root / self.default_pytest_target_dir
+                if default_test_dir_abs.exists() and default_test_dir_abs.is_dir():
+                    pytest_target_str = str(default_test_dir_abs)
+                else: # Fallback to project root if default test dir doesn't exist
+                    pytest_target_str = str(project_root)
+                if self.verbose:
+                    print(f"Validator: Pytest target is default test location: {pytest_target_str}.")
+                    print(f"Validator: Note - This Pytest run may not directly cover the unapplied changes in the temporary file '{tmp_target_file_pytest_path_str}' unless '{target_file_path.name}' was already part of the test suite.")
 
-        # Or, a more direct mock if the target file *is* a test file (less common for patches unless tests themselves are patched)
-        if target_file_path.name.startswith("test_") and "# TEST_FAILS" in (digester.get_file_content(target_file_path) or ""):
-             return f"Pytest error: Mock test directly failed in {target_file_path.name}"
-        return None
+            command = [self.pytest_path, pytest_target_str, "-qq", "--disable-warnings"]
+            if self.verbose: print(f"Validator: Running Pytest: {' '.join(command)} from CWD: {project_root}")
+
+            result = subprocess.run(command, capture_output=True, text=True, check=False, cwd=project_root)
+
+            if result.returncode != 0 and result.returncode != 5: # 0=all pass, 5=no tests collected
+                error_message = f"Pytest failed for target '{pytest_target_str}' (exit code {result.returncode}):\n"
+                # Basic parsing for failure summary. JUnitXML would be more robust.
+                failure_summary = []
+                in_failures_section = False
+                for line in result.stdout.splitlines():
+                    if "=== FAILURES ===" in line:
+                        in_failures_section = True
+                    if in_failures_section:
+                        if line.startswith("_") or line.startswith("E ") or line.startswith(" "): # Typical lines in pytest failure block
+                            failure_summary.append(line)
+                        elif failure_summary and not line.strip(): # Blank line might end a specific failure detail block
+                             pass # Keep collecting until end of output or new section
+                if failure_summary:
+                    error_message += "\n".join(failure_summary)
+                else: # Fallback if parsing fails
+                    error_message += result.stdout.strip() if result.stdout.strip() else result.stderr.strip()
+                return error_message
+
+            if result.returncode == 5:
+                if self.verbose: print(f"Validator: Pytest: No tests collected for target '{pytest_target_str}'.")
+                # Consider if "no tests collected" should be an error. For now, treating as non-failure.
+
+            return None # Tests passed or no tests found/collected.
+
+        except FileNotFoundError:
+            return f"Pytest executable not found at '{self.pytest_path}'. Please configure 'pytest_path' or ensure Pytest is in PATH."
+        except Exception as e:
+            return f"An unexpected error occurred while running Pytest on '{target_file_path.name}': {e}"
+        finally:
+            if tmp_target_file_pytest_path_str and Path(tmp_target_file_pytest_path_str).exists():
+                os.remove(tmp_target_file_pytest_path_str)
 
     def validate_patch(
         self,
@@ -380,7 +419,7 @@ class Validator:
         # Pytest runs on the project state. The modified_code_content_str represents the change
         # to one file. A real pytest would run against the filesystem.
         # The mock _run_pytest uses digester to potentially access other content if needed.
-        pytest_errors = self._run_pytest(target_file_path, project_root, digester) # target_file_path is the path of the modified file
+        pytest_errors = self._run_pytest(target_file_path, project_root, digester, modified_code_content_str) # Pass modified content
         if pytest_errors: all_errors.append(pytest_errors)
 
         if not all_errors:
