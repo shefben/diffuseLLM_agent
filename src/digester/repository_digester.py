@@ -96,38 +96,67 @@ class SymbolAndSignatureExtractorVisitor(ast.NodeVisitor): # Renamed
         #   (node here is the annotation node itself, e.g. ast.Name(id='int'))
 
         # category_hint from generate_function_signature_string is like:
-        # "func_name.param_name:parameter_posonly", "func_name.param_name:parameter",
-        # "func_name.*vararg_name:parameter_vararg_annotation", "func_name:return_annotation"
+        # "func_name.param_name:parameter_posonly", "func_name.param_name:parameter", etc.
+        # "func_name:return_annotation"
 
-        # Attempt to map category_hint to the key structure used by PyanalyzeTypeExtractionVisitor
-        key_name_part = category_hint.split(":")[0] # e.g., "func_name.param_name" or "func_name" for return
-        key_category_part = category_hint.split(":")[-1] # e.g., "parameter", "return_annotation"
+        # PyanalyzeTypeExtractionVisitor now stores keys like:
+        # Parameter: "module.ClassName.func_name.param_name:parameter:line:col"
+        # Return:    "module.ClassName.func_name.<return>:function_return:line:col"
 
-        # Adjust category for Pyanalyze's specific keys if needed based on PyanalyzeTypeExtractionVisitor
-        if key_category_part == "return_annotation":
-            # Pyanalyze uses "function_return_annotation" for the node,
-            # and "function_return_annotation_type" for the type string from dump_value
-            # Let's assume Pyanalyze stored type of node.returns with key like:
-            # "func_name.<return_annotation>:function_return_annotation_type:line:col"
-            # The node passed here IS node.returns.
-            # The category_hint "func_name:return_annotation" needs mapping.
-            # The PyanalyzeTypeExtractionVisitor uses:
-            # `self._add_type_info(node.returns, f"{node.name}.<return_annotation>", "function_return_annotation")`
-            # So, the key_name_part from category_hint (func_name) needs ".<return_annotation>" appended.
-            # And category becomes "function_return_annotation".
-            key_to_lookup = f"{key_name_part}.<return_annotation>:function_return_annotation:{node.lineno}:{node.col_offset}"
-        elif key_category_part.startswith("parameter"):
-            # PyanalyzeTypeExtractionVisitor uses:
-            # `self._add_type_info(arg_node, f"{node.name}.{arg_node.arg}", "parameter")`
-            # category_hint is "func_name.param_name:parameter..."
-            # So, key_name_part is "func_name.param_name", category is "parameter"
-            key_to_lookup = f"{key_name_part}:parameter:{node.lineno}:{node.col_offset}"
-        else: # Fallback or other types of hints not directly from Pyanalyze visitor
-            key_to_lookup = f"{key_name_part}:{key_category_part}:{node.lineno}:{node.col_offset}"
+        # `category_hint` comes from `generate_function_signature_string` and is like:
+        #   "FuncName.param_name:parameter_posonly"
+        #   "FuncName:return_annotation"
+        # `node` is the ast.arg node for parameters, or ast.Name/Attribute for return annotation.
 
+        hint_name_part, hint_category_suffix = category_hint.split(":", 1) # e.g., "FuncName.param_name", "parameter_posonly" or "FuncName", "return_annotation"
+
+        # Determine the actual category PyanalyzeTypeExtractionVisitor would have used.
+        pyanalyze_category = ""
+        if hint_category_suffix.startswith("parameter"):
+            pyanalyze_category = "parameter" # Covers posonly, regular, kwonly
+            if "vararg" in hint_category_suffix:
+                pyanalyze_category = "parameter_vararg"
+            elif "kwarg" in hint_category_suffix:
+                pyanalyze_category = "parameter_kwarg"
+        elif hint_category_suffix == "return_annotation":
+            pyanalyze_category = "function_return"
+            # hint_name_part from generate_function_signature_string is "FuncName"
+            # PyanalyzeTypeExtractionVisitor uses "FuncName.<return>" as the name_qualifier for _add_type_info
+            hint_name_part = f"{hint_name_part}.<return>"
+
+
+        # Construct the FQN prefix based on the current context of SymbolAndSignatureExtractorVisitor
+        current_fqn_prefix = self.module_qname
+        if self.current_class_name: # self.current_class_name is already an FQN like module.class
+            current_fqn_prefix = self.current_class_name
+
+        # hint_name_part is like "FuncName.param_name" or "FuncName.<return>"
+        # This needs to be prefixed with the module/class FQN.
+        fully_qualified_name_part = f"{current_fqn_prefix}.{hint_name_part}"
+
+        # If hint_name_part already contains the class name correctly (e.g. from nested calls in signature gen),
+        # ensure no double prefixing.
+        # This can get complex if current_class_name is for an outer class and hint_name_part refers to an inner class method.
+        # For now, assume hint_name_part is relative to current_fqn_prefix context.
+
+        # Example: module_qname = "my_module", current_class_name = "my_module.MyClass"
+        # hint_name_part for param 'p' of method 'meth' = "meth.p"
+        # fully_qualified_name_part = "my_module.MyClass.meth.p"
+        # pyanalyze_category = "parameter"
+        # key_to_lookup = "my_module.MyClass.meth.p:parameter:lineno:coloffset"
+
+        key_to_lookup = f"{fully_qualified_name_part}:{pyanalyze_category}:{node.lineno}:{node.col_offset}"
 
         resolved_type = self.type_info_map_for_resolver.get(key_to_lookup)
-        # print(f"Resolver: node={type(node)}, hint='{category_hint}', lookup_key='{key_to_lookup}', result='{resolved_type}'")
+
+        if verbose_resolver := False: # Set to True for debugging this resolver
+             print(f"Resolver DEBUG:\n  Context: module='{self.module_qname}', class='{self.current_class_name}'")
+             print(f"  Input node: {type(node)}, lineno: {node.lineno}, col: {node.col_offset}")
+             print(f"  Input category_hint: '{category_hint}' -> name_part='{hint_name_part}', cat_suffix='{hint_category_suffix}'")
+             print(f"  Derived pyanalyze_category: '{pyanalyze_category}'")
+             print(f"  Constructed FQN part for key: '{fully_qualified_name_part}'")
+             print(f"  Attempted lookup key: '{key_to_lookup}'")
+             print(f"  Resolved type: '{resolved_type}'")
         return resolved_type
 
 
@@ -613,43 +642,166 @@ class ControlDependenceVisitor(ast.NodeVisitor):
             self.visit(child_node)
         self.current_control_stack.pop()
 
-# Reverted PyanalyzeTypeExtractionVisitor to simpler version
 class PyanalyzeTypeExtractionVisitor(ast.NodeVisitor):
-    def __init__(self, file_path_str: str):
-        self.file_path_str = file_path_str
+    def __init__(self, filename: str, module_qname: str):
+        self.filename = filename
+        self.module_qname = module_qname
         self.type_info_map: Dict[str, str] = {}
         self.dump_value_func = pyanalyze_dump_value
+        self.current_class_qname_stack: List[str] = []
 
-    def _add_type_info(self, node: ast.AST, name: str, category: str):
-        if hasattr(node, 'inferred_value') and self.dump_value_func:
-            inferred_val = getattr(node, 'inferred_value')
+    def _get_current_scope_prefix(self) -> str:
+        if self.current_class_qname_stack:
+            return self.current_class_qname_stack[-1]
+        return self.module_qname
+
+    def _add_type_info(self, node: ast.AST, name_qualifier: str, category: str, inferred_value_node: Optional[ast.AST] = None):
+        target_node_for_value = inferred_value_node if inferred_value_node else node
+        if hasattr(target_node_for_value, 'inferred_value') and self.dump_value_func:
+            inferred_val = getattr(target_node_for_value, 'inferred_value')
             if inferred_val is not None:
                 type_str = self.dump_value_func(inferred_val)
-                node_key = f"{name}:{category}:{node.lineno}:{node.col_offset}"
+
+                # Construct FQN for the typed element
+                # name_qualifier is the base name (var, param, func for return, attr)
+                # It should NOT contain the scope prefix already.
+                scope_prefix = self._get_current_scope_prefix()
+
+                # For parameters and returns, the 'name_qualifier' might be like 'param_name' or '<return>'
+                # and needs to be associated with the function it belongs to.
+                # The 'category' helps disambiguate.
+
+                # If name_qualifier is already an FQN (e.g. from recursive calls or complex types), don't prepend.
+                # This heuristic might need refinement.
+                fqn_of_element = name_qualifier
+                if not any(name_qualifier.startswith(prefix + ".") for prefix in [self.module_qname] + self.current_class_qname_stack):
+                     # If it's a simple name (e.g. 'x', 'my_param', '<return>', 'my_attr')
+                     # then prepend current scope.
+                     if category in ["parameter", "function_return", "parameter_vararg", "parameter_kwonly", "parameter_kwarg"]:
+                         # name_qualifier here is like "func_name.param_name" or "func_name.<return>"
+                         # where func_name is node.name from visit_FunctionDef.
+                         # Scope prefix is module or class. So, fqn is scope_prefix + "." + name_qualifier (if not already prefixed)
+                         if not name_qualifier.startswith(scope_prefix + "."):
+                              fqn_of_element = f"{scope_prefix}.{name_qualifier}"
+                         # else name_qualifier was already correctly prefixed by caller.
+                     elif category in ["instance_attribute_definition", "class_attribute_definition", "class_variable_definition"]:
+                         # name_qualifier here is like "ClassName.attr_name" or just "attr_name" if class is implicit.
+                         # scope_prefix is ClassName.
+                         if not name_qualifier.startswith(scope_prefix + "."): # if name_qualifier is just 'attr_name'
+                            fqn_of_element = f"{scope_prefix}.{name_qualifier}"
+                         # else name_qualifier was already correctly prefixed by caller.
+                     else: # "variable_definition", "variable_use", etc.
+                        fqn_of_element = f"{scope_prefix}.{name_qualifier}"
+
+
+                node_key = f"{fqn_of_element}:{category}:{node.lineno}:{node.col_offset}"
                 self.type_info_map[node_key] = type_str
+                # print(f"PyanalyzeVisitor DEBUG: Key='{node_key}', Type='{type_str}'")
+
 
     def visit_Name(self, node: ast.Name):
+        # Captures types for local variables (stores) and potentially uses (loads) if Pyanalyze annotates them.
         if isinstance(node.ctx, ast.Store):
             self._add_type_info(node, node.id, "variable_definition")
+        elif isinstance(node.ctx, ast.Load):
+            # Pyanalyze might put inferred_value on Load nodes too.
+            # This could be useful but also very verbose.
+            # self._add_type_info(node, node.id, "variable_use") # Example if we want to capture uses
+            pass
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
-        for arg_node in node.args.args:
-            self._add_type_info(arg_node, f"{node.name}.{arg_node.arg}", "parameter")
-        if node.returns:
-             self._add_type_info(node.returns, f"{node.name}.<return_annotation>", "function_return_annotation")
+        scope_prefix = self._get_current_scope_prefix()
+        func_name_simple = node.name
+        func_qualifier_for_elements = f"{func_name_simple}" # Params/returns are relative to function name
+
+        for arg_node in node.args.args: # Includes posonlyargs if logic combined
+            self._add_type_info(arg_node, f"{func_qualifier_for_elements}.{arg_node.arg}", "parameter", inferred_value_node=arg_node)
+        if node.args.vararg:
+            self._add_type_info(node.args.vararg, f"{func_qualifier_for_elements}.{node.args.vararg.arg}", "parameter_vararg", inferred_value_node=node.args.vararg)
+        for arg_node in node.args.kwonlyargs:
+            self._add_type_info(arg_node, f"{func_qualifier_for_elements}.{arg_node.arg}", "parameter_kwonly", inferred_value_node=arg_node)
+        if node.args.kwarg:
+            self._add_type_info(node.args.kwarg, f"{func_qualifier_for_elements}.{node.args.kwarg.arg}", "parameter_kwarg", inferred_value_node=node.args.kwarg)
+
+        if node.returns: # node.returns is the annotation AST node
+            self._add_type_info(node.returns, f"{func_qualifier_for_elements}.<return>", "function_return", inferred_value_node=node.returns)
+
+        # Type of the function/method itself (callable type)
+        # The name_qualifier should be just the function name, _add_type_info will prefix scope.
+        self._add_type_info(node, func_name_simple, "function_definition_callable_type")
+
+        # Handle nested functions/classes
+        # For nested functions, their scope_prefix will be formed using the outer func's FQN.
+        # For nested classes, visit_ClassDef will handle pushing onto current_class_qname_stack.
+        # No explicit passing of func_fqn needed if _get_current_scope_prefix correctly reflects nesting.
+        # Pyanalyze itself should create FQNs for nested items. We just need to record them.
+
+        # Store current func FQN if we need to build FQNs for items defined *inside* it,
+        # if Pyanalyze doesn't provide them directly on those items.
+        # However, the current keying relies on Pyanalyze providing FQN-like structures or types
+        # that can be resolved to FQNs by SymbolAndSignatureExtractorVisitor.
+
+        # The current logic of _add_type_info prepends scope. If node.name for a nested function
+        # is just 'inner_func', it will become 'outer_scope.inner_func'.
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
         self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node: ast.ClassDef):
-        for child in node.body:
-            if isinstance(child, (ast.Assign, ast.AnnAssign)):
-                target = child.target if isinstance(child, ast.AnnAssign) else (child.targets[0] if child.targets else None)
-                if isinstance(target, ast.Name):
-                    self._add_type_info(target, f"{node.name}.{target.id}", "class_variable")
+        scope_prefix = self._get_current_scope_prefix()
+        class_fqn = f"{scope_prefix}.{node.name}"
+
+        self.current_class_qname_stack.append(class_fqn)
+        self._add_type_info(node, node.name, "class_definition_type") # Type of the class itself
+
+        self.generic_visit(node) # Visit methods and attributes
+        self.current_class_qname_stack.pop()
+
+    def _handle_assign_target(self, target_node: ast.expr, value_node: Optional[ast.AST]):
+        """Helper to process assignment targets for attributes."""
+        # This helper is for AnnAssign and Assign within class context.
+        # value_node is the RHS of assignment, Pyanalyze might attach type info there or on target.
+        # inferred_value_node should be the node Pyanalyze actually put .inferred_value on.
+
+        scope_prefix = self.current_class_qname_stack[-1] if self.current_class_qname_stack else self.module_qname
+
+        if isinstance(target_node, ast.Attribute):
+            # e.g., self.attr = value OR cls.attr = value
+            if isinstance(target_node.value, ast.Name) and target_node.value.id in ('self', 'cls'):
+                category = "instance_attribute_definition" if target_node.value.id == 'self' else "class_attribute_definition"
+                # name_qualifier is just the attribute name, _add_type_info will prefix with class FQN
+                self._add_type_info(target_node, target_node.attr, category, inferred_value_node=target_node)
+            # Could also handle ClassName.attr = value if target_node.value resolves to ClassName
+            # This would require more complex name resolution here or rely on Pyanalyze annotating target_node directly.
+        elif isinstance(target_node, ast.Name):
+            # This is an assignment to a name within a class body, e.g. MyVar: int = 1
+            # This is a class variable.
+            # name_qualifier is the variable name, _add_type_info prefixes with class FQN
+            self._add_type_info(target_node, target_node.id, "class_variable_definition", inferred_value_node=target_node)
+
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        if self.current_class_qname_stack: # Inside a class definition
+            self._handle_assign_target(node.target, node.value)
+        else: # Module or function scope variable
+            if isinstance(node.target, ast.Name):
+                 self._add_type_info(node.target, node.target.id, "variable_definition", inferred_value_node=node.target)
         self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign):
+        # Assign can have multiple targets (e.g., a = b = 1)
+        # Pyanalyze typically annotates the rightmost target or the value.
+        if self.current_class_qname_stack: # Inside a class definition
+            for target in node.targets:
+                self._handle_assign_target(target, node.value)
+        else: # Module or function scope
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self._add_type_info(target, target.id, "variable_definition", inferred_value_node=target)
+        self.generic_visit(node)
+
 
 class CallGraphVisitor(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (ParentNodeProvider, PositionProvider, QualifiedNameProvider, ScopeProvider)
@@ -871,29 +1023,68 @@ class RepositoryDigester:
         print(f"RepositoryDigester: Discovered {len(self._all_py_files)} Python files.")
 
     def _infer_types_with_pyanalyze(self, file_path: Path, source_code: str) -> Optional[Dict[str, Any]]:
-        if not (self.pyanalyze_checker and pyanalyze and hasattr(pyanalyze, 'ast_annotator') and hasattr(pyanalyze.ast_annotator, 'annotate_code') and pyanalyze_dump_value):
-            return {"info": "Pyanalyze components unavailable."}
+        if not self.pyanalyze_checker: # Covers if pyanalyze or Checker is None
+            return {"info": "Pyanalyze type inference disabled (checker not initialized)."}
+        if not pyanalyze or not hasattr(pyanalyze, 'ast_annotator') or \
+           not hasattr(pyanalyze.ast_annotator, 'annotate_code') or not pyanalyze_dump_value:
+            return {"info": "Pyanalyze components (ast_annotator or dump_value) unavailable."}
+
         original_sys_path = list(sys.path)
-        file_dir_str = str(file_path.parent.resolve()); repo_path_str = str(self.repo_path)
-        paths_to_add = []
-        if file_dir_str not in sys.path: paths_to_add.append(file_dir_str)
-        if repo_path_str not in sys.path and repo_path_str != file_dir_str: paths_to_add.append(repo_path_str)
-        for p_add in reversed(paths_to_add): sys.path.insert(0, p_add)
+        paths_to_manage = []
+
+        # Ensure project root is in sys.path for Pyanalyze to resolve project-level imports
+        repo_path_str = str(self.repo_path.resolve())
+        if repo_path_str not in original_sys_path:
+            paths_to_manage.append(repo_path_str)
+            sys.path.insert(0, repo_path_str)
+            if self.pyanalyze_checker.config._path_options[0].startswith(repo_path_str): # type: ignore
+                 print(f"RepositoryDigester: Added {repo_path_str} to sys.path for Pyanalyze.")
+
+        # Add file's parent directory to allow Pyanalyze to resolve relative imports
+        file_dir_str = str(file_path.parent.resolve())
+        if file_dir_str not in sys.path and file_dir_str != repo_path_str:
+            paths_to_manage.append(file_dir_str)
+            sys.path.insert(0, file_dir_str) # Add parent dir with higher precedence than repo root for local relative imports
+            print(f"RepositoryDigester: Added {file_dir_str} to sys.path for Pyanalyze.")
+
         type_info_map: Dict[str, Any] = {}
+        module_qname = self._get_module_qname_from_path(file_path, self.repo_path)
+
         try:
-            if not source_code.strip(): return {"info": "Empty source code, Pyanalyze not run."}
-            annotated_ast = pyanalyze.ast_annotator.annotate_code(source_code, filename=str(file_path), show_errors=False, verbose=False) # type: ignore
+            if not source_code.strip():
+                return {"info": "Empty source code, Pyanalyze not run."}
+
+            # Pyanalyze's annotate_code might modify the AST in place with 'inferred_value' attributes.
+            annotated_ast = pyanalyze.ast_annotator.annotate_code(
+                source_code,
+                filename=str(file_path),
+                module_name=module_qname, # Provide module name
+                config=self.pyanalyze_checker.config, # Pass existing config
+                # show_errors=False, # Default in annotate_code
+                # verbose=False # Default in annotate_code
+            ) # type: ignore
+
             if annotated_ast:
-                visitor = PyanalyzeTypeExtractionVisitor(str(file_path))
+                # Pass module_qname for correct qualification of names
+                visitor = PyanalyzeTypeExtractionVisitor(filename=str(file_path), module_qname=module_qname)
                 visitor.visit(annotated_ast)
-                type_info_map = visitor.type_info_map # type: ignore
-                if not type_info_map: type_info_map = {"info": "Pyanalyze ran but no types extracted by basic visitor."}
-            else: type_info_map = {"error": "Pyanalyze annotate_code returned None."}
-        except Exception as e: type_info_map = {"error": f"Pyanalyze processing failed: {e}"}
+                type_info_map = visitor.type_info_map
+                if not type_info_map:
+                    type_info_map = {"info": f"Pyanalyze ran for {file_path.name} but no types extracted by visitor."}
+            else:
+                type_info_map = {"error": f"Pyanalyze annotate_code returned None for {file_path.name}."}
+        except Exception as e:
+            error_msg = f"Pyanalyze processing failed for {file_path.name}: {type(e).__name__} - {e}"
+            print(f"RepositoryDigester Error: {error_msg}")
+            type_info_map = {"error": error_msg}
         finally:
-            for p_remove in paths_to_add:
-                if sys.path and sys.path[0] == p_remove: sys.path.pop(0)
-                elif p_remove in sys.path: sys.path.remove(p_remove)
+            # Restore sys.path
+            current_sys_path = list(sys.path)
+            new_sys_path = [p for p in current_sys_path if p not in paths_to_manage]
+            sys.path = new_sys_path
+            # Verify restoration (optional)
+            # if len(sys.path) != len(original_sys_path) or any(p not in original_sys_path for p in sys.path if p in paths_to_manage):
+            #    print(f"Warning: sys.path may not have been restored perfectly. Original len: {len(original_sys_path)}, New len: {len(sys.path)}")
         return type_info_map
 
     def parse_file(self, file_path: Path) -> ParsedFileResult:

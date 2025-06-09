@@ -1,52 +1,58 @@
 import random
-from typing import Dict, Literal, Union, Optional
-from dataclasses import dataclass, field # Using dataclass for simplicity
+from typing import Dict, Literal, Union, Optional, List, Any
+from dataclasses import dataclass, field
+import io
+import tokenize
+import re
+import ast
+from collections import Counter
+import json
+from pathlib import Path
 
-# Define the structure for the style fingerprint tuple from a single sample
+# Guard LlamaCPP import
+try:
+    from llama_cpp import Llama, LlamaGrammar
+except ImportError:
+    Llama = None # type: ignore
+    LlamaGrammar = None # type: ignore
+    print("Warning: llama-cpp-python not found. GGUF model interaction will be disabled.")
+
+# Guard Transformers/Torch import
+try:
+    import torch
+    from transformers import T5ForConditionalGeneration, T5TokenizerFast
+except ImportError:
+    torch = None # type: ignore
+    T5ForConditionalGeneration = None # type: ignore
+    T5TokenizerFast = None # type: ignore
+    print("Warning: PyTorch or Hugging Face Transformers not found. DivoT5 SafeTensor model interaction will be disabled.")
+
+
 @dataclass
 class SingleSampleFingerprint:
     indent: int
     quotes: Literal["single", "double"]
-    linelen: int # Max line length observed or preferred for this sample
-    camel_pct: float # Percentage of camelCase identifiers in the sample
-    snake_pct: float # Percentage of snake_case identifiers in the sample
+    linelen: int
+    camel_pct: float
+    snake_pct: float
     docstyle: Literal["google", "numpy", "epytext", "restructuredtext", "plain", "other"]
-    # Add other potential fields based on common style aspects
-    # For example, presence of type hints, spacing around operators, etc.
-    # These would be derived by the hypothetical LLM from the sample.
     has_type_hints: Optional[bool] = None
-    spacing_around_operators: Optional[bool] = None # True if consistent, False if not, None if N/A
+    spacing_around_operators: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Union[int, str, float, bool, None]]:
         return {
             "indent": self.indent,
             "quotes": self.quotes,
             "linelen": self.linelen,
-            "camel_pct": round(self.camel_pct, 2), # Ensure consistent formatting
+            "camel_pct": round(self.camel_pct, 2),
             "snake_pct": round(self.snake_pct, 2),
             "docstyle": self.docstyle,
             "has_type_hints": self.has_type_hints,
             "spacing_around_operators": self.spacing_around_operators,
         }
 
-# Added imports for collect_deterministic_stats
-import io
-import tokenize
-import re
-import ast
-from collections import Counter
-# Need to import get_args for Literal type inspection if not already present
-# Add this near other typing imports if it's not there
-from typing import get_args, List, Any # Ensure List, Any are imported (Dict, Optional, Union already are)
-import json # For json.loads in orchestrator
-from pathlib import Path # For model paths in __main__
-
-# (Keep existing SingleSampleFingerprint dataclass and get_style_fingerprint_from_llm mock function for now)
-# ...
-
-# Define triple quote strings in a way that might be safer for subtask parsing
-TRIPLE_SINGLE_QUOTE = chr(39) * 3  # '''
-TRIPLE_DOUBLE_QUOTE = chr(34) * 3  # """
+TRIPLE_SINGLE_QUOTE = chr(39) * 3
+TRIPLE_DOUBLE_QUOTE = chr(34) * 3
 
 def _get_modal_indent(code_snippet: str) -> int:
     indents = []
@@ -69,77 +75,44 @@ def _get_line_length_percentile(code_snippet: str, percentile: float = 0.95) -> 
     return line_lengths[index]
 
 def collect_deterministic_stats(code_snippet: str) -> str:
-    stats = {}
+    stats: Dict[str, Any] = {}
     stats['indent_modal'] = _get_modal_indent(code_snippet)
-
-    single_quotes_count = 0
-    double_quotes_count = 0
-    f_strings_count = 0
-    identifiers = []
-
+    single_quotes_count = 0; double_quotes_count = 0; f_strings_count = 0; identifiers = []
     try:
         code_bytes = code_snippet.encode('utf-8')
         token_stream = tokenize.tokenize(io.BytesIO(code_bytes).readline)
         for token_info in token_stream:
             if token_info.type == tokenize.STRING:
-                token_string = token_info.string
-                is_fstring = False
-                prefix_len = 0
-
+                token_string = token_info.string; is_fstring = False; prefix_len = 0
                 lowered_token_string = token_string.lower()
-                if lowered_token_string.startswith(("rf", "fr")):
-                    is_fstring = True
-                    prefix_len = 2
+                if lowered_token_string.startswith(("rf", "fr")): is_fstring = True; prefix_len = 2
                 elif lowered_token_string.startswith(("r", "f", "u", "b")):
-                    if lowered_token_string.startswith("f"):
-                        is_fstring = True
+                    if lowered_token_string.startswith("f"): is_fstring = True
                     prefix_len = 1
-
-                if is_fstring:
-                    f_strings_count += 1
-
+                if is_fstring: f_strings_count += 1
                 actual_string_part = token_string[prefix_len:]
-
-                if actual_string_part.startswith(TRIPLE_SINGLE_QUOTE) and actual_string_part.endswith(TRIPLE_SINGLE_QUOTE):
-                    single_quotes_count += 1
-                elif actual_string_part.startswith(TRIPLE_DOUBLE_QUOTE) and actual_string_part.endswith(TRIPLE_DOUBLE_QUOTE):
-                    double_quotes_count += 1
-                elif actual_string_part.startswith("'") and actual_string_part.endswith("'"):
-                    single_quotes_count += 1
-                elif actual_string_part.startswith('"') and actual_string_part.endswith('"'):
-                    double_quotes_count += 1
-
-            elif token_info.type == tokenize.NAME:
-                identifiers.append(token_info.string)
-    except tokenize.TokenError:
-        pass
-
-    stats['quotes_single'] = single_quotes_count
-    stats['quotes_double'] = double_quotes_count
-    stats['f_strings'] = f_strings_count
+                if actual_string_part.startswith(TRIPLE_SINGLE_QUOTE) and actual_string_part.endswith(TRIPLE_SINGLE_QUOTE): single_quotes_count += 1
+                elif actual_string_part.startswith(TRIPLE_DOUBLE_QUOTE) and actual_string_part.endswith(TRIPLE_DOUBLE_QUOTE): double_quotes_count += 1
+                elif actual_string_part.startswith("'") and actual_string_part.endswith("'"): single_quotes_count += 1
+                elif actual_string_part.startswith('"') and actual_string_part.endswith('"'): double_quotes_count += 1
+            elif token_info.type == tokenize.NAME: identifiers.append(token_info.string)
+    except tokenize.TokenError: pass
+    stats['quotes_single'] = single_quotes_count; stats['quotes_double'] = double_quotes_count; stats['f_strings'] = f_strings_count
     stats['line_len_95p'] = _get_line_length_percentile(code_snippet)
-
-    snake_case_count = 0
-    camelCase_count = 0
-    UPPER_SCREAMING_count = 0
+    snake_case_count = 0; camelCase_count = 0; UPPER_SCREAMING_count = 0
     valid_idents_for_case_analysis = [ident for ident in identifiers if len(ident) > 1 or ident == '_']
-
     for ident in valid_idents_for_case_analysis:
-        if re.fullmatch(r'[a-z0-9_]+', ident) and not any(c.isupper() for c in ident):
-            snake_case_count += 1
-        elif re.fullmatch(r'[a-z]+[A-Z][a-zA-Z0-9_]*', ident):
-            camelCase_count += 1
-        elif re.fullmatch(r'[A-Z0-9_]+', ident) and ident.isupper():
-            UPPER_SCREAMING_count += 1
-
+        if re.fullmatch(r'[a-z0-9_]+', ident) and not any(c.isupper() for c in ident): snake_case_count += 1
+        elif re.fullmatch(r'[a-z]+[A-Z][a-zA-Z0-9_]*', ident): camelCase_count += 1
+        elif re.fullmatch(r'[A-Z0-9_]+', ident) and ident.isupper(): UPPER_SCREAMING_count += 1
     total_countable_idents = len(valid_idents_for_case_analysis)
     stats['snake_pct'] = round(snake_case_count / total_countable_idents, 2) if total_countable_idents > 0 else 0.0
     stats['camel_pct'] = round(camelCase_count / total_countable_idents, 2) if total_countable_idents > 0 else 0.0
     stats['screaming_pct'] = round(UPPER_SCREAMING_count / total_countable_idents, 2) if total_countable_idents > 0 else 0.0
-
-    docstring_markers = []
-    try:
-        tree = ast.parse(code_snippet)
+    docstring_markers = []; tree = None
+    try: tree = ast.parse(code_snippet)
+    except SyntaxError: pass
+    if tree:
         for node in ast.walk(tree):
             docstring = ast.get_docstring(node, clean=False)
             if docstring:
@@ -149,201 +122,205 @@ def collect_deterministic_stats(code_snippet: str) -> str:
                 if "Returns:" in docstring or "Return:" in docstring: unique_markers_in_doc.add("Returns:")
                 if ":param" in docstring: unique_markers_in_doc.add(":param")
                 docstring_markers.extend(list(unique_markers_in_doc))
-        if docstring_markers:
-             docstring_markers = sorted(list(set(docstring_markers)))
-    except SyntaxError:
-        pass
+        if docstring_markers: docstring_markers = sorted(list(set(docstring_markers)))
     stats['doc_tokens'] = ", ".join(docstring_markers) if docstring_markers else "none"
-
-    stats_block_lines = ["STATS_START"]
-    stats_block_lines.append(f"indent_modal: {stats['indent_modal']}")
-    stats_block_lines.append(f"quotes_single: {stats['quotes_single']}")
-    stats_block_lines.append(f"quotes_double: {stats['quotes_double']}")
-    stats_block_lines.append(f"f_strings: {stats['f_strings']}")
-    stats_block_lines.append(f"line_len_95p: {stats['line_len_95p']}")
-    stats_block_lines.append(f"snake_pct: {stats['snake_pct']:.2f}")
-    stats_block_lines.append(f"camel_pct: {stats['camel_pct']:.2f}")
-    stats_block_lines.append(f"screaming_pct: {stats['screaming_pct']:.2f}")
-    stats_block_lines.append(f"doc_tokens: {stats['doc_tokens']}")
-    stats_block_lines.append("STATS_END")
-
+    stats_block_lines = ["STATS_START"] + [f"{k}: {v}" for k,v in stats.items()] + ["STATS_END"]
     return "\n".join(stats_block_lines)
 
-# (Optional __main__ block for testing)
-# if __name__ == '__main__':
-#     # This main block is for testing collect_deterministic_stats.
-#     # Keep it separate from the one testing get_style_fingerprint_from_llm.
-#     example_code_for_test = TRIPLE_SINGLE_QUOTE + '''
-# Module doc for testing.
-# Args:
-#     arg1: something
-# ''' + TRIPLE_SINGLE_QUOTE + '''
-# import os
-#
-# class MyClassExample:
-#     A_CONSTANT = 10
-#
-#     def __init__(self, my_param_snake: int):
-#         self.my_inst_var = my_param_snake
-#
-#     def anotherMethod(self, another_param: str):
-#         # Docstring using TRIPLE_SINGLE_QUOTE
-#         pass # body
-# ''' # End of example_code_for_test
-#     stats_output = collect_deterministic_stats(example_code_for_test)
-#     print(stats_output)
-
-
-# Add LlamaCPP import, guarded for environments where it might not be installed
-try:
-    from llama_cpp import Llama, LlamaGrammar
-except ImportError:
-    Llama = None # type: ignore
-    LlamaGrammar = None # type: ignore
-    print("Warning: llama-cpp-python not found. DeepSeek GGUF model interaction will be disabled.")
-
-
-def get_deepseek_draft_fingerprint(stats_block: str, model_path: str, n_gpu_layers: int = -1, verbose: bool = False) -> Dict:
-    """
-    Loads a DeepSeek GGUF model and prompts it with style statistics to get a raw
-    style fingerprint.
-
-    Args:
-        stats_block: A string containing the deterministic style statistics.
-        model_path: Path to the DeepSeek GGUF model file.
-        n_gpu_layers: Number of layers to offload to GPU. -1 for all, 0 for none.
-        verbose: Whether LlamaCPP should be verbose.
-
-    Returns:
-        A dictionary representing the raw style fingerprint from DeepSeek.
-        Returns a mock/default dictionary if LlamaCPP is not available or model fails.
-    """
+def get_deepseek_draft_fingerprint(stats_block: str, model_path: str, n_gpu_layers: int = -1, verbose: bool = False) -> Dict[str, Any]:
+    default_error_fingerprint: Dict[str, Any] = {"indent": None, "quotes": None, "linelen": None, "snake_pct": None, "camel_pct": None, "screaming_pct": None, "docstyle": None, "error": "Unknown error during fingerprint generation."}
+    expected_fingerprint_keys = {"indent", "quotes", "linelen", "snake_pct", "camel_pct", "screaming_pct", "docstyle"}
     if Llama is None:
-        print("Error: llama-cpp-python is not installed. Cannot interact with DeepSeek GGUF model.")
-        # Return a mock response that includes potential ambiguities for downstream testing
-        return {
-            "indent": 4, "quotes": "mixed?", "linelen": 100, "snake_pct": 0.7,
-            "camel_pct": 0.2, "screaming_pct": 0.1, "docstyle": "google_or_numpy"
-        }
-
+        error_msg = "llama-cpp-python not installed. Cannot get LLM style fingerprint."
+        print(f"LLM_Interfacer Error: {error_msg}")
+        return {**default_error_fingerprint, "error": error_msg}
+    resolved_model_path_str = model_path; is_placeholder_path = False
+    if not model_path or model_path == "path/to/your/deepseek-coder-gguf-model.gguf" or model_path.endswith("placeholder_deepseek.gguf"):
+        resolved_model_path_str = "./models/placeholder_deepseek.gguf"; is_placeholder_path = True
+        print(f"LLM_Interfacer Warning: Model path is a placeholder or not provided. Using standard placeholder: '{resolved_model_path_str}'.")
+    resolved_model_path = Path(resolved_model_path_str)
+    if not resolved_model_path.exists() or not resolved_model_path.is_file():
+        error_msg = f"Model file does not exist at resolved path: {resolved_model_path}"
+        if is_placeholder_path: error_msg += " (This is a placeholder path. Please provide a valid GGUF model path or place the model at './models/placeholder_deepseek.gguf' for it to be found by default.)"
+        print(f"LLM_Interfacer Error: {error_msg}")
+        return {**default_error_fingerprint, "error": error_msg}
     try:
-        # TODO: Make model loading more configurable (n_ctx, etc.)
-        # For now, using some defaults. The user might need to adjust n_ctx based on model and prompt length.
-        llm = Llama(
-            model_path=model_path,
-            n_gpu_layers=n_gpu_layers, # -1 attempts to offload all possible layers
-            n_ctx=2048, # Context window, might need adjustment
-            verbose=verbose
-        )
+        llm = Llama(model_path=str(resolved_model_path), n_gpu_layers=n_gpu_layers, n_ctx=2048, verbose=verbose)
     except Exception as e:
-        # This can catch errors like model file not found, permission issues, or LlamaCPP init errors.
-        print(f"Error loading DeepSeek GGUF model from {model_path}: {e}")
-        print("Falling back to mock DeepSeek response.")
-        return {
-            "indent": 4, "quotes": "mixed?", "linelen": 90, "snake_pct": 0.6,
-            "camel_pct": 0.3, "screaming_pct": 0.05, "docstyle": "google"
-        }
-
-    system_prompt = "Return ONLY a JSON object with keys indent, quotes, linelen, snake_pct, camel_pct, screaming_pct, docstyle."
-
-    # Using a chat completion like format, common for instruction-following models
-    # The exact prompt format might need tuning based on the specific DeepSeek GGUF version.
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": stats_block}
-    ]
-
-    raw_json_output = "{}" # Default to empty JSON string
-
+        error_msg = f"Error loading GGUF model from {resolved_model_path}: {e}"; print(f"LLM_Interfacer Error: {error_msg}")
+        return {**default_error_fingerprint, "error": error_msg}
+    system_prompt = ("You are a style analysis assistant. Based on the provided code statistics, generate a JSON object representing the style fingerprint. The JSON object must only contain the following keys, with appropriate values derived from the statistics: 'indent' (int), 'quotes' (string, e.g., 'single', 'double', 'mixed?'), 'linelen' (int), 'snake_pct' (float, 0.0-1.0), 'camel_pct' (float, 0.0-1.0), 'screaming_pct' (float, 0.0-1.0), 'docstyle' (string, e.g., 'google', 'numpy', 'plain', 'unknown?'). Ensure screaming_pct refers to UPPER_CASE_SNAKE_CASE.")
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": stats_block}]
+    raw_json_output = "{}";
     try:
-        # TODO: Make generation parameters configurable (temp, top_p, etc.)
-        response = llm.create_chat_completion(
-            messages=messages,
-            temperature=0.1, # Low temperature for more deterministic, factual output
-            max_tokens=256  # Max tokens for the JSON response
-        )
-        if response and response['choices'] and response['choices'][0]['message']['content']:
-            raw_json_output = response['choices'][0]['message']['content'].strip()
-        else:
-            print("Warning: DeepSeek model returned an empty or unexpected response.")
-
+        response = llm.create_chat_completion(messages=messages, temperature=0.1, max_tokens=256)
+        if response and response['choices'] and response['choices'][0]['message']['content']: raw_json_output = response['choices'][0]['message']['content'].strip()
+        else: print("LLM_Interfacer Warning: GGUF model returned an empty or unexpected response for draft fingerprint.")
     except Exception as e:
-        print(f"Error during DeepSeek model inference: {e}")
-        print("Falling back to mock DeepSeek response due to inference error.")
-        return {
-            "indent": 4, "quotes": "double?", "linelen": 80, "snake_pct": 0.5,
-            "camel_pct": 0.4, "screaming_pct": 0.08, "docstyle": "numpy"
-        }
-
-    # Attempt to parse the output as JSON.
-    # The model is asked for JSON, but it might not be perfect.
-    # Example from user: {"quotes": "mixed?"} - this is not valid JSON due to unquoted "mixed?".
-    # The user's example output was: `{"indent": 4, "quotes": "mixed?", ...}` which IS valid JSON if "mixed?" is a string.
-    # The problem arises if DeepSeek outputs `mixed?` without quotes.
-    # The prompt "Return ONLY a JSON object" should strongly encourage valid JSON.
-
-    fingerprint_dict = {}
+        error_msg = f"Error during GGUF model inference for draft fingerprint: {e}"; print(f"LLM_Interfacer Error: {error_msg}")
+        # Fallback to a mock response if inference fails, this was the previous behavior for some errors
+        return {"indent": 4, "quotes": "double?", "linelen": 80, "snake_pct": 0.5, "camel_pct": 0.4, "screaming_pct": 0.08, "docstyle": "numpy", "error": error_msg}
     try:
-        # A simple attempt to clean common non-JSON issues if model doesn't strictly adhere.
-        # E.g., if it uses Python dict-like output with single quotes for strings.
-        # This is a heuristic. A more robust solution might involve more advanced parsing
-        # or re-prompting if the initial output is not valid JSON.
-        # For now, we rely on the prompt and basic json.loads.
-
-        # Try to find the JSON block if there's surrounding text (though prompt asks for ONLY JSON)
         json_match = re.search(r'\{.*\}', raw_json_output, re.DOTALL)
-        if json_match:
-            raw_json_output = json_match.group(0)
-
-        fingerprint_dict = json.loads(raw_json_output)
-
-        # Ensure all expected keys are present, fill with None if not (or a default ambiguous marker)
-        expected_keys = ["indent", "quotes", "linelen", "snake_pct", "camel_pct", "screaming_pct", "docstyle"]
-        for key in expected_keys:
-            if key not in fingerprint_dict:
-                fingerprint_dict[key] = "unknown?" # Mark as unknown if missing
-
+        if json_match: raw_json_output = json_match.group(0)
+        parsed_fingerprint = json.loads(raw_json_output)
+        if not isinstance(parsed_fingerprint, dict):
+            error_msg = f"LLM output parsed to JSON but is not a dictionary: {type(parsed_fingerprint)}"; print(f"LLM_Interfacer Warning: {error_msg}. Raw output: {raw_json_output}")
+            return {**default_error_fingerprint, "error": error_msg}
+        current_keys = set(parsed_fingerprint.keys()); missing_keys = expected_fingerprint_keys - current_keys
+        if missing_keys:
+            error_msg = f"LLM output JSON is missing expected keys: {', '.join(missing_keys)}"; print(f"LLM_Interfacer Warning: {error_msg}. Parsed JSON: {parsed_fingerprint}")
+            for key_to_add in missing_keys: parsed_fingerprint[key_to_add] = None
+            final_fingerprint = {key: parsed_fingerprint.get(key) for key in expected_fingerprint_keys}; final_fingerprint["error"] = error_msg
+            return final_fingerprint
+        result_fingerprint = {key: parsed_fingerprint[key] for key in expected_fingerprint_keys}; result_fingerprint["error"] = None
+        return result_fingerprint
     except json.JSONDecodeError as e:
-        print(f"Warning: DeepSeek output was not valid JSON: {raw_json_output}. Error: {e}")
-        print("Attempting to create a partial fingerprint from the raw string, or returning a default ambiguous one.")
-        # Fallback: try to extract values with regex if JSON parsing fails, or return a default ambiguous dict
-        # This part can be made more sophisticated. For now, a simple fallback.
-        partial_fingerprint = {}
-        for key in ["indent", "linelen"]: # Numerical
-            match = re.search(rf'"{key}":\s*(\d+)', raw_json_output)
-            if match: partial_fingerprint[key] = int(match.group(1))
-        for key in ["quotes", "docstyle"]: # String
-            match = re.search(rf'"{key}":\s*"([^"]*)"', raw_json_output) # looking for quoted strings
-            if match: partial_fingerprint[key] = match.group(1)
-            else: # try to match unquoted problematic values like 'mixed?'
-                match_unquoted = re.search(rf'"{key}":\s*([a-zA-Z_?]+)', raw_json_output)
-                if match_unquoted : partial_fingerprint[key] = match_unquoted.group(1)
+        error_msg = f"GGUF model output was not valid JSON: '{raw_json_output}'. Error: {e}"; print(f"LLM_Interfacer Warning: {error_msg}")
+        return {**default_error_fingerprint, "error": error_msg}
+    except Exception as e_gen:
+        error_msg = f"Unexpected error processing GGUF model output: {e_gen}. Raw output: '{raw_json_output}'"; print(f"LLM_Interfacer Warning: {error_msg}")
+        return {**default_error_fingerprint, "error": error_msg}
 
-        for key_pct in ["snake_pct", "camel_pct", "screaming_pct"]:
-            match = re.search(rf'"{key_pct}":\s*(\d+\.\d+)', raw_json_output)
-            if match: partial_fingerprint[key_pct] = float(match.group(1))
+def get_divot5_refined_output(code_snippet: str, raw_fingerprint_dict: Dict[str, Any], model_path: str, num_denoising_steps: int = 10, device: Optional[str] = None, verbose: bool = False) -> Optional[str]:
+    if T5ForConditionalGeneration is None or T5TokenizerFast is None or torch is None:
+        print("LLM_Interfacer Error: Transformers/PyTorch not installed. Cannot interact with DivoT5 model.")
+        return None
+    resolved_model_path_str = model_path; is_placeholder_path = False
+    if not model_path or model_path == "path/to/your/divot5_model_dir":
+        resolved_model_path_str = "./models/placeholder_divot5_refiner/"; is_placeholder_path = True
+        print(f"LLM_Interfacer Warning: DivoT5 model path not provided or is a default placeholder. Using standard placeholder: '{resolved_model_path_str}'.")
+    resolved_model_path = Path(resolved_model_path_str)
+    if not resolved_model_path.exists() or not resolved_model_path.is_dir():
+        error_msg = f"DivoT5 model directory does not exist at resolved path: {resolved_model_path}"
+        if is_placeholder_path: error_msg += " (This is a placeholder path. Please provide a valid DivoT5 model directory or place the model at './models/placeholder_divot5_refiner/')"
+        print(f"LLM_Interfacer Error: {error_msg}"); return None
+    selected_device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+    if verbose: print(f"LLM_Interfacer: Attempting to load DivoT5 model from {resolved_model_path} onto device: {selected_device}")
+    else: print(f"LLM_Interfacer: Loading DivoT5 model from {resolved_model_path}...")
+    try:
+        tokenizer = T5TokenizerFast.from_pretrained(str(resolved_model_path))
+        model = T5ForConditionalGeneration.from_pretrained(str(resolved_model_path)).to(selected_device); model.eval()
+    except Exception as e:
+        print(f"LLM_Interfacer Error: Error loading DivoT5 model from {resolved_model_path}: {e}"); return None
+    filtered_raw_fp_dict = {k: v for k, v in raw_fingerprint_dict.items() if k != "error" and v is not None}
+    raw_fp_parts = []
+    for key, value in filtered_raw_fp_dict.items():
+        if isinstance(value, str): raw_fp_parts.append(f'"{key}": "{value}"')
+        elif isinstance(value, (int, float)): raw_fp_parts.append(f'"{key}": {value}')
+        elif isinstance(value, bool): raw_fp_parts.append(f'"{key}": {str(value).lower()}')
+        else: raw_fp_parts.append(f'"{key}": "{str(value)}"')
+    input_text = f"USER_CODE_START\n{code_snippet}\nUSER_CODE_END\nRAW_FINGERPRINT_START\n{', '.join(raw_fp_parts)}\nRAW_FINGERPRINT_END"
+    try:
+        if verbose: print(f"LLM_Interfacer: DivoT5 input text (first 500 chars):\n{input_text[:500]}...")
+        inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=1024).to(selected_device)
+        output_max_length = max(200, min(num_denoising_steps * 40, 512))
+        with torch.no_grad():
+            outputs = model.generate(inputs.input_ids, max_length=output_max_length, num_beams=4, early_stopping=True, length_penalty=1.0)
+        if outputs is not None and len(outputs) > 0:
+            refined_output_string = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+            if verbose: print(f"LLM_Interfacer: DivoT5 raw output: '{refined_output_string}'")
+            return refined_output_string
+        else: print("LLM_Interfacer Warning: DivoT5 model returned an empty or unexpected response."); return None
+    except Exception as e:
+        print(f"LLM_Interfacer Error: Error during DivoT5 model inference: {e}"); return None
 
-        # If very little was parsed, use a more structured ambiguous default
-        if not partial_fingerprint or len(partial_fingerprint) < 3:
-            fingerprint_dict = {
-                "indent": "unknown?", "quotes": "unknown?", "linelen": "unknown?",
-                "snake_pct": "unknown?", "camel_pct": "unknown?",
-                "screaming_pct": "unknown?", "docstyle": "unknown?"
-            }
-        else: # Use what was partially parsed, fill missing
-            expected_keys = ["indent", "quotes", "linelen", "snake_pct", "camel_pct", "screaming_pct", "docstyle"]
-            for key in expected_keys:
-                if key not in partial_fingerprint:
-                    partial_fingerprint[key] = "unknown?"
-            fingerprint_dict = partial_fingerprint
+JSON_FINGERPRINT_GRAMMAR_STR = r'''
+root   ::= object
+value  ::= object | array | string | number | boolean | "null"
+object ::= "{}" | "{" members "}"
+members ::= pair ("," pair)*
+pair   ::= string ":" value
+array  ::= "[]" | "[" elements "]"
+elements ::= value ("," value)*
+string ::= "\"\"\" (([#x20-#x21] | [#x23-#x5B] | [#x5D-#xFFFF]) | #x5C ([#x22#x5C#x2F#x62#x66#x6E#x72#x74] | #x75[0-9a-fA-F]{4}))* "\"\"\""
+number ::= ("-")? (("0") | ([1-9][0-9]*)) ("." [0-9]+)? (("e" | "E") (("-" | "+")?) [0-9]+)?
+boolean ::= "true" | "false"
+'''
 
-    return fingerprint_dict
+def get_deepseek_polished_json(cleaned_key_value_string: str, model_path: str, n_gpu_layers: int = -1, verbose: bool = False) -> Optional[str]:
+    if Llama is None or LlamaGrammar is None:
+        error_msg = "llama-cpp-python or LlamaGrammar not available. Cannot polish JSON with GGUF model."
+        print(f"LLM_Interfacer Error: {error_msg}")
+        return None
+    resolved_model_path_str = model_path; is_placeholder_path = False
+    if not model_path or model_path == "path/to/your/deepseek-coder-gguf-model.gguf" or model_path.endswith("placeholder_deepseek.gguf"):
+        resolved_model_path_str = "./models/placeholder_deepseek.gguf"; is_placeholder_path = True
+        print(f"LLM_Interfacer Warning: Model path for JSON polishing is a placeholder or not provided. Using standard placeholder: '{resolved_model_path_str}'.")
+    resolved_model_path = Path(resolved_model_path_str)
+    if not resolved_model_path.exists() or not resolved_model_path.is_file():
+        error_msg = f"GGUF model for JSON polishing does not exist at: {resolved_model_path}"
+        if is_placeholder_path: error_msg += " (This is a placeholder path. Please provide a valid GGUF model or place it at './models/placeholder_deepseek.gguf')"
+        print(f"LLM_Interfacer Error: {error_msg}"); return None
+    try:
+        llm = Llama(model_path=str(resolved_model_path), n_gpu_layers=n_gpu_layers, n_ctx=2048, verbose=verbose)
+        grammar = LlamaGrammar.from_string(JSON_FINGERPRINT_GRAMMAR_STR)
+    except Exception as e:
+        error_msg = f"Error loading GGUF model or grammar from {resolved_model_path} for polish: {e}"; print(f"LLM_Interfacer Error: {error_msg}")
+        return None
+    system_prompt = ("You are a JSON formatting assistant. Convert the following string of key-value pairs into a single, valid JSON object. Ensure all keys and string values are double-quoted, and the overall structure is a correct JSON object. The required keys are 'indent', 'quotes', 'linelen', 'snake_pct', 'camel_pct', 'screaming_pct', and 'docstyle'. If a key is missing from the input, try to infer a sensible default or set its value to null if appropriate for the JSON structure, but ensure all listed keys are present in the final JSON.")
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": cleaned_key_value_string}]
+    if verbose: print(f"LLM_Interfacer: Polishing JSON with prompt (user content snippet): {cleaned_key_value_string[:200]}...")
+    try:
+        response = llm.create_chat_completion(messages=messages, temperature=0.05, max_tokens=512, grammar=grammar) # Increased max_tokens
+        if response and response['choices'] and response['choices'][0]['message']['content']:
+            polished_json_string = response['choices'][0]['message']['content'].strip()
+            if verbose: print(f"LLM_Interfacer: Raw polished JSON output from LLM: '{polished_json_string}'")
+            try:
+                json.loads(polished_json_string); return polished_json_string
+            except json.JSONDecodeError as je:
+                error_msg = f"LLM output for JSON polishing was not valid JSON despite grammar constraint: '{polished_json_string}'. Error: {je}"; print(f"LLM_Interfacer Warning: {error_msg}")
+                return None
+        else: print("LLM_Interfacer Warning: GGUF model (polish pass) returned an empty or unexpected response."); return None
+    except Exception as e:
+        error_msg = f"Error during GGUF model (polish pass) inference: {e}"; print(f"LLM_Interfacer Error: {error_msg}")
+        return None
 
-# (Optional: Add to the existing __main__ block in llm_interfacer.py or create a new one for testing this)
+def get_llm_code_fix_suggestion(model_path: str, original_code_script: str, error_traceback: str, phase_description: str, target_file: Optional[str], additional_context: Optional[Dict[str, Any]], n_gpu_layers: int = -1, max_tokens: int = 1024, temperature: float = 0.4, verbose: bool = False) -> Optional[str]:
+    if Llama is None:
+        print("LLM_Interfacer Error: llama-cpp-python not installed. Cannot get LLM code fix suggestion.")
+        return f"# Mock fix for error: {error_traceback[:100]}...\n# Original script had {len(original_code_script)} chars.\npass # LLM disabled - Apply actual fix here"
+    resolved_model_path_str = model_path; is_placeholder_path = False
+    if not model_path or model_path.endswith("placeholder_deepseek.gguf") or model_path.endswith("placeholder_repair_model.gguf"): # General placeholder check
+        resolved_model_path_str = "./models/placeholder_repair_model.gguf"; is_placeholder_path = True # Standardize to a repair placeholder
+        print(f"LLM_Interfacer Warning: LLM repair model path is a placeholder or not provided. Using standard placeholder: '{resolved_model_path_str}'.")
+    resolved_model_path = Path(resolved_model_path_str)
+    if not resolved_model_path.exists() or not resolved_model_path.is_file():
+        error_msg = f"LLM repair model file does not exist at: {resolved_model_path}"
+        if is_placeholder_path: error_msg += " (This is a placeholder. Provide a valid GGUF model path or place model here.)"
+        print(f"LLM_Interfacer Error: {error_msg}")
+        return f"# Mock fix due to model path error: {error_msg}\n# Error: {error_traceback[:100]}\npass"
+    try:
+        llm = Llama(model_path=str(resolved_model_path), n_gpu_layers=n_gpu_layers, n_ctx=4096, verbose=verbose)
+    except Exception as e:
+        print(f"LLM_Interfacer Error: Error loading LLM repair model from {resolved_model_path}: {e}")
+        return f"# Mock fix due to model load error for: {error_traceback[:100]}...\npass"
+    prompt_parts = ["You are an expert Python programmer and code assistant, specialized in writing and debugging LibCST refactoring scripts.", f"The following LibCST script was intended to perform a refactoring operation but failed validation or execution.\nRefactoring Operation Description: {phase_description}\nTarget File for Refactoring: {target_file if target_file else 'N/A'}"]
+    if additional_context:
+        if 'style_profile' in additional_context and additional_context['style_profile']:
+            try: prompt_parts.append(f"Project Style Profile (relevant parts for context):\n{json.dumps(additional_context['style_profile'], indent=2)}")
+            except (TypeError, OverflowError) as json_e: prompt_parts.append(f"Project Style Profile (relevant parts for context): Error serializing - {json_e}")
+        if 'code_snippets' in additional_context and additional_context['code_snippets']:
+            for fname, snippet in additional_context['code_snippets'].items(): prompt_parts.append(f"Relevant code snippet from '{fname}':\n```python\n{snippet}\n```")
+    prompt_parts.extend(["Original LibCST script that failed:\n```python", original_code_script, "```", "Validation Error Traceback or Description:\n```text", error_traceback, "```", "Please provide a revised version of the LibCST script that fixes the error. Output only the complete, revised Python script for the LibCST code. Do not add any explanations or markdown formatting before or after the script block."])
+    full_prompt = "\n\n".join(prompt_parts)
+    if verbose: print(f"LLM Code Fix Prompt (first 1000 chars):\n{full_prompt[:1000]}...")
+    else: print(f"LLM Code Fix Prompt (first 200 chars):\n{full_prompt[:200]}...")
+    try:
+        response = llm.create_chat_completion(prompt=full_prompt, max_tokens=max_tokens, temperature=temperature, stop=["```python\n", "\n```\n", "\n```"], echo=False) # Changed to create_chat_completion
+        suggested_script = response['choices'][0]['message']['content'].strip() # Adjusted for chat completion response
+        if suggested_script.startswith("```python"): suggested_script = suggested_script[len("```python"):].strip()
+        if suggested_script.startswith("```"): suggested_script = suggested_script[len("```"):].strip()
+        if suggested_script.endswith("```"): suggested_script = suggested_script[:-len("```")].strip()
+        return suggested_script
+    except Exception as e:
+        print(f"LLM_Interfacer Error: Error during LLM code fix suggestion inference: {e}")
+        return f"# Mock fix due to inference error for: {error_traceback[:100]}...\n# Original script length: {len(original_code_script)}\npass"
+
+# Main block for testing (commented out as per original structure)
 # if __name__ == '__main__':
-#     # This main block would be for testing the whole llm_interfacer.
-#     # To test get_deepseek_draft_fingerprint specifically:
-#     example_stats = """STATS_START
+#     # Test get_deepseek_draft_fingerprint
+#     example_stats_for_main = """STATS_START
 # indent_modal: 4
 # quotes_single: 10
 # quotes_double: 2
@@ -354,454 +331,71 @@ def get_deepseek_draft_fingerprint(stats_block: str, model_path: str, n_gpu_laye
 # screaming_pct: 0.05
 # doc_tokens: Args:, Returns:
 # STATS_END"""
-#     # IMPORTANT: Replace with an ACTUAL path to a DeepSeek GGUF model file.
-#     # If no model is available, it will use the mock fallback.
-#     # For the test environment, we won't have a real model path, so it will always use mock.
-#     from pathlib import Path # Ensure Path is imported if this __main__ is uncommented
-#     deepseek_model_path = "path/to/your/deepseek-coder-gguf-model.gguf"
-#
-#     print("\n--- Testing DeepSeek Draft Fingerprint ---")
-#     if Llama is None:
-#         print("llama-cpp-python not installed, test will use mock response.")
-#     # Simple check to see if placeholder path was changed; in CI/test, it won't be.
-#     elif deepseek_model_path == "path/to/your/deepseek-coder-gguf-model.gguf" or not Path(deepseek_model_path).exists():
-#         print(f"DeepSeek GGUF model not found at '{deepseek_model_path}' (or path is placeholder), test will use mock response if loading fails.")
-#
-#     draft_fp = get_deepseek_draft_fingerprint(example_stats, deepseek_model_path, verbose=False) # Verbose usually True for debug
-#     print("\nDeepSeek Draft Fingerprint Output:")
-#     import json # for pretty print
-#     print(json.dumps(draft_fp, indent=2))
+#     main_deepseek_model_path = "./models/placeholder_deepseek.gguf"
+#     print("\n--- Testing DeepSeek Draft Fingerprint (from __main__) ---")
+#     draft_fp_main = get_deepseek_draft_fingerprint(example_stats_for_main, model_path=main_deepseek_model_path, verbose=False)
+#     print("\nDeepSeek Draft Fingerprint Output (from __main__):")
+#     print(json.dumps(draft_fp_main, indent=2))
 
-
-# Add Hugging Face Transformers import, guarded
-try:
-    import torch
-    from transformers import T5ForConditionalGeneration, T5TokenizerFast
-except ImportError:
-    torch = None # type: ignore
-    T5ForConditionalGeneration = None # type: ignore
-    T5TokenizerFast = None # type: ignore
-    print("Warning: PyTorch or Hugging Face Transformers not found. DivoT5 SafeTensor model interaction will be disabled.")
-
-
-def get_divot5_refined_output(
-    code_snippet: str,
-    raw_fingerprint_dict: Dict,
-    model_path: str,
-    num_denoising_steps: int = 10, # User spec: 8-12, used conceptually for generation params
-    device: Optional[str] = None
-) -> str:
-    """
-    Loads a DivoT5 SafeTensor model and uses it to refine a raw style fingerprint
-    based on the original code snippet.
-
-    Args:
-        code_snippet: The original code snippet.
-        raw_fingerprint_dict: The raw style fingerprint dictionary from DeepSeek.
-        model_path: Path to the DivoT5 model directory (SafeTensor format).
-        num_denoising_steps: Conceptually represents generation quality/length.
-                             Used to set max_length for T5 generation.
-        device: Device to run the model on (e.g., "cpu", "cuda"). Auto-detects if None.
-
-    Returns:
-        A string containing the refined key/value pairs for the style fingerprint.
-        Returns a mock/default string if Transformers/PyTorch are not available or model fails.
-    """
-    if T5ForConditionalGeneration is None or T5TokenizerFast is None or torch is None:
-        print("Error: Transformers/PyTorch not installed. Cannot interact with DivoT5 model.")
-        # Return a mock response that looks like a refined version of a typical raw input
-        refined_mock_parts = []
-        for key, value in raw_fingerprint_dict.items():
-            if isinstance(value, str) and "?" in value: # If ambiguous
-                if key == "quotes": refined_mock_parts.append(f'"{key}": "single"') # Example refinement
-                elif key == "docstyle": refined_mock_parts.append(f'"{key}": "google"')
-                else: refined_mock_parts.append(f'"{key}": "{str(value).replace("?", "")}_refined"')
-            elif isinstance(value, float):
-                 refined_mock_parts.append(f'"{key}": {value:.2f}') # Ensure formatting
-            else:
-                refined_mock_parts.append(f'"{key}": "{value}"' if isinstance(value, str) else f'"{key}": {value}')
-        return ", ".join(refined_mock_parts)
-
-    if device is None:
-        selected_device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        selected_device = device
-
-    print(f"Loading DivoT5 model from {model_path} onto device: {selected_device}")
-
-    try:
-        tokenizer = T5TokenizerFast.from_pretrained(model_path)
-        model = T5ForConditionalGeneration.from_pretrained(model_path).to(selected_device)
-        model.eval() # Set to evaluation mode
-    except Exception as e:
-        print(f"Error loading DivoT5 model from {model_path}: {e}")
-        print("Falling back to mock DivoT5 response.")
-        # Simulate refinement of the input raw_fingerprint_dict
-        refined_mock_parts = []
-        for key, value in raw_fingerprint_dict.items():
-            if key == "quotes" and value == "mixed?": refined_mock_parts.append(f'"{key}": "single"')
-            else: refined_mock_parts.append(f'"{key}": "{value}"' if isinstance(value, str) else f'"{key}": {value}')
-        return ", ".join(refined_mock_parts)
-
-    # Construct the input string for DivoT5 as per playbook
-    # RAW_FINGERPRINT_START needs key/value pairs, not a dict string literal
-    raw_fp_parts = []
-    for key, value in raw_fingerprint_dict.items():
-        if isinstance(value, str):
-            # Ensure internal quotes in string values are escaped if necessary for the model,
-            # but typical key-value string format doesn't require this for values.
-            # The spec shows simple "key": "value" or "key": number.
-            raw_fp_parts.append(f'"{key}": "{value}"')
-        else: # numbers, booleans (though not in example)
-            raw_fp_parts.append(f'"{key}": {value if isinstance(value, (int, float)) else str(value).lower()}')
-
-
-    input_text = f"""USER_CODE_START
-{code_snippet}
-USER_CODE_END
-RAW_FINGERPRINT_START
-{", ".join(raw_fp_parts)}
-RAW_FINGERPRINT_END"""
-
-    refined_output_string = ", ".join(raw_fp_parts) # Default to input if generation fails
-
-    try:
-        print(f"DivoT5 input length: {len(input_text)} chars")
-        inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=1024).to(selected_device) # Max input length for T5
-
-        # "denoising steps" for T5 might translate to generation parameters like num_beams, length_penalty, max_length.
-        # The user spec says 8-12 denoising steps. This is more typical of diffusion.
-        # For T5, we'll generate a sequence that should be the refined key/value string.
-        # Let's use num_denoising_steps to influence max_length of the output.
-        # Output is expected to be a string of key/value pairs.
-        # Example: "indent": 4, "quotes": "single", ...
-        # Max length should be enough for all key-value pairs. ~50 chars per pair * 7 pairs = ~350. Add buffer.
-        output_max_length = num_denoising_steps * 40 # Heuristic: 40 chars per "denoising step unit"
-        output_max_length = max(200, min(output_max_length, 512)) # Clamp to reasonable range for key/value string
-
-        with torch.no_grad():
-            outputs = model.generate(
-                inputs.input_ids,
-                max_length=output_max_length,
-                num_beams=4, # Beam search can produce better quality
-                early_stopping=True,
-                length_penalty=1.0 # Adjust as needed
-            )
-
-        if outputs is not None and len(outputs) > 0:
-            refined_output_string = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-        else:
-            print("Warning: DivoT5 model returned an empty or unexpected response.")
-
-    except Exception as e:
-        print(f"Error during DivoT5 model inference: {e}")
-        print("Falling back to mock DivoT5 response due to inference error.")
-        # Fallback: Simulate some refinement on the input dictionary
-        refined_mock_parts = []
-        for key, value in raw_fingerprint_dict.items():
-            if key == "quotes" and isinstance(value, str) and "?" in value:
-                refined_mock_parts.append(f'"{key}": "single"') # Example: 'mixed?' becomes 'single'
-            elif key == "docstyle" and isinstance(value, str) and "?" in value:
-                refined_mock_parts.append(f'"{key}": "google"') # Example: 'google?' becomes 'google'
-            elif isinstance(value, float) :
-                 refined_mock_parts.append(f'"{key}": {value:.2f}') # Format float
-            else: # numbers or already fine strings
-                refined_mock_parts.append(f'"{key}": "{value}"' if isinstance(value, str) else f'"{key}": {value}')
-        return ", ".join(refined_mock_parts)
-
-    return refined_output_string
-
-# (Optional: Add to the existing __main__ block in llm_interfacer.py or create a new one for testing this)
-# if __name__ == '__main__':
-#     # This main block would be for testing the whole llm_interfacer.
-#     # To test get_divot5_refined_output specifically:
-#
-#     # 1. First get a draft fingerprint (mock or real)
-#     example_stats = """STATS_START
-# indent_modal: 4
-# quotes_single: 10
-# quotes_double: 8
-# f_strings: 1
-# line_len_95p: 70
-# snake_pct: 0.60
-# camel_pct: 0.30
-# screaming_pct: 0.10
-# doc_tokens: Args:
-# STATS_END"""
-#     # Use a mock path for DeepSeek if not available for this isolated test
-#     deepseek_model_path_for_test = "mock_deepseek_path_for_divot5_test"
-#
-#     # Simulate a raw fingerprint that DivoT5 might receive
-#     raw_fp_from_deepseek = {
+#     # Test get_divot5_refined_output
+#     raw_fp_from_deepseek_for_divo_main = {
 #         "indent": 4, "quotes": "mixed?", "linelen": 70,
 #         "snake_pct": 0.60, "camel_pct": 0.30, "screaming_pct": 0.10,
-#         "docstyle": "google?" # Another ambiguous field
+#         "docstyle": "google?", "error": None
 #     }
-#     # Or call the actual get_deepseek_draft_fingerprint if testing integration
-#     # raw_fp_from_deepseek = get_deepseek_draft_fingerprint(example_stats, deepseek_model_path_for_test)
-#
-#     example_code_snippet = "def myFunc(a_var):\n  return a_var # Example snippet"
-#
-#     # IMPORTANT: Replace with an ACTUAL path to a DivoT5 model directory.
-#     # If no model is available, it will use the mock fallback.
-#     from pathlib import Path # Ensure Path is imported if this __main__ is uncommented
-#     divot5_model_path = "path/to/your/divot5_model_dir"
-#
-#     print("\n--- Testing DivoT5 Refined Output ---")
-#     if T5ForConditionalGeneration is None:
-#         print("Transformers/PyTorch not installed, test will use mock response.")
-#     elif not Path(divot5_model_path).exists() and not divot5_model_path.startswith("path/to"):
-#         print(f"DivoT5 model not found at '{divot5_model_path}', test will use mock response if loading fails.")
-#
-#     refined_key_values = get_divot5_refined_output(
-#         example_code_snippet,
-#         raw_fp_from_deepseek,
-#         divot5_model_path
+#     example_code_snippet_for_divo_main = "def myFunc(a_var):\n  return a_var # Example snippet for DivoT5"
+#     main_divot5_model_path = "./models/placeholder_divot5_refiner/"
+#     print("\n--- Testing DivoT5 Refined Output (from __main__) ---")
+#     refined_key_values_main = get_divot5_refined_output(
+#         code_snippet=example_code_snippet_for_divo_main,
+#         raw_fingerprint_dict=raw_fp_from_deepseek_for_divo_main,
+#         model_path=main_divot5_model_path,
+#         verbose=False
 #     )
-#     print("\nDivoT5 Refined Key/Value String Output:")
-#     print(refined_key_values)
-#
-#     # Example of how this string might be used in the next step (DeepSeek Polish)
-#     # It would be parsed or directly fed if the polish step can handle it.
-#     # For now, just showing the string.
+#     print("\nDivoT5 Refined Key/Value String Output (from __main__):")
+#     if refined_key_values_main is not None:
+#         print(refined_key_values_main)
+#     else:
+#         print("DivoT5 refinement returned None (indicating an error).")
 
-
-# Simple JSON grammar for LlamaCPP (GBNF format).
-# This grammar expects a JSON object with specific string keys and allows string, number, or boolean values.
-# It's a simplified grammar; a more robust one would handle nesting, arrays, etc.
-# For this specific fingerprint, values are mostly strings or numbers.
-JSON_FINGERPRINT_GRAMMAR_STR = r'''
-root   ::= object
-value  ::= object | array | string | number | boolean | "null"
-object ::= "{}" | "{" members "}"
-members ::= pair ("," pair)*
-pair   ::= string ":" value
-array  ::= "[]" | "[" elements "]"
-elements ::= value ("," value)*
-string ::= """ (([#x20-#x21] | [#x23-#x5B] | [#x5D-#xFFFF]) | #x5C ([#x22#x5C#x2F#x62#x66#x6E#x72#x74] | #x75[0-9a-fA-F]{4}))* """
-number ::= ("-")? (("0") | ([1-9][0-9]*)) ("." [0-9]+)? (("e" | "E") (("-" | "+")?) [0-9]+)?
-boolean ::= "true" | "false"
-'''
-# Note: The above grammar is a general JSON grammar. For the specific fingerprint,
-# we might want a more constrained one if all keys are known and types are fixed.
-# However, the prompt to DeepSeek already specifies the keys. This general JSON grammar
-# ensures the *structure* is JSON, letting the LLM fill in values based on the prompt.
-
-
-def get_deepseek_polished_json(
-    cleaned_key_value_string: str,
-    model_path: str,
-    n_gpu_layers: int = -1,
-    verbose: bool = False
-) -> str:
-    """
-    Loads/uses a DeepSeek GGUF model to polish a string of key/value pairs into
-    a valid JSON object string, potentially using a grammar constraint.
-
-    Args:
-        cleaned_key_value_string: The string of key/value pairs from DivoT5.
-        model_path: Path to the DeepSeek GGUF model file.
-        n_gpu_layers: Number of layers to offload to GPU.
-        verbose: Whether LlamaCPP should be verbose.
-
-    Returns:
-        A string that should be a valid JSON representation of the fingerprint.
-        Returns a mock/default JSON string if LlamaCPP is not available or model fails.
-    """
-    if Llama is None or LlamaGrammar is None:
-        print("Error: llama-cpp-python is not installed. Cannot polish JSON with DeepSeek GGUF model.")
-        # Return a mock response that looks like a valid JSON version of the input
-        # Assuming cleaned_key_value_string is like: '"indent": 4, "quotes": "single", ...'
-        # A simple mock is to wrap it in braces if it's not already.
-        if cleaned_key_value_string.strip().startswith("{") and cleaned_key_value_string.strip().endswith("}"):
-            return cleaned_key_value_string
-        return f"{{{cleaned_key_value_string}}}"
-
-
-    try:
-        llm = Llama(
-            model_path=model_path,
-            n_gpu_layers=n_gpu_layers,
-            n_ctx=2048, # Context window, ensure it's enough for prompt + response
-            verbose=verbose
-        )
-        grammar = LlamaGrammar.from_string(JSON_FINGERPRINT_GRAMMAR_STR)
-    except Exception as e:
-        print(f"Error loading DeepSeek GGUF model or grammar from {model_path}: {e}")
-        print("Falling back to mock JSON polishing response.")
-        if cleaned_key_value_string.strip().startswith("{") and cleaned_key_value_string.strip().endswith("}"):
-            return cleaned_key_value_string
-        return f"{{{cleaned_key_value_string}}}"
-
-    # Prompt for this step: User playbook says "Send the cleaned key/value string back to DeepSeek
-    # with a grammar mask that forces valid JSON. DeepSeek inserts any missing keys,
-    # ensures proper quoting, and emits..."
-    # The system prompt might need to guide it to complete/validate the JSON structure.
-
-    system_prompt = "You are a helpful assistant that completes and validates JSON. Given the following key-value pairs, ensure they form a complete and valid JSON object representing a style fingerprint. The required keys are indent, quotes, linelen, snake_pct, camel_pct, screaming_pct, and docstyle. Ensure all string values are properly quoted."
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": cleaned_key_value_string}
-    ]
-
-    polished_json_string = "{}" # Default to empty JSON string
-
-    try:
-        response = llm.create_chat_completion(
-            messages=messages,
-            temperature=0.05, # Very low temperature for precise JSON formatting
-            max_tokens=300,   # Max tokens for the JSON response
-            grammar=grammar   # Apply the JSON grammar
-        )
-        if response and response['choices'] and response['choices'][0]['message']['content']:
-            polished_json_string = response['choices'][0]['message']['content'].strip()
-        else:
-            print("Warning: DeepSeek (polish pass) model returned an empty or unexpected response.")
-            # Fallback: try to make the input valid JSON if possible
-            if cleaned_key_value_string.strip().startswith("{") and cleaned_key_value_string.strip().endswith("}"):
-                 polished_json_string = cleaned_key_value_string
-            else:
-                 polished_json_string = f"{{{cleaned_key_value_string}}}"
-
-    except Exception as e:
-        print(f"Error during DeepSeek (polish pass) model inference: {e}")
-        print("Falling back to basic JSON wrapping due to inference error.")
-        if cleaned_key_value_string.strip().startswith("{") and cleaned_key_value_string.strip().endswith("}"):
-             polished_json_string = cleaned_key_value_string
-        else:
-             polished_json_string = f"{{{cleaned_key_value_string}}}"
-
-    return polished_json_string
-
-# (Optional: Add to the existing __main__ block in llm_interfacer.py or create a new one for testing this)
-# if __name__ == '__main__':
-#     # This main block would be for testing the whole llm_interfacer.
-#     # To test get_deepseek_polished_json specifically:
-#
-#     # Simulate a cleaned key/value string from DivoT5
-#     # This string might already be close to JSON, or it might be just key-value pairs.
-#     # User spec: DivoT5 snaps ambiguous fields to canonical values and clamps numbers:
-#     # "indent": 4, "quotes": "single", "linelen": 110, ...
-#     divot5_output_example = '"indent": 4, "quotes": "single", "linelen": 110, "snake_pct": 0.82, "camel_pct": 0.12, "screaming_pct": 0.06, "docstyle": "google"'
-#
-#     # IMPORTANT: Replace with an ACTUAL path to a DeepSeek GGUF model file.
-#     from pathlib import Path # Ensure Path is imported if this __main__ is uncommented
-#     deepseek_model_path_for_polish = "path/to/your/deepseek-coder-gguf-model.gguf"
-#
-#     print("\n--- Testing DeepSeek Polished JSON ---")
-#     if Llama is None:
-#         print("llama-cpp-python not installed, test will use mock response.")
-#     elif not Path(deepseek_model_path_for_polish).exists() and not deepseek_model_path_for_polish.startswith("path/to"):
-#         print(f"DeepSeek GGUF model not found at '{deepseek_model_path_for_polish}', test will use mock response if loading fails.")
-#
-#     polished_fp_json_str = get_deepseek_polished_json(
-#         divot5_output_example,
-#         deepseek_model_path_for_polish,
-#         verbose=False # Set to True for detailed LlamaCPP logging
+#     # Test get_deepseek_polished_json
+#     divot5_output_example_main = '"indent": 4, "quotes": "single", "linelen": 110, "snake_pct": 0.82, "camel_pct": 0.12, "screaming_pct": 0.06, "docstyle": "google"'
+#     # main_deepseek_model_path is already defined
+#     print("\n--- Testing DeepSeek Polished JSON (from __main__) ---")
+#     polished_fp_json_str_main = get_deepseek_polished_json(
+#         cleaned_key_value_string=divot5_output_example_main,
+#         model_path=main_deepseek_model_path, # Use the same GGUF model for this pass
+#         verbose=False
 #     )
-#     print("\nDeepSeek Polished JSON String Output:")
-#     print(polished_fp_json_str)
-#
-#     # Try to parse it to see if it's valid
-#     try:
-#         import json
-#         parsed_json = json.loads(polished_fp_json_str)
-#         print("\nSuccessfully parsed the polished JSON:")
-#         print(json.dumps(parsed_json, indent=2))
-#     except json.JSONDecodeError as e:
-#         print(f"\nFailed to parse polished JSON: {e}")
-#     except Exception as e_gen:
-#         print(f"\nAn error occurred with the polished JSON: {e_gen}")
+#     print("\nDeepSeek Polished JSON String Output (from __main__):")
+#     if polished_fp_json_str_main is not None:
+#         print(polished_fp_json_str_main)
+#         try:
+#             # json import is at top of file
+#             parsed_json_main = json.loads(polished_fp_json_str_main)
+#             print("\nSuccessfully parsed the polished JSON (from __main__):")
+#             print(json.dumps(parsed_json_main, indent=2))
+#         except json.JSONDecodeError as e:
+#             print(f"\nFailed to parse polished JSON (from __main__): {e}")
+#     else:
+#         print("DeepSeek JSON polishing returned None (indicating an error).")
 
+#     # Test get_llm_code_fix_suggestion
+#     main_repair_model_path = "./models/placeholder_repair_model.gguf" # Define a placeholder for repair model
+#     print("\n--- Testing LLM Code Fix Suggestion (from __main__) ---")
+#     mock_failed_script_main = "import libcst\ndef malformed_function((("
+#     mock_traceback_main = "SyntaxError: unexpected EOF while parsing"
+#     mock_phase_desc_main = "Add a new function to the module."
+#     mock_target_file_main = "src/example/target.py"
+#     mock_additional_context_main = {"style_profile": {"indent": 2, "quotes": "single"}}
 
-# --- New function for LLM Code Fix Suggestion ---
-def get_llm_code_fix_suggestion(
-    model_path: str, # Path to GGUF model
-    original_code_script: str, # The LibCST script that failed
-    error_traceback: str,
-    phase_description: str,
-    target_file: Optional[str],
-    additional_context: Optional[Dict[str, Any]], # e.g., style profile, snippets
-    n_gpu_layers: int = -1,
-    max_tokens: int = 1024, # Max tokens for the suggested script
-    temperature: float = 0.4, # Temperature for generation
-    verbose: bool = False
-) -> Optional[str]:
-    """
-    Uses a GGUF language model to suggest a fix for a failing LibCST script.
-    """
-    if Llama is None:
-        print("Error: llama-cpp-python not installed. Cannot get LLM code fix suggestion.")
-        # Return a mock suggestion that includes parts of the error and original script info
-        return f"# Mock fix for error: {error_traceback[:100]}...\n# Original script had {len(original_code_script)} chars.\npass # LLM disabled - Apply actual fix here"
-
-    try:
-        # Increased n_ctx for potentially longer prompts including code and traceback
-        llm = Llama(model_path=model_path, n_gpu_layers=n_gpu_layers, n_ctx=4096, verbose=verbose)
-    except Exception as e:
-        print(f"Error loading LLM model from {model_path}: {e}")
-        return f"# Mock fix due to model load error for: {error_traceback[:100]}...\npass"
-
-    # Construct a detailed prompt
-    prompt_parts = [
-        "You are an expert Python programmer and code assistant, specialized in writing and debugging LibCST refactoring scripts.",
-        "The following LibCST script was intended to perform a refactoring operation but failed validation or execution.",
-        f"Refactoring Operation Description: {phase_description}",
-        f"Target File for Refactoring: {target_file if target_file else 'N/A'}",
-    ]
-    if additional_context:
-        if 'style_profile' in additional_context and additional_context['style_profile']:
-            try:
-                style_profile_str = json.dumps(additional_context['style_profile'], indent=2)
-                prompt_parts.append(f"Project Style Profile (relevant parts for context):\n{style_profile_str}")
-            except (TypeError, OverflowError) as json_e:
-                 prompt_parts.append(f"Project Style Profile (relevant parts for context): Error serializing - {json_e}")
-
-        if 'code_snippets' in additional_context and additional_context['code_snippets']: # Assuming code_snippets is Dict[str, str]
-            for fname, snippet in additional_context['code_snippets'].items():
-                prompt_parts.append(f"Relevant code snippet from '{fname}':\n```python\n{snippet}\n```")
-
-    prompt_parts.extend([
-        "Original LibCST script that failed:",
-        "```python",
-        original_code_script,
-        "```",
-        "Validation Error Traceback or Description:",
-        "```text", # Marking traceback as text
-        error_traceback,
-        "```",
-        "Please provide a revised version of the LibCST script that fixes the error. Output only the complete, revised Python script for the LibCST code. Do not add any explanations or markdown formatting before or after the script block."
-    ])
-
-    full_prompt = "\n\n".join(prompt_parts)
-
-    if verbose: # Print more of the prompt if verbose is on
-        print(f"LLM Code Fix Prompt (first 1000 chars):\n{full_prompt[:1000]}...")
-    else:
-        print(f"LLM Code Fix Prompt (first 200 chars):\n{full_prompt[:200]}...")
-
-
-    try:
-        response = llm.create_completion(
-            prompt=full_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=["```python\n", "\n```\n", "\n```"], # More robust stopping, though model should just output script
-            echo=False # Don't echo the prompt in the completion
-        )
-
-        suggested_script = response['choices'][0]['text'].strip()
-
-        # Basic cleaning: Sometimes models might still include markdown even if asked not to.
-        if suggested_script.startswith("```python"):
-            suggested_script = suggested_script[len("```python"):].strip()
-        if suggested_script.startswith("```"): # Generic code block start
-             suggested_script = suggested_script[len("```"):].strip()
-        if suggested_script.endswith("```"):
-            suggested_script = suggested_script[:-len("```")].strip()
-
-        return suggested_script
-    except Exception as e:
-        print(f"Error during LLM code fix suggestion inference: {e}")
-        return f"# Mock fix due to inference error for: {error_traceback[:100]}...\n# Original script length: {len(original_code_script)}\npass"
+#     suggested_fix_main = get_llm_code_fix_suggestion(
+#         model_path=main_repair_model_path,
+#         original_code_script=mock_failed_script_main,
+#         error_traceback=mock_traceback_main,
+#         phase_description=mock_phase_desc_main,
+#         target_file=mock_target_file_main,
+#         additional_context=mock_additional_context_main,
+#         verbose=False
+#     )
+#     print(f"\nSuggested Code Fix (from __main__):\n{suggested_fix_main}")
