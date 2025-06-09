@@ -4,10 +4,11 @@ import json # Add json import for dumping dicts in prompt
 
 # Attempt to import the new LLM interfacer function
 try:
-    from src.profiler.llm_interfacer import get_llm_code_fix_suggestion
+    from src.profiler.llm_interfacer import get_llm_code_fix_suggestion, get_llm_cst_scaffold
 except ImportError:
     get_llm_code_fix_suggestion = None
-    print("LLMCore Warning: Failed to import get_llm_code_fix_suggestion. LLM-based repair will be disabled.")
+    get_llm_cst_scaffold = None # Also handle if this specific one is missing
+    print("LLMCore Warning: Failed to import one or more LLM interfacer functions. Related LLM capabilities will be disabled.")
 
 
 class LLMCore:
@@ -32,161 +33,173 @@ class LLMCore:
 
     def generate_scaffold_patch(self, context_data: Dict[str, Any]) -> Tuple[Optional[str], Optional[List[str]]]:
         """
-        Generates a scaffold patch (LibCST edit script string) and an edit summary.
+        Generates a LibCST scaffold script and an edit summary using an LLM.
         Args:
             context_data: Comprehensive context data dictionary.
         Returns:
-            A tuple containing the mock LibCST script string (or None) and an edit summary list (or None).
+            A tuple (cst_script_str, edit_summary_list), or (None, None) on failure.
         """
         print(f"LLMCore.generate_scaffold_patch called. Context keys: {list(context_data.keys())}")
 
-        # Extract relevant information from context_data
-        phase_description = context_data.get("phase_description", "No phase description provided.")
-        target_file = context_data.get("phase_target_file", "No target file specified.")
+        if get_llm_cst_scaffold is None or not self.llm_model_path:
+            print("LLMCore Error: get_llm_cst_scaffold is not available or llm_model_path not configured. Cannot generate scaffold.")
+            return None, None
+
+        phase_description = context_data.get("phase_description", "N/A")
+        target_file = str(context_data.get("phase_target_file", "N/A")) # Ensure string for prompt
         parameters = context_data.get("phase_parameters", {})
-        code_snippets = context_data.get("retrieved_code_snippets", {"info": "No snippets retrieved."})
+        code_snippets = context_data.get("retrieved_code_snippets", {})
         style_profile = context_data.get("style_profile", {})
 
-        # Construct a detailed prompt string
-        prompt = f"""[LLM TASK: Generate LibCST Python Edit Script and Edit Summary]
+        # Refined Prompt for LibCST script and delimited edit summary
+        prompt = f"""[TASK]
+You are an expert Python programmer specializing in code generation using LibCST.
+Your goal is to generate a Python script that defines a LibCST VisitorBasedCodemodCommand or MatcherDecoratableCommand class.
+This script will be used to perform a specific code modification as described in the phase details.
+For complex logic or sections that will be filled in later (e.g., by another AI model), use placeholders like '__HOLE_0__', '__HOLE_1__', etc., in the generated *code within the LibCST command's methods*.
 
-Objective:
-Generate a Python script using LibCST that performs a specific code modification.
-The script should define a VisitorBasedCodemodCommand class to implement the change.
-For complex logic or sections that require further refinement (e.g., by a diffusion model),
-use placeholders like '__HOLE_0__', '__HOLE_1__', etc., in the generated code within the LibCST script.
+[OUTPUT FORMAT]
+Provide your response as two distinct parts, separated by a specific delimiter:
+1.  The LibCST Python script.
+2.  An edit summary list enclosed in XML-like tags.
 
-Output Format:
-1.  A Python string variable containing the complete LibCST script.
-2.  A Python list of strings variable named "edit_summary", where each string describes a high-level change.
-    Example: edit_summary = ["ADD_DECORATOR @transactional to func:process_payment line 33 in payment_service.py", "REPLACE_BODY func:get_data in data_utils.py with placeholder __HOLE_0__"]
+Example:
+```python
+# LibCST Script part
+import libcst as cst
+from libcst.codemod import VisitorBasedCodemodCommand, CodemodContext
 
-Task Details:
-----------------
-Phase Description: {phase_description}
+class AddCommentCommand(VisitorBasedCodemodCommand):
+    # ... (rest of the class definition) ...
+    def leave_FunctionDef(self, original_node, updated_node):
+        # ... logic using placeholders like self.new_code_with_hole = "__HOLE_0__" ...
+        return updated_node # ... with changes ...
+```
+# SCRIPT_END_EDIT_SUMMARY_START
+# - ADD_FUNCTION: new_dummy_function in module/file.py
+# - INSERT_PLACEHOLDER: __HOLE_0__ for core logic in new_dummy_function
+# EDIT_SUMMARY_END
+
+[PHASE DETAILS]
+Description: {phase_description}
 Target File: {target_file}
-Phase Parameters: {json.dumps(parameters, indent=2)}
+Parameters: {json.dumps(parameters, indent=2)}
 
+[CONTEXTUAL INFORMATION]
 Relevant Code Snippets:
--------------------------
 {json.dumps(code_snippets, indent=2)}
 
-Style Profile (guidelines for generated code within the CST script, if applicable, and for the modification itself):
----------------------------------------------------------------------------------------------------------------
+Style Profile (for generated code within the CST script, if applicable, and for the modification itself):
 Indent Width: {style_profile.get('indent_size', style_profile.get('tab_width', 4))}
 Quote Style: {style_profile.get('quote_style', 'double')}
-(Other relevant style elements could be included here)
 
-Instructions for LibCST script:
--------------------------------
-- Ensure all necessary LibCST imports are included (e.g., libcst as cst, libcst.matchers as m, VisitorBasedCodemodCommand).
-- The command should be parameterizable via its __init__ method if details from 'Phase Parameters' are needed.
-- Use placeholders like '__HOLE_0__' for parts of the new code that are complex or require later expansion.
-- The script should be executable and define at least one class inheriting from VisitorBasedCodemodCommand.
-
-Begin Script and Summary:
+[INSTRUCTIONS]
+- Ensure the script is syntactically correct Python and uses LibCST correctly.
+- The class should be parameterizable via its __init__ if details from 'Phase Parameters' are needed.
+- Use placeholders like '__HOLE_0__' for complex logic within the generated code segments in the CST script.
+- Ensure the edit summary is concise and uses the specified format.
 """
-        print("\n--- LLMCore: Constructed Prompt for Scaffold Generation ---")
-        print(prompt)
-        print("--- End of Prompt ---\n")
+        if self.config.get("verbose_prompts", False): # Control verbosity of prompt logging
+            print("\n--- LLMCore: Constructed Prompt for Scaffold Generation ---")
+            print(prompt)
+            print("--- End of Prompt ---\n")
+        else:
+            print("\n--- LLMCore: Constructed Prompt for Scaffold Generation (summary shown) ---")
+            print(prompt[:300] + "...")
+            print("--- End of Prompt Summary ---\n")
 
-        # Mock LLM Interaction
-        print("LLMCore: Using MOCK LLM response for scaffold generation.")
 
-        # Example: If phase is to add a function (could be inferred from phase_description or parameters)
-        func_name_param = parameters.get("function_name", "new_mock_function")
+        llm_params = self.config.get("llm_scaffold_params", {})
+        raw_llm_output = get_llm_cst_scaffold(
+            model_path=self.llm_model_path,
+            prompt=prompt,
+            verbose=self.config.get("llm_verbose", False),
+            n_gpu_layers=self.config.get("llm_n_gpu_layers", -1),
+            n_ctx=llm_params.get("n_ctx", 4096),
+            max_tokens_for_scaffold=llm_params.get("max_tokens", 2048),
+            temperature=llm_params.get("temperature", 0.3)
+        )
 
-        mock_cst_script_str = f'''
-import libcst as cst
-import libcst.matchers as m
-from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand
+        if raw_llm_output is None:
+            print("LLMCore Error: get_llm_cst_scaffold returned None. Failed to generate scaffold from LLM.")
+            return None, None
 
-class AddFunctionWithPlaceholderCommand(VisitorBasedCodemodCommand):
-    DESCRIPTION: str = "Adds a new function with a placeholder body, using a parameter for the function name."
+        # Parse the raw output
+        script_marker = "# SCRIPT_END_EDIT_SUMMARY_START"
+        summary_start_marker = "# EDIT_SUMMARY_START" # Redundant if script_marker is primary
+        summary_end_marker = "# EDIT_SUMMARY_END"
 
-    def __init__(self, context: CodemodContext, function_name: str, placeholder_content: str):
-        super().__init__(context)
-        self.function_name = function_name
-        self.placeholder_content = placeholder_content # e.g., "__HOLE_0__"
+        extracted_cst_script_str: Optional[str] = None
+        extracted_edit_summary_list: Optional[List[str]] = None
 
-    def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
-        new_function_code = f"""
-def {self.function_name}():
-    # {self.placeholder_content}
-    pass
-"""
-        new_function_def = cst.parse_statement(new_function_code)
-
-        # Example: Add to the end of the module
-        # More sophisticated logic might insert it relative to other elements.
-        return updated_node.with_changes(body=list(updated_node.body) + [new_function_def])
-
-# How to instantiate (example):
-# cmd_context = CodemodContext()
-# command_instance = AddFunctionWithPlaceholderCommand(cmd_context, function_name="{func_name_param}", placeholder_content="__HOLE_0__ # Business logic for {func_name_param}")
-'''
-
-        mock_edit_summary_list = [
-            f"ADD_FUNCTION name:{func_name_param} in file:{target_file}",
-            f"INSERT_PLACEHOLDER __HOLE_0__ in {func_name_param}"
-        ]
-
-        # Handle a hypothetical 'modify_class' operation
-        if "modify_class" in phase_description.lower() or parameters.get("operation_type") == "modify_class":
-            class_name_param = parameters.get("class_name", "ExistingMockClass")
-            method_name_param = parameters.get("method_name", "new_method_in_class")
-            mock_cst_script_str = f'''
-import libcst as cst
-import libcst.matchers as m
-from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand
-
-class ModifyClassAddMethodCommand(VisitorBasedCodemodCommand):
-    DESCRIPTION: str = "Adds a new method with a placeholder to an existing class."
-
-    def __init__(self, context: CodemodContext, class_name: str, method_name: str, placeholder_content: str):
-        super().__init__(context)
-        self.class_name = class_name
-        self.method_name = method_name
-        self.placeholder_content = placeholder_content
-
-    @m.call_if_inside(m.ClassDef(name=m.Name(value=lambda val: val == self.class_name)))
-    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.ClassDef:
-        new_method_code = f"""
-    def {self.method_name}(self):
-        # {self.placeholder_content}
-        return None
-"""
-        # WARNING: cst.parse_statement expects a statement. A method def is part of a ClassDef body.
-        # This direct parsing and appending might need refinement for correct indentation and structure.
-        # A safer way is to construct CST nodes directly or use a more complex parsing logic.
-        # For this mock, we'll assume a simplified approach that might need fixing in a real scenario.
         try:
-            # This is not ideal, parsing a full class just to get a method, then extracting.
-            temp_class_def = cst.parse_module(f"class Temp:\\n{new_method_code.strip()}").body[0]
-            if isinstance(temp_class_def, cst.ClassDef) and temp_class_def.body.body:
-                new_method_node = temp_class_def.body.body[0]
-                # Ensure it's a FunctionDef before adding
-                if isinstance(new_method_node, cst.FunctionDef):
-                    # Add to existing methods
-                    updated_body_elements = list(updated_node.body.body) + [new_method_node]
-                    return updated_node.with_changes(body=updated_node.body.with_changes(body=updated_body_elements))
-        except Exception as e:
-            print(f"Mock LLM: Error constructing class method node: {e}")
+            if script_marker in raw_llm_output:
+                parts = raw_llm_output.split(script_marker, 1)
+                extracted_cst_script_str = parts[0].strip()
 
-        return updated_node # Return original if modification failed
+                summary_part = parts[1]
+                # Summary part might still contain the start marker if it was also a stop token
+                if summary_start_marker in summary_part:
+                     summary_part = summary_part.split(summary_start_marker,1)[1]
 
-# How to instantiate (example):
-# cmd_context = CodemodContext()
-# command_instance = ModifyClassAddMethodCommand(cmd_context, class_name="{class_name_param}", method_name="{method_name_param}", placeholder_content="__HOLE_CLASS_METHOD_0__")
-'''
-            mock_edit_summary_list = [
-                f"MODIFY_CLASS name:{class_name_param} in file:{target_file}",
-                f"ADD_METHOD name:{method_name_param} to class:{class_name_param}",
-                f"INSERT_PLACEHOLDER __HOLE_CLASS_METHOD_0__ in {class_name_param}.{method_name_param}"
-            ]
+                if summary_end_marker in summary_part:
+                    summary_part = summary_part.split(summary_end_marker, 1)[0]
 
-        # Simulate returning the script and summary
-        return mock_cst_script_str, mock_edit_summary_list
+                extracted_edit_summary_list = [
+                    line.strip() for line in summary_part.strip().splitlines()
+                    if line.strip() and line.strip().startswith("- ") # Ensure lines are actual summary items
+                ]
+                # Clean up "- " prefix
+                extracted_edit_summary_list = [line[2:] for line in extracted_edit_summary_list]
+
+            else: # Fallback if markers are not perfectly produced
+                print("LLMCore Warning: Script/summary delimiter not found in LLM output. Attempting heuristic parsing.")
+                # Attempt to find Python code block for script
+                code_block_match = re.search(r"```python\n(.*?)\n```", raw_llm_output, re.DOTALL)
+                if code_block_match:
+                    extracted_cst_script_str = code_block_match.group(1).strip()
+                else: # Assume the whole thing might be the script if no markers
+                    extracted_cst_script_str = raw_llm_output.strip()
+
+                # For summary, if no markers, it's hard to get. Maybe it's after the script.
+                # This part is highly unreliable without markers.
+                # For now, if no markers, summary might be None or extracted based on other heuristics.
+                # Let's assume for now if markers are missing, summary extraction is skipped or results in empty.
+                if extracted_cst_script_str and len(raw_llm_output) > len(extracted_cst_script_str):
+                    potential_summary_part = raw_llm_output[len(extracted_cst_script_str):].strip()
+                    if potential_summary_part.startswith("#"): # Common for comments
+                         extracted_edit_summary_list = [
+                            line.strip()[2:] for line in potential_summary_part.splitlines()
+                            if line.strip().startswith("# - ")
+                         ]
+
+
+            if not extracted_cst_script_str:
+                print("LLMCore Error: Could not extract LibCST script from LLM output.")
+                if self.verbose: print(f"LLM Raw Output for script extraction failure:\n{raw_llm_output}")
+                return None, None
+
+            if not extracted_edit_summary_list: # Default to a generic summary if none parsed
+                print("LLMCore Warning: Could not extract edit summary from LLM output, or it was empty.")
+                extracted_edit_summary_list = [f"GENERIC_EDIT_APPLIED to {target_file}"]
+
+
+            # Basic validation of the script
+            try:
+                ast.parse(extracted_cst_script_str)
+                if self.verbose: print(f"LLMCore Info: Extracted CST script is valid Python syntax. Length: {len(extracted_cst_script_str)}")
+            except SyntaxError as e_syn:
+                print(f"LLMCore Error: Extracted CST script has syntax errors: {e_syn}")
+                if self.verbose: print(f"Problematic CST script:\n{extracted_cst_script_str}")
+                return None, None
+
+            print(f"LLMCore Info: Successfully generated scaffold. Script length: {len(extracted_cst_script_str)}, Summary items: {len(extracted_edit_summary_list)}")
+            return extracted_cst_script_str, extracted_edit_summary_list
+
+        except Exception as e_parse:
+            print(f"LLMCore Error: Failed to parse LLM output for scaffold: {e_parse}")
+            if self.verbose: print(f"LLM Raw Output for parsing failure:\n{raw_llm_output}")
+            return None, None
 
     def polish_patch(self, completed_patch_script: Optional[str], context_data: Dict[str, Any]) -> Optional[str]:
         """

@@ -317,6 +317,154 @@ def get_llm_code_fix_suggestion(model_path: str, original_code_script: str, erro
         print(f"LLM_Interfacer Error: Error during LLM code fix suggestion inference: {e}")
         return f"# Mock fix due to inference error for: {error_traceback[:100]}...\n# Original script length: {len(original_code_script)}\npass"
 
+
+def get_llm_cst_scaffold(
+    model_path: str,
+    prompt: str, # Specifically crafted prompt for scaffold generation
+    verbose: bool = False,
+    n_gpu_layers: int = -1,
+    n_ctx: int = 4096,
+    max_tokens_for_scaffold: int = 2048, # Max tokens for the entire scaffold output
+    temperature: float = 0.3,
+    stop: Optional[List[str]] = None # e.g. ["</s>"] or specific output terminators
+) -> Optional[str]: # Returns raw LLM string output (expected to be CST script + summary)
+    """
+    Generates a LibCST scaffold script and an edit summary using a GGUF model.
+    """
+    if Llama is None:
+        print("LLM_Interfacer Error: LlamaCPP not installed, cannot perform CST scaffold generation.")
+        return None # Or return a mock/placeholder string if that's more useful for callers
+
+    resolved_model_path_str = model_path
+    is_placeholder_path = False
+    # Use a general agent placeholder if a specific scaffold model isn't implied by the path
+    if not model_path or model_path.endswith((".placeholder_llm_agent.gguf", ".placeholder_deepseek.gguf")): # Check against common placeholders
+        resolved_model_path_str = "./models/placeholder_llm_agent.gguf"
+        is_placeholder_path = True
+        print(f"LLM_Interfacer Warning: Using default model path '{resolved_model_path_str}' for CST scaffold generation (original path: '{model_path}').")
+
+    resolved_model_path = Path(resolved_model_path_str)
+    if not resolved_model_path.is_file():
+        error_msg = f"LLM_Interfacer Error: Model file not found at '{resolved_model_path}' for CST scaffold generation."
+        if is_placeholder_path:
+            error_msg += f" (This was determined to be a placeholder path. Ensure '{resolved_model_path_str}' exists or provide a valid model path.)"
+        print(error_msg)
+        return None
+
+    try:
+        llm = Llama(
+            model_path=str(resolved_model_path),
+            n_gpu_layers=n_gpu_layers,
+            n_ctx=n_ctx,
+            verbose=verbose
+        )
+    except Exception as e_load:
+        print(f"LLM_Interfacer Error: Error loading GGUF model from '{resolved_model_path}' for CST scaffold generation: {e_load}")
+        return None
+
+    if verbose:
+        print(f"LLM_Interfacer: Generating CST scaffold with prompt (first 300 chars):\n{prompt[:300]}...")
+
+    try:
+        # Using create_completion for more direct control if chat format is not strictly needed by model
+        # For models fine-tuned on chat, create_chat_completion might be better.
+        # Assuming a model that can take direct instruction prompts.
+        response = llm.create_completion(
+            prompt=prompt,
+            max_tokens=max_tokens_for_scaffold,
+            temperature=temperature,
+            stop=stop if stop else [], # Ensure stop is a list
+            echo=False # Don't echo the prompt in the output
+        )
+
+        if response and response['choices'] and response['choices'][0]['text']:
+            scaffold_output = response['choices'][0]['text'].strip()
+            if verbose:
+                print(f"LLM_Interfacer: Raw scaffold output from LLM (first 300 chars):\n{scaffold_output[:300]}...")
+            return scaffold_output
+        else:
+            print("LLM_Interfacer Warning: LLM returned no content for CST scaffold generation.")
+            return None
+
+    except Exception as e_infer:
+        print(f"LLM_Interfacer Error: Error during LLM CST scaffold generation inference: {e_infer}")
+        return None
+
+
+def get_llm_code_infill(
+    model_path: str,
+    prompt: str, # Specifically crafted prompt for in-filling
+    verbose: bool = False,
+    n_gpu_layers: int = -1,
+    n_ctx: int = 4096,
+    max_tokens_for_infill: int = 512, # Max tokens for the code snippet to fill a hole
+    temperature: float = 0.4,
+    stop: Optional[List[str]] = None
+) -> Optional[str]: # Returns raw LLM string output for the infill
+    """
+    Fills in a code hole using a GGUF model based on the provided prompt.
+    """
+    if Llama is None:
+        print("LLM_Interfacer Error: LlamaCPP not installed, cannot perform code infill.")
+        return None
+
+    resolved_model_path_str = model_path
+    is_placeholder_path = False
+    # Default to a general agent model if not specified or clearly a placeholder
+    # The check model_path.endswith((".gguf", ".placeholder_llm_agent.gguf")) in the brief was a bit confusing.
+    # Correct logic: if model_path is sensible, use it. If it's empty or looks like a known placeholder, use the default infill placeholder.
+    if not model_path or model_path.endswith("placeholder_llm_agent.gguf") or model_path.endswith("placeholder_deepseek.gguf"):
+        resolved_model_path_str = "./models/placeholder_llm_agent.gguf" # Default model for general agent tasks including infill
+        is_placeholder_path = True
+        print(f"LLM_Interfacer Warning: Using default model path '{resolved_model_path_str}' for code infill (original path: '{model_path}').")
+
+    resolved_model_path = Path(resolved_model_path_str)
+    if not resolved_model_path.is_file():
+        error_msg = f"LLM_Interfacer Error: Model file not found at '{resolved_model_path}' for code infill."
+        if is_placeholder_path:
+            error_msg += f" (This was determined to be a placeholder. Ensure '{resolved_model_path_str}' exists or provide a valid model path.)"
+        print(error_msg)
+        return None
+
+    try:
+        llm = Llama(
+            model_path=str(resolved_model_path),
+            n_gpu_layers=n_gpu_layers,
+            n_ctx=n_ctx,
+            verbose=verbose
+        )
+    except Exception as e_load:
+        print(f"LLM_Interfacer Error: Error loading GGUF model from '{resolved_model_path}' for code infill: {e_load}")
+        return None
+
+    if verbose:
+        print(f"LLM_Interfacer: Performing code infill with prompt (first 300 chars):\n{prompt[:300]}...")
+
+    try:
+        # Using create_completion. For models specifically trained for infilling with FIM tokens (e.g., <PRE>, <SUF>, <MID>),
+        # the prompt and model parameters (like `infill=True`) would need adjustment.
+        # This implementation assumes a general instruction-following model.
+        response = llm.create_completion(
+            prompt=prompt,
+            max_tokens=max_tokens_for_infill,
+            temperature=temperature,
+            stop=stop if stop else [], # Ensure stop is a list
+            echo=False
+        )
+
+        if response and response['choices'] and response['choices'][0]['text']:
+            infilled_code = response['choices'][0]['text'].strip()
+            if verbose:
+                print(f"LLM_Interfacer: Raw infill output from LLM:\n{infilled_code}")
+            return infilled_code
+        else:
+            print("LLM_Interfacer Warning: LLM returned no content for code infill.")
+            return None # Explicitly return None for empty content
+
+    except Exception as e_infer:
+        print(f"LLM_Interfacer Error: Error during LLM code infill inference: {e_infer}")
+        return None
+
 # Main block for testing (commented out as per original structure)
 # if __name__ == '__main__':
 #     # Test get_deepseek_draft_fingerprint
@@ -399,3 +547,44 @@ def get_llm_code_fix_suggestion(model_path: str, original_code_script: str, erro
 #         verbose=False
 #     )
 #     print(f"\nSuggested Code Fix (from __main__):\n{suggested_fix_main}")
+
+#     # Test get_llm_score_for_text
+#     main_scorer_model_path = "./models/placeholder_scorer.gguf"
+#     print("\n--- Testing LLM Score for Text (from __main__) ---")
+#     mock_scorer_prompt = "Evaluate the quality of this code snippet on a scale of 0.0 to 1.0: def foo(): pass"
+#     score = get_llm_score_for_text(
+#         model_path=main_scorer_model_path,
+#         prompt=mock_scorer_prompt,
+#         verbose=True
+#     )
+#     if score is not None:
+#         print(f"LLM Score (from __main__): {score:.2f}")
+#     else:
+#         print("LLM Score (from __main__): Failed to get score.")
+
+#     # Test get_llm_cst_scaffold
+#     main_agent_model_path = "./models/placeholder_llm_agent.gguf" # Assume same model for scaffold and infill for now
+#     print("\n--- Testing LLM CST Scaffold Generation (from __main__) ---")
+#     mock_scaffold_prompt = "Generate a LibCST script to add a function 'my_new_test_func' with a placeholder body, and provide an edit summary."
+#     scaffold_output = get_llm_cst_scaffold(
+#         model_path=main_agent_model_path,
+#         prompt=mock_scaffold_prompt,
+#         verbose=True
+#     )
+#     if scaffold_output:
+#         print(f"LLM Scaffold Output (from __main__):\n{scaffold_output}")
+#     else:
+#         print("LLM Scaffold Generation (from __main__): Failed to get output.")
+
+#     # Test get_llm_code_infill
+#     print("\n--- Testing LLM Code Infill (from __main__) ---")
+#     mock_infill_prompt = "Complete the following Python code snippet inside the placeholder __HOLE_0__:\n```python\ndef my_function():\n    # Code before hole\n    __HOLE_0__\n    # Code after hole\n```"
+#     infill_output = get_llm_code_infill(
+#         model_path=main_agent_model_path, # Can use same model as scaffolding
+#         prompt=mock_infill_prompt,
+#         verbose=True
+#     )
+#     if infill_output:
+#         print(f"LLM Infill Output (from __main__):\n{infill_output}")
+#     else:
+#         print("LLM Code Infill (from __main__): Failed to get output.")

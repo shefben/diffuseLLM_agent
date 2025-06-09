@@ -16,8 +16,9 @@ from .spec_model import Spec
 from .phase_model import Phase
 from .refactor_grammar import BaseRefactorOperation, REFACTOR_OPERATION_INSTANCES
 from src.validator.validator import Validator
-from src.builder.commit_builder import CommitBuilder # New import
-from src.agent_group.exceptions import PhaseFailure # New import
+from src.builder.commit_builder import CommitBuilder
+from src.agent_group.exceptions import PhaseFailure
+from src.profiler.llm_interfacer import get_llm_score_for_text # New import
 
 # REFACTOR_OPERATION_CLASSES is not directly used by PhasePlanner logic, REFACTOR_OPERATION_INSTANCES is.
 
@@ -92,19 +93,18 @@ class PhasePlanner:
         if self.beam_width <= 0:
             raise ValueError("Beam width must be a positive integer.")
 
-        self.phi2_scorer = None
+        # Scorer configuration logging
         if self.scorer_model_config and self.scorer_model_config.get("enabled", True):
-            try:
-                model_name = self.scorer_model_config.get("model_name", "microsoft/phi-2")
-                device_setting = self.scorer_model_config.get("device", "cpu")
-                self.phi2_scorer = "mock_phi2_scorer_initialized"
-                print(f"Info: LLM scorer mock-initialized for planner. (Config: model='{model_name}', device='{device_setting}')")
-            except Exception as e:
-                print(f"Warning: Failed to initialize LLM scorer (mock setup): {e}. Falling back to random scoring.")
-                self.phi2_scorer = None
+            scorer_model_path = self.scorer_model_config.get("model_path")
+            if scorer_model_path and Path(scorer_model_path).is_file():
+                 print(f"PhasePlanner Info: Real LLM scorer configured with model: {scorer_model_path}.")
+                 # self.phi2_scorer attribute is no longer needed for primary logic
+            elif scorer_model_path: # Path provided but not found
+                 print(f"PhasePlanner Warning: Scorer GGUF model_path '{scorer_model_path}' not found. Scoring will use fallback logic within _score_candidate_plan_with_llm.")
+            else: # No path provided
+                 print("PhasePlanner Warning: LLM scorer enabled but no 'model_path' provided in scorer_model_config. Scoring will use placeholder/fallback logic within _score_candidate_plan_with_llm.")
         else:
-            print("Info: LLM scorer is disabled or no config provided for planner. Falling back to random scoring.")
-            self.phi2_scorer = None
+            print("PhasePlanner Info: LLM scorer is disabled in config or no scorer_model_config provided. Plan scoring will use random fallback.")
 
         # Import and Initialize CollaborativeAgentGroup
         from src.agent_group.collaborative_agent_group import CollaborativeAgentGroup
@@ -115,15 +115,39 @@ class PhasePlanner:
 
         # Import and Initialize CollaborativeAgentGroup
         from src.agent_group.collaborative_agent_group import CollaborativeAgentGroup
+        # Prepare a common config for LLM agents if specific settings are needed.
+        # For now, it will primarily carry the llm_model_path for both cores.
+        # Other parameters like n_gpu_layers, n_ctx, verbose can be added here if they
+        # should be controlled from PhasePlanner's initialization.
+        # DiffusionCore.expand_scaffold expects:
+        # "infill_model_path", "llm_model_path", "verbose", "n_gpu_layers", "n_ctx",
+        # "max_tokens_for_infill", "temperature", "stop_sequences_for_infill"
+        # LLMCore.propose_repair_diff also uses similar params from its config.
+
+        # Let's assume llm_model_path is the primary model for all agent tasks for now.
+        # Specific configs can override this if needed.
+        common_agent_llm_config = {
+            "llm_model_path": llm_model_path, # Path to the GGUF model for general agent tasks
+            "infill_model_path": llm_model_path, # Explicitly set for DiffusionCore, can be overridden by more specific config
+            "verbose": False, # Default verbosity for LLM operations
+            "n_gpu_layers": -1, # Default: all layers to GPU if possible
+            "n_ctx": 4096,      # Default context size
+            # Add other common parameters if they are available or make sense at PhasePlanner level
+            # "temperature": 0.4, # Example, might be too specific here
+            # "max_tokens_for_infill": 512, # Example
+        }
+        # If llm_core_config or diffusion_core_config are ever passed as actual dicts to PhasePlanner,
+        # they could be merged with common_agent_llm_config here.
+
         self.agent_group: 'CollaborativeAgentGroup' = CollaborativeAgentGroup(
             style_profile=self.style_fingerprint,
             naming_conventions_db_path=self.naming_conventions_db_path,
-            validator_instance=self.validator, # Pass validator instance
-            llm_core_config=None,
-            diffusion_core_config=None,
-            llm_model_path=llm_model_path
+            validator_instance=self.validator,
+            llm_core_config=common_agent_llm_config.copy(), # Pass a copy for LLMCore
+            diffusion_core_config=common_agent_llm_config.copy(), # Pass a copy for DiffusionCore
+            llm_model_path=llm_model_path # This is specifically for LLMCore's repair GGUF model path, distinct from general task model
         )
-        print("PhasePlanner: CollaborativeAgentGroup initialized.")
+        print(f"PhasePlanner: CollaborativeAgentGroup initialized with common_agent_llm_config: {common_agent_llm_config}")
 
         # Store actual validator handle and mock score style handle
         self.validator_handle: Callable[[Optional[str], str, 'RepositoryDigester', Path], Tuple[bool, Optional[str]]] = self.validator.validate_patch
@@ -147,104 +171,90 @@ class PhasePlanner:
         return hashlib.md5(spec_json_str.encode('utf-8')).hexdigest()
 
     def _get_graph_statistics(self) -> Dict[str, Any]:
-        graph_stats = {
-            "num_call_graph_nodes": 0,
-            "num_call_graph_edges": 0,
-            "cg_density": 0.0,
-            "num_cdg_nodes": 0,
-            "num_cdg_edges": 0,
-            "cdg_density": 0.0,
-            "num_ddg_nodes": 0,
-            "num_ddg_edges": 0,
-            "ddg_density": 0.0,
-        }
+        # Initialize stats with defaults
+        num_cg_nodes, num_cg_edges, cg_density = 0, 0, 0.0
+        num_cdg_nodes, num_cdg_edges, cdg_density = 0, 0, 0.0
+        num_ddg_nodes, num_ddg_edges, ddg_density = 0, 0, 0.0
 
         # Call Graph (CG) statistics
-        if hasattr(self.digester, 'project_call_graph') and self.digester.project_call_graph is not None:
-            cg_nodes = self.digester.project_call_graph
-            graph_stats["num_call_graph_nodes"] = len(cg_nodes)
-            graph_stats["num_call_graph_edges"] = sum(len(edges) for edges in cg_nodes.values())
-            if graph_stats["num_call_graph_nodes"] > 1:
-                v = graph_stats["num_call_graph_nodes"]
-                e = graph_stats["num_call_graph_edges"]
-                graph_stats["cg_density"] = e / (v * (v - 1))
-            else:
-                graph_stats["cg_density"] = 0.0
+        if hasattr(self.digester, 'project_call_graph') and self.digester.project_call_graph:
+            cg = self.digester.project_call_graph
+            num_cg_nodes = len(cg)
+            num_cg_edges = sum(len(edges) for edges in cg.values())
+            if num_cg_nodes > 1:
+                cg_density = num_cg_edges / (num_cg_nodes * (num_cg_nodes - 1))
 
         # Control Dependence Graph (CDG) statistics
-        if hasattr(self.digester, 'project_control_dependence_graph') and self.digester.project_control_dependence_graph is not None:
-            cdg_nodes = self.digester.project_control_dependence_graph
-            graph_stats["num_cdg_nodes"] = len(cdg_nodes)
-            graph_stats["num_cdg_edges"] = sum(len(edges) for edges in cdg_nodes.values()) # Assuming similar structure to CG
-            if graph_stats["num_cdg_nodes"] > 1:
-                v = graph_stats["num_cdg_nodes"]
-                e = graph_stats["num_cdg_edges"]
-                graph_stats["cdg_density"] = e / (v * (v - 1))
-            else:
-                graph_stats["cdg_density"] = 0.0
+        if hasattr(self.digester, 'project_control_dependence_graph') and self.digester.project_control_dependence_graph:
+            cdg = self.digester.project_control_dependence_graph
+            num_cdg_nodes = len(cdg)
+            # Assuming CDG values are lists/sets of dependent nodes (edges)
+            num_cdg_edges = sum(len(dependents) for dependents in cdg.values())
+            if num_cdg_nodes > 1:
+                cdg_density = num_cdg_edges / (num_cdg_nodes * (num_cdg_nodes - 1))
 
         # Data Dependence Graph (DDG) statistics
-        if hasattr(self.digester, 'project_data_dependence_graph') and self.digester.project_data_dependence_graph is not None:
-            ddg_nodes = self.digester.project_data_dependence_graph
-            graph_stats["num_ddg_nodes"] = len(ddg_nodes)
-            graph_stats["num_ddg_edges"] = sum(len(edges) for edges in ddg_nodes.values()) # Assuming similar structure to CG
-            if graph_stats["num_ddg_nodes"] > 1:
-                v = graph_stats["num_ddg_nodes"]
-                e = graph_stats["num_ddg_edges"]
-                graph_stats["ddg_density"] = e / (v * (v - 1))
-            else:
-                graph_stats["ddg_density"] = 0.0
+        if hasattr(self.digester, 'project_data_dependence_graph') and self.digester.project_data_dependence_graph:
+            ddg = self.digester.project_data_dependence_graph
+            num_ddg_nodes = len(ddg)
+            # Assuming DDG values are lists/sets of dependent nodes (edges)
+            num_ddg_edges = sum(len(dependents) for dependents in ddg.values())
+            if num_ddg_nodes > 1:
+                ddg_density = num_ddg_edges / (num_ddg_nodes * (num_ddg_nodes - 1))
 
-        # Ensure all keys are present even if graphs are missing
-        final_stats = {
-            "num_call_graph_nodes": graph_stats.get("num_call_graph_nodes", 0),
-            "num_call_graph_edges": graph_stats.get("num_call_graph_edges", 0),
-            "cg_density": graph_stats.get("cg_density", 0.0),
-            "num_cdg_nodes": graph_stats.get("num_cdg_nodes", 0),
-            "num_cdg_edges": graph_stats.get("num_cdg_edges", 0),
-            "cdg_density": graph_stats.get("cdg_density", 0.0),
-            "num_ddg_nodes": graph_stats.get("num_ddg_nodes", 0),
-            "num_ddg_edges": graph_stats.get("num_ddg_edges", 0),
-            "ddg_density": graph_stats.get("ddg_density", 0.0),
+        graph_stats = {
+            "num_call_graph_nodes": num_cg_nodes,
+            "num_call_graph_edges": num_cg_edges,
+            "cg_density": cg_density,
+            "num_cdg_nodes": num_cdg_nodes,
+            "num_cdg_edges": num_cdg_edges,
+            "cdg_density": cdg_density,
+            "num_ddg_nodes": num_ddg_nodes,
+            "num_ddg_edges": num_ddg_edges,
+            "ddg_density": ddg_density,
         }
 
-        print(f"PhasePlanner: Generated graph stats for scorer: {final_stats}")
-        return final_stats
+        print(f"PhasePlanner: Generated graph stats for scorer: {graph_stats}")
+        return graph_stats
 
-    def _score_candidate_plan_with_llm(self, candidate_plan: List['Phase'], graph_stats: Dict[str, Any]) -> float:
-        if not self.phi2_scorer or self.phi2_scorer != "mock_phi2_scorer_initialized":
+    def _score_candidate_plan_with_llm(self, candidate_plan: List[Phase], graph_stats: Dict[str, Any]) -> float:
+        # Check if LLM scoring is enabled and configured
+        if not self.scorer_model_config or not self.scorer_model_config.get("enabled", True):
+            print("PhasePlanner Info: Real LLM scorer is disabled in config. Falling back to random scoring.")
+            return random.uniform(0.2, 0.8)
+
+        scorer_model_path = self.scorer_model_config.get("model_path")
+        # Default to a placeholder if path not provided, get_llm_score_for_text will handle actual existence check.
+        if not scorer_model_path:
+             scorer_model_path = "./models/placeholder_scorer.gguf"
+             print(f"PhasePlanner Warning: No 'model_path' in scorer_model_config. Defaulting to placeholder '{scorer_model_path}' for get_llm_score_for_text.")
+
+        # Check if the placeholder path actually exists if it's the one being used.
+        # get_llm_score_for_text also does this, but an early check here can provide clearer context for fallback.
+        if scorer_model_path == "./models/placeholder_scorer.gguf" and not Path(scorer_model_path).is_file():
+            print(f"PhasePlanner Warning: Default scorer model placeholder '{scorer_model_path}' not found. Falling back to random scoring.")
             return random.uniform(0.2, 0.8)
 
         if not candidate_plan:
-            return 0.05
+            return 0.05 # Return a low score for an empty plan
 
+        # Prepare prompt components (similar to existing logic)
         plan_str_parts = []
         for i, phase in enumerate(candidate_plan):
-            try:
-                params_json = json.dumps(phase.parameters)
-            except TypeError:
-                params_json = str(phase.parameters)
-
+            try: params_json = json.dumps(phase.parameters)
+            except TypeError: params_json = str(phase.parameters)
             plan_str_parts.append(
-                f"Phase {i + 1} (Operation: {phase.operation_name}):
-"
-                f"  Target File: {phase.target_file or 'N/A'}
-"
-                f"  Parameters: {params_json}
-"
+                f"Phase {i + 1} (Operation: {phase.operation_name}):\n"
+                f"  Target File: {phase.target_file or 'N/A'}\n"
+                f"  Parameters: {params_json}\n"
                 f"  Description: {phase.description}"
             )
         plan_formatted_str = "\n\n".join(plan_str_parts)
 
-        try:
-            style_fp_str = json.dumps(self.style_fingerprint, indent=2)
-        except TypeError:
-            style_fp_str = str(self.style_fingerprint)
-
-        try:
-            graph_stats_str = json.dumps(graph_stats, indent=2)
-        except TypeError:
-            graph_stats_str = str(graph_stats)
+        try: style_fp_str = json.dumps(self.style_fingerprint, indent=2)
+        except TypeError: style_fp_str = str(self.style_fingerprint)
+        try: graph_stats_str = json.dumps(graph_stats, indent=2)
+        except TypeError: graph_stats_str = str(graph_stats)
 
         prompt = f"""You are an expert software engineering assistant. Your task is to evaluate a proposed refactoring plan for a Python codebase.
 A higher score indicates a better plan. Consider the plan's clarity, correctness, potential risks, efficiency, and how well it seems to adhere to common best practices and the described project style.
@@ -265,49 +275,37 @@ Candidate Refactoring Plan (Total phases: {len(candidate_plan)}):
 ---
 
 Based on all the above information, score this plan on a continuous scale from 0.0 (very bad) to 1.0 (excellent).
-Output only the numerical score as a float (e.g., 0.75).
+Output ONLY the numerical score as a float (e.g., 0.75).
 Score:"""
 
-        mock_llm_response_text = ""
-        try:
-            score_value = 0.5
-            score_value += len(candidate_plan) * 0.03
-            if candidate_plan: # Check if plan is not empty
-                 score_value -= candidate_plan[0].operation_name.count('error') * 0.1
+        # Get LLM parameters from config, with defaults
+        llm_verbose = self.scorer_model_config.get("verbose", False)
+        llm_n_gpu_layers = self.scorer_model_config.get("n_gpu_layers", -1)
+        llm_n_ctx = self.scorer_model_config.get("n_ctx", 2048) # Default from get_llm_score_for_text
+        llm_temperature = self.scorer_model_config.get("temperature", 0.1) # Default from get_llm_score_for_text
+        max_tokens_score = self.scorer_model_config.get("max_tokens_for_score", 16)
 
-            if any("extract_method" in p.operation_name for p in candidate_plan):
-                score_value += 0.05
-            if len(candidate_plan) > 7:
-                score_value -= (len(candidate_plan) - 7) * 0.02
+        # Call the new LLM interfacer function
+        llm_score = get_llm_score_for_text(
+            model_path=scorer_model_path,
+            prompt=prompt,
+            verbose=llm_verbose,
+            n_gpu_layers=llm_n_gpu_layers,
+            n_ctx=llm_n_ctx,
+            max_tokens_for_score=max_tokens_score,
+            temperature=llm_temperature
+        )
 
-            score_value += random.uniform(-0.02, 0.02)
-            final_mock_score = max(0.0, min(1.0, score_value))
-            mock_llm_response_text = f"{final_mock_score:.2f}"
-        except Exception as e:
-            print(f"Error during Mock LLM scoring simulation: {e}. Falling back to random score.")
-            return random.uniform(0.1, 0.5)
-
-        try:
-            match = re.search(r"(0?\.\d+|1\.0|1)", mock_llm_response_text) # Corrected regex
-            parsed_score = -1.0
-            if match:
-                parsed_score = float(match.group(1))
-            else:
-                general_match = re.search(r"[-+]?\d*\.\d+", mock_llm_response_text)
-                if general_match:
-                    parsed_score = float(general_match.group(0))
-
-            if 0.0 <= parsed_score <= 1.0:
-                return parsed_score
-            else:
-                print(f"Warning: LLM mock score {parsed_score} out of range [0.0, 1.0] from '{mock_llm_response_text}'. Using default.")
-                return 0.1
-        except ValueError:
-            print(f"Warning: ValueError parsing score from LLM mock response: '{mock_llm_response_text}'. Using default.")
-            return 0.1
-        except Exception as e:
-            print(f"Warning: Unexpected error parsing score: {e}. Raw: '{mock_llm_response_text}'. Using default.")
-            return 0.1
+        if llm_score is not None:
+            # Optional: Validate or clamp score to expected range [0.0, 1.0]
+            if not (0.0 <= llm_score <= 1.0):
+                print(f"PhasePlanner Warning: LLM score {llm_score:.4f} is outside the expected [0.0, 1.0] range. Clamping.")
+                llm_score = max(0.0, min(1.0, llm_score))
+            print(f"PhasePlanner: LLM Scorer returned score: {llm_score:.4f}")
+            return llm_score
+        else:
+            print("PhasePlanner Warning: Failed to get score from LLM via get_llm_score_for_text. Falling back to default low score for this candidate.")
+            return 0.1 # Default low score on failure
 
     def _beam_search_for_plan(self, spec: Spec, graph_stats: Dict[str, Any]) -> List[Phase]:
         # Initial beam: list of (plan_phases, score)
