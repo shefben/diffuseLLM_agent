@@ -1,205 +1,277 @@
 # src/spec_normalizer/spec_fusion.py
-from typing import TYPE_CHECKING, Optional, Union, List, Dict, Any # Added Union, List, Dict, Any
+from typing import TYPE_CHECKING, Optional, List, Dict, Any
 from pathlib import Path
 
-# Assuming Spec is defined in src.specs.schemas
-# from ..specs.schemas import Spec
-# Assuming normalise_request is in t5_client
-# from .t5_client import normalise_request
-# Assuming SymbolRetriever is in symbol_retriever
-# from ..retriever.symbol_retriever import SymbolRetriever
+try:
+    import yaml
+except ImportError:
+    yaml = None # type: ignore
+    print("Warning: PyYAML not installed. SpecFusion's YAML parsing will be disabled.")
+
+try:
+    from pydantic import ValidationError
+except ImportError:
+    ValidationError = None # type: ignore
+    print("Warning: Pydantic not installed. SpecFusion's model validation will be disabled.")
+
+# Imports for actual classes
+from src.planner.spec_model import Spec # Assuming this is the correct path
+from .t5_client import T5Client
 
 if TYPE_CHECKING:
-    from src.digester.repository_digester import RepositoryDigester
-    from src.specs.schemas import Spec
-    from src.retriever.symbol_retriever import SymbolRetriever
-
-
-# For subtask execution, define placeholders if real imports fail
-try:
-    from src.specs.schemas import Spec
-except ImportError:
-    print("Warning: src.specs.schemas.Spec not found. Using placeholder Spec model.")
-    from pydantic import BaseModel, Field
-    class Spec(BaseModel):
-        task: str = Field(..., description="Free-text summary.")
-        target_symbols: List[str] = Field(default_factory=list)
-        operations: List[str] = Field(default_factory=list)
-        acceptance: List[str] = Field(default_factory=list)
-        raw_output: Optional[str] = None
-        raw_yaml: Optional[str] = None
-        parsed_dict: Optional[Dict[str, Any]] = None
-        class Config: # Pydantic V2 way for extra fields
-            extra = 'allow'
-
-
-try:
-    from .t5_client import normalise_request
-except ImportError:
-    print("Warning: normalise_request from .t5_client not found for SpecFusion. Using placeholder.")
-    def normalise_request(raw_request_text: str, symbol_bag_string: str, model_path: str, **kwargs) -> Spec:
-        return Spec(task=f"Placeholder normalise_request for: {raw_request_text[:50]}...",
-                    target_symbols=[s.strip() for s in symbol_bag_string.split("|") if s.strip()][:2])
-
-try:
-    from src.retriever.symbol_retriever import SymbolRetriever
-except ImportError:
-    print("Warning: SymbolRetriever from src.retriever.symbol_retriever not found for SpecFusion. Using placeholder.")
-    class SymbolRetriever: # type: ignore
-        def __init__(self, digester: Any): self.digester = digester # Use Any for digester type
-        def retrieve_symbol_bag(self, raw_request: str, top_k: int = 50, similarity_threshold: float = 0.25) -> str:
-            return "placeholder.symbol1|placeholder.symbol2"
-# End Placeholders
+    from src.retriever.symbol_retriever import SymbolRetriever # For type hinting
+else: # Runtime: try to import, or define a placeholder if it fails, for __main__ or basic runs
+    try:
+        from src.retriever.symbol_retriever import SymbolRetriever
+    except ImportError:
+        print("Warning: src.retriever.symbol_retriever.SymbolRetriever not found. Using placeholder for SpecFusion.")
+        class SymbolRetriever: # type: ignore
+            def __init__(self, digester: Any): self.digester = digester
+            def get_all_fqns(self) -> List[str]: return ["placeholder.symbol1", "placeholder.symbol2"]
 
 
 class SpecFusion:
     def __init__(
         self,
-        t5_model_path: Union[str, Path],
-        digester: 'RepositoryDigester',
-        retriever_top_k: int = 50,
-        retriever_sim_threshold: float = 0.25
+        t5_client: T5Client,
+        symbol_retriever: 'SymbolRetriever',
+        verbose: bool = False
     ):
         """
         Initializes the SpecFusion component.
+        Args:
+            t5_client: An instance of T5Client.
+            symbol_retriever: An instance of SymbolRetriever.
+            verbose: If True, enables detailed logging.
         """
-        self.t5_model_path = str(t5_model_path)
-        self.digester = digester
+        self.t5_client = t5_client
+        self.symbol_retriever = symbol_retriever
+        self.verbose = verbose
+        if self.verbose:
+            print(f"SpecFusion initialized. T5Client ready: {self.t5_client.is_ready}, SymbolRetriever type: {type(self.symbol_retriever)}")
 
-        if 'SymbolRetriever' in globals() and callable(SymbolRetriever) and SymbolRetriever.__module__ != __name__ : # Check it's not the placeholder
-            try:
-                self.symbol_retriever: Optional[SymbolRetriever] = SymbolRetriever(self.digester)
-            except Exception as e: # Catch errors if real SymbolRetriever init fails (e.g. missing np)
-                print(f"Warning: Failed to initialize real SymbolRetriever: {e}. SpecFusion may be impaired.")
-                self.symbol_retriever = None
-        else:
-            self.symbol_retriever = SymbolRetriever(self.digester) # type: ignore # Use placeholder if real one failed/not imported
-            print("Warning: SpecFusion initialized with a placeholder or fallback SymbolRetriever.")
-
-        self.retriever_top_k = retriever_top_k
-        self.retriever_sim_threshold = retriever_sim_threshold
-
-    def generate_spec_from_request(
-        self,
-        raw_request: str,
-        t5_device: Optional[str] = None,
-        t5_max_input_length: int = 1024,
-        t5_max_output_length: int = 512
-    ) -> 'Spec':
+    def normalise_request(self, raw_issue_text: str) -> Optional[Spec]:
         """
-        Generates a structured Spec from a raw text request.
+        Normalizes a raw issue text string into a structured Spec object.
+        This involves retrieving context symbols, calling a T5 model to generate
+        a YAML spec, parsing the YAML, and validating it into a Spec model.
         """
-        print(f"SpecFusion: Generating spec for request: '{raw_request[:100]}...'")
+        if yaml is None:
+            print("SpecFusion Error: PyYAML is not installed. Cannot parse YAML spec. Please install PyYAML.")
+            return None
+        if ValidationError is None and Spec is None : # Check if Pydantic related imports failed
+             print("SpecFusion Error: Pydantic or Spec model not available. Cannot validate spec. Please ensure Pydantic is installed and Spec model is correctly defined.")
+             return None
 
-        symbol_bag_str = ""
+
+        if self.verbose:
+            print(f"\nSpecFusion: Normalizing request: '{raw_issue_text[:100]}...'")
+
+        # 1. Retrieve Context Symbols
+        context_symbols_list: Optional[List[str]] = None
+        context_symbols_string: Optional[str] = "No context symbols retrieved." # Default message
+
         if self.symbol_retriever:
             try:
-                print("SpecFusion: Retrieving symbol bag...")
-                symbol_bag_str = self.symbol_retriever.retrieve_symbol_bag(
-                    raw_request,
-                    top_k=self.retriever_top_k,
-                    similarity_threshold=self.retriever_sim_threshold
-                )
+                if self.verbose: print("SpecFusion: Retrieving context symbols for spec fusion...")
+                # Call the new method, assuming a default max_symbols or make it configurable if needed.
+                context_symbols_list = self.symbol_retriever.get_context_symbols_for_spec_fusion()
+
+                if context_symbols_list:
+                    context_symbols_string = ", ".join(context_symbols_list)
+                    if self.verbose:
+                        print(f"SpecFusion: Retrieved {len(context_symbols_list)} context symbols. Preview (first 200 chars): '{context_symbols_string[:200]}...'")
+                elif self.verbose:
+                    print("SpecFusion: SymbolRetriever returned no context symbols.")
             except Exception as e_retrieval:
-                print(f"SpecFusion: Error during symbol retrieval: {e_retrieval}. Proceeding without symbol bag.")
-        else:
-            print("SpecFusion: SymbolRetriever not available. Proceeding without symbol bag.")
+                print(f"SpecFusion Warning: Error during symbol retrieval: {e_retrieval}. Proceeding with limited/no symbol context.")
+                context_symbols_string = f"Error retrieving symbols: {str(e_retrieval)[:100]}" # Short error summary
+        elif self.verbose:
+            print("SpecFusion: SymbolRetriever not available. Proceeding without symbol context.")
 
-        if 'normalise_request' not in globals() or not callable(normalise_request) or \
-           (hasattr(normalise_request, '__module__') and normalise_request.__module__ == __name__ and "Placeholder normalise_request" in normalise_request("","","").task) :
-             print("Error: Real normalise_request function is not available in SpecFusion. Cannot generate spec.")
-             return Spec(task=f"Error: T5 client (normalise_request) unavailable.")
+        # 2. Call T5Client
+        if self.verbose: print("SpecFusion: Requesting YAML spec from T5Client...")
+        yaml_spec_str = self.t5_client.request_spec_from_text(raw_issue_text, context_symbols_string)
 
+        if yaml_spec_str is None:
+            print("SpecFusion Error: T5Client failed to generate YAML spec string (returned None).")
+            return None
 
-        print("SpecFusion: Normalizing request with T5 client...")
-        spec_object = normalise_request(
-            raw_request_text=raw_request,
-            symbol_bag_string=symbol_bag_str,
-            model_path=self.t5_model_path,
-            device=t5_device,
-            max_input_length=t5_max_input_length,
-            max_output_length=t5_max_output_length
-        )
+        if self.verbose:
+            print(f"SpecFusion: Received YAML spec string from T5Client (length: {len(yaml_spec_str)}):\n{yaml_spec_str[:500]}...")
 
-        print("SpecFusion: Spec generation complete.")
-        return spec_object
+        # 3. Parse YAML String
+        parsed_dict: Optional[Dict[str, Any]] = None
+        try:
+            if self.verbose: print("SpecFusion: Parsing YAML spec string...")
+            parsed_dict = yaml.safe_load(yaml_spec_str)
+        except yaml.YAMLError as e:
+            print(f"SpecFusion Error: Failed to parse YAML spec from T5. Error: {e}")
+            if self.verbose: print(f"Problematic YAML string:\n{yaml_spec_str}")
+            return None
+
+        if not isinstance(parsed_dict, dict):
+            print(f"SpecFusion Error: Parsed YAML is not a dictionary, but type {type(parsed_dict)}. Content: {str(parsed_dict)[:200]}")
+            return None
+
+        if self.verbose: print(f"SpecFusion: Successfully parsed YAML to dictionary: {list(parsed_dict.keys())}")
+
+        # 4. Validate and Instantiate Spec Model
+        spec_object: Optional[Spec] = None
+        try:
+            if self.verbose: print("SpecFusion: Validating dictionary and instantiating Spec model...")
+            # Add raw inputs to the dict before Spec instantiation if desired
+            parsed_dict["raw_issue_text"] = raw_issue_text
+            parsed_dict["raw_yaml_spec"] = yaml_spec_str
+
+            spec_object = Spec(**parsed_dict)
+            if self.verbose: print("SpecFusion: Successfully normalized request to Spec object.")
+            return spec_object
+        except ValidationError as e_pydantic: # If Pydantic's ValidationError was imported
+            print(f"SpecFusion Error: Failed to validate Spec model from parsed YAML. Errors:\n{e_pydantic}")
+            return None
+        except TypeError as e_type: # Catch potential TypeError if Spec(**parsed_dict) fails for other reasons
+            print(f"SpecFusion Error: TypeError during Spec model instantiation. This might be due to unexpected fields or structure. Error: {e_type}")
+            print(f"Parsed dictionary was: {parsed_dict}")
+            return None
+
 
 if __name__ == '__main__':
     from unittest.mock import MagicMock
+    # Ensure RepositoryDigester is available for the mock setup, even if just a placeholder
+    try:
+        from src.digester.repository_digester import RepositoryDigester
+    except ImportError:
+        print("Warning (__main__): src.digester.repository_digester.RepositoryDigester not found. Using placeholder.")
+        class RepositoryDigester: # type: ignore
+             def __init__(self, repo_path: Any): self.repo_path = repo_path; self.faiss_id_to_metadata = []
 
-    print("--- SpecFusion Example Usage (Conceptual) ---")
+    print("--- SpecFusion __main__ Example ---")
 
-    class MockRepositoryDigesterForFusion: # Simplified mock
+    # Mock T5Client
+    class MockT5Client:
+        def __init__(self, model_path_or_name: str, verbose: bool = False):
+            self.model_path_or_name = model_path_or_name
+            self.verbose = verbose
+            self.is_ready = True # Assume ready for mock
+            print(f"MockT5Client initialized with model: {model_path_or_name}, verbose: {verbose}")
+
+        def request_spec_from_text(self, raw_issue_text: str, context_symbols_string: Optional[str] = None) -> Optional[str]:
+            if self.verbose: print(f"MockT5Client.request_spec_from_text called. Issue: '{raw_issue_text[:50]}...', Symbols: '{str(context_symbols_string)[:50]}...'")
+            # Simulate YAML output based on input
+            if "add function" in raw_issue_text:
+                return """
+issue_description: "Add a new function `calculate_total` to `billing.py`"
+target_files:
+  - "src/billing.py"
+operations:
+  - name: "add_function"
+    target_file: "src/billing.py"
+    function_name: "calculate_total"
+    parameters: {"items": "List[Item]", "discount": "Optional[float]"}
+    return_type: "float"
+    docstring: "Calculates the total price after applying an optional discount."
+    body_scaffold: "total = sum(item.price for item in items)\nif discount:\n  total *= (1 - discount)\nreturn total"
+acceptance_tests:
+  - "Test with items and no discount."
+  - "Test with items and a discount."
+  - "Test with empty items list."
+"""
+            else:
+                return f"issue_description: '{raw_issue_text}'\ntarget_files: ['unknown.py']\noperations: []\nacceptance_tests: ['basic_test']"
+
+    # Mock SymbolRetriever (if the real one isn't available or for isolated testing)
+    # If real SymbolRetriever was imported successfully, SymbolRetrieverToUse will be it.
+    # Otherwise, MockSymbolRetrieverForFusionMain will be used.
+    # This setup allows testing with the real SymbolRetriever if available and properly configured,
+    # or falls back to a local mock for this __main__ block.
+
+    # Try to use the real SymbolRetriever first
+    try:
+        from src.retriever.symbol_retriever import SymbolRetriever as RealSymbolRetriever
+        # Check if the imported one is not the placeholder already defined at file level for TYPE_CHECKING
+        if RealSymbolRetriever.__module__ == "src.retriever.symbol_retriever":
+            SymbolRetrieverToUseInMain = RealSymbolRetriever
+            print("Info (__main__): Using real SymbolRetriever.")
+        else: # Fallback if import was tricky (e.g. relative import issues in __main__)
+            raise ImportError("Imported SymbolRetriever is not the expected one.")
+    except ImportError:
+        print("Warning (__main__): Real SymbolRetriever not found or import issue. Using local MockSymbolRetrieverForFusionMain.")
+        class MockSymbolRetrieverForFusionMain:
+            def __init__(self, digester: Any, verbose: bool = False):
+                self.verbose = verbose
+                print(f"MockSymbolRetrieverForFusionMain initialized, verbose: {verbose}")
+            def get_context_symbols_for_spec_fusion(self, max_symbols: Optional[int] = 500) -> List[str]:
+                if self.verbose: print(f"MockSymbolRetrieverForFusionMain.get_context_symbols_for_spec_fusion called, max_symbols={max_symbols}")
+                symbols = ["example.utils.helper_a", "example.services.main_service.process_data", "another.mock.symbol"]
+                return symbols[:max_symbols] if max_symbols is not None else symbols
+        SymbolRetrieverToUseInMain = MockSymbolRetrieverForFusionMain # type: ignore
+
+    # Setup
+    # Use a more complete MockDigester for SymbolRetriever, or the real one if testing integration
+    class MockDigesterForFusionMain:
         def __init__(self, repo_path):
-            self.repo_path = repo_path
-            print(f"MockDigesterForFusion initialized for {repo_path}")
-            self.embedding_model = MagicMock()
-            self.faiss_index = MagicMock(ntotal=10)
-            self.faiss_id_to_metadata = []
-            global np # Ensure np is available for retriever if it uses it
-            if 'np' not in globals() or globals()['np'] is None:
-                try: import numpy as np # type: ignore
-                except ImportError: globals()['np'] = None
-            self.np_module = np
+            self.repo_path = Path(repo_path)
+            self.faiss_id_to_metadata = [ # Populate with some data for get_context_symbols_for_spec_fusion
+                {"fqn": "example.utils.helper_a", "item_type": "function_code"},
+                {"fqn": "example.services.main_service.process_data", "item_type": "method_code"},
+                {"fqn": "example.models.User", "item_type": "class_code"},
+                {"fqn": "example.module_overview", "item_type": "docstring_for_module"},
+                {"fqn": "example.constants.MAX_USERS", "item_type": "global_variable"}, # This might be filtered out by SymbolRetriever
+            ]
+            self.embedding_model = MagicMock() # SymbolRetriever __init__ checks this
+            self.faiss_index = MagicMock()     # And this
+            self.np_module = MagicMock()       # And this (if np is None globally in retriever)
+            print(f"MockDigesterForFusionMain initialized for {repo_path}")
+
+    mock_digester = MockDigesterForFusionMain("dummy_repo_for_specfusion_main")
+
+    mock_t5_client = MockT5Client(model_path_or_name="./models/placeholder_t5_spec_normalizer/", verbose=True)
+
+    try:
+        # If SymbolRetrieverToUseInMain is the real one, it needs a valid digester.
+        # Our MockDigesterForFusionMain is basic; real SymbolRetriever init might require more.
+        mock_symbol_retriever = SymbolRetrieverToUseInMain(digester=mock_digester, verbose=True) # type: ignore
+    except Exception as e_sr_init:
+        print(f"Error initializing SymbolRetrieverToUseInMain: {e_sr_init}. Falling back to basic mock for __main__.")
+        # Fallback to an even simpler mock if the chosen one fails with MockDigester
+        class BasicMockSymbolRetriever:
+            def __init__(self, digester:Any, verbose:bool=False): pass
+            def get_context_symbols_for_spec_fusion(self, max_symbols: Optional[int] = 500) -> List[str]:
+                return ["fallback.symbol1", "fallback.symbol2"][:max_symbols] if max_symbols is not None else []
+        mock_symbol_retriever = BasicMockSymbolRetriever(digester=mock_digester, verbose=True)
 
 
-    # Store original (potentially placeholder) versions
-    _original_symbol_retriever_class_for_main = SymbolRetriever
-    _original_normalise_request_func_for_main = normalise_request
+    spec_fuser = SpecFusion(
+        t5_client=mock_t5_client,
+        symbol_retriever=mock_symbol_retriever,
+        verbose=True
+    )
 
-    # Define mocks for the example
-    class MockSymbolRetrieverForMainExample:
-        def __init__(self, digester): pass
-        def retrieve_symbol_bag(self, raw_request: str, top_k: int, similarity_threshold: float) -> str:
-            print(f"MockSymbolRetrieverForMainExample: Called for '{raw_request[:30]}...', k={top_k}, thresh={similarity_threshold}")
-            if "cache" in raw_request: return "UserService.get_data|utils.caching.cache"
-            return "some.default.symbol"
+    test_issue_1 = "User wants to add function `calculate_total` in `billing.py` with items and discount."
+    print(f"\n--- Test Case 1: {test_issue_1} ---")
+    spec_obj_1 = spec_fuser.normalise_request(test_issue_1)
 
-    def mock_normalise_request_for_main_example(raw_request_text, symbol_bag_string, model_path, **kwargs) -> Spec:
-        print(f"MockNormaliseRequestForMainExample: Called with request='{raw_request_text[:30]}...', bag='{symbol_bag_string}'")
-        return Spec(
-            task=f"Mock task for: {raw_request_text}",
-            target_symbols=symbol_bag_string.split("|") if symbol_bag_string else [],
-            operations=["mock_operation"],
-            acceptance=["mock_test_passes"]
-        )
-
-    # Temporarily replace with mocks for the __main__ block
-    SymbolRetriever = MockSymbolRetrieverForMainExample # type: ignore
-    normalise_request = mock_normalise_request_for_main_example
-
-    if 'MockRepositoryDigesterForFusion' in globals() and 'Spec' in globals():
-        try:
-            dummy_digester = MockRepositoryDigesterForFusion("dummy_repo_for_specfusion")
-
-            spec_fuser = SpecFusion(
-                t5_model_path="path/to/dummy/t5_model",
-                digester=dummy_digester # type: ignore
-            )
-
-            request1 = "add caching to user service"
-            spec1 = spec_fuser.generate_spec_from_request(request1)
-            print("\nSpec for request 1:")
-            if spec1 and hasattr(spec1, 'model_dump_json'):
-                print(spec1.model_dump_json(indent=2))
-            else:
-                print(str(spec1))
-
-
-            request2 = "fix bug in payment processing"
-            spec2 = spec_fuser.generate_spec_from_request(request2)
-            print("\nSpec for request 2:")
-            if spec2 and hasattr(spec2, 'model_dump_json'):
-                print(spec2.model_dump_json(indent=2))
-            else:
-                print(str(spec2))
-
-        except Exception as e:
-            print(f"Error in SpecFusion __main__ example: {e}")
-        finally:
-            # Restore original (potentially placeholder) versions
-            SymbolRetriever = _original_symbol_retriever_class_for_main
-            normalise_request = _original_normalise_request_func_for_main
+    if spec_obj_1:
+        print("\nSuccessfully generated Spec object 1:")
+        # Assuming Spec has a .model_dump_json() method (Pydantic V2) or similar
+        if hasattr(spec_obj_1, 'model_dump_json'):
+            print(spec_obj_1.model_dump_json(indent=2))
+        else: # Fallback for Pydantic V1 or non-Pydantic
+            print(spec_obj_1)
     else:
-        print("Skipping SpecFusion __main__ example due to missing core component definitions.")
-    print("\n--- SpecFusion Example Done ---")
+        print("\nFailed to generate Spec object 1.")
+
+    test_issue_2 = "A generic bug fix is needed."
+    print(f"\n--- Test Case 2: {test_issue_2} ---")
+    spec_obj_2 = spec_fuser.normalise_request(test_issue_2)
+    if spec_obj_2:
+        print("\nSuccessfully generated Spec object 2:")
+        if hasattr(spec_obj_2, 'model_dump_json'):
+            print(spec_obj_2.model_dump_json(indent=2))
+        else:
+            print(spec_obj_2)
+    else:
+        print("\nFailed to generate Spec object 2.")
+
+    print("\n--- SpecFusion __main__ Example Done ---")

@@ -6,7 +6,7 @@ if TYPE_CHECKING:
     from src.digester.repository_digester import RepositoryDigester # To avoid circular import if used only for type hint
 
 class SymbolRetriever:
-    def __init__(self, digester: 'RepositoryDigester'):
+    def __init__(self, digester: 'RepositoryDigester', verbose: bool = False):
         """
         Initializes the SymbolRetriever with a RepositoryDigester instance.
 
@@ -14,27 +14,29 @@ class SymbolRetriever:
             digester: An instance of RepositoryDigester that has already processed
                       a repository and contains the embedding model, FAISS index,
                       and metadata.
+            verbose: If True, enables detailed logging.
         """
-        if digester.embedding_model is None:
-            raise ValueError("RepositoryDigester's embedding_model is not initialized.")
+        if digester.embedding_model is None: # Check this first as it's a primary dependency for retrieval
+            print("SymbolRetriever Warning: RepositoryDigester's embedding_model is not initialized. Retrieval will be limited.")
+            # Depending on strictness, could raise ValueError here. For now, allow init but retrieval will be impaired.
+
+        # FAISS index is also crucial for embedding-based retrieval
         if digester.faiss_index is None:
-            raise ValueError("RepositoryDigester's faiss_index is not initialized.")
+            print("SymbolRetriever Warning: RepositoryDigester's faiss_index is not initialized. Embedding-based retrieval will be impaired.")
 
-        # Check for numpy availability (np is imported globally in repository_digester)
-        # This check ensures that if repository_digester.np is None, we raise an error.
-        if not hasattr(digester, 'np') or digester.np is None:
-             # Or, more directly, check the global np imported in this file if SymbolRetriever
-             # itself uses np directly for its operations beyond what digester provides.
-             # The current code uses np directly for query_embedding manipulation.
-            if np is None:
-                raise ImportError("Numpy is required for SymbolRetriever but not found/imported globally in symbol_retriever.py.")
-
+        if np is None: # Global numpy check for SymbolRetriever's own operations
+            # This might be redundant if all np ops are on digester.np_module, but good as a safeguard
+            print("SymbolRetriever Warning: Numpy not found globally. Some operations might fail if not using digester.np_module.")
 
         self.digester = digester
-        self.embedding_model = digester.embedding_model
-        self.faiss_index = digester.faiss_index
-        self.faiss_id_to_metadata = digester.faiss_id_to_metadata
-        self.np_module = np # Store a reference to the numpy module
+        self.embedding_model = digester.embedding_model # Might be None
+        self.faiss_index = digester.faiss_index       # Might be None
+        self.faiss_id_to_metadata = digester.faiss_id_to_metadata # Might be empty
+        self.np_module = np # Uses the global np imported in this file for its own operations
+        self.verbose = verbose
+        if self.verbose:
+            print(f"SymbolRetriever initialized. Embedding model ready: {bool(self.embedding_model)}, FAISS index ready: {bool(self.faiss_index)}")
+
 
     def _l2_normalize_vector(self, vector: np.ndarray) -> np.ndarray:
         """L2 normalizes a vector."""
@@ -122,50 +124,84 @@ class SymbolRetriever:
         print(f"SymbolRetriever: Constructed symbol_bag: '{symbol_bag_string[:200]}...'")
         return symbol_bag_string
 
+    def get_context_symbols_for_spec_fusion(self, max_symbols: Optional[int] = 500) -> List[str]:
+        """
+        Retrieves a list of FQNs for context, prioritizing relevant item types.
+        This implementation primarily uses faiss_id_to_metadata.
+        """
+        if self.verbose: print("SymbolRetriever: Retrieving context symbols for spec fusion...")
+
+        if not hasattr(self.digester, 'faiss_id_to_metadata') or not self.digester.faiss_id_to_metadata:
+            if self.verbose: print("  SymbolRetriever Warning: faiss_id_to_metadata is empty or not available in digester. No symbols to retrieve.")
+            return []
+
+        collected_fqns: Set[str] = set()
+        # Prioritize these item types for spec context
+        relevant_item_types = {
+            "function_code",
+            "method_code",
+            "class_code",
+            "docstring_for_module" # Module FQNs can be useful context
+        }
+
+        for item in self.digester.faiss_id_to_metadata:
+            try:
+                fqn = item.get('fqn')
+                item_type = item.get('item_type')
+                if isinstance(fqn, str) and fqn and isinstance(item_type, str) and item_type in relevant_item_types:
+                    collected_fqns.add(fqn)
+            except Exception as e: # pylint: disable=broad-except
+                if self.verbose: print(f"  SymbolRetriever Warning: Error processing metadata item {item}: {e}")
+
+        if not collected_fqns:
+            if self.verbose: print("  SymbolRetriever: No FQNs collected after filtering by relevant types.")
+            return []
+
+        sorted_fqns = sorted(list(collected_fqns))
+
+        if max_symbols is not None and len(sorted_fqns) > max_symbols:
+            if self.verbose: print(f"  SymbolRetriever: Truncating symbol list from {len(sorted_fqns)} to {max_symbols}.")
+            return sorted_fqns[:max_symbols]
+
+        if self.verbose: print(f"  SymbolRetriever: Returning {len(sorted_fqns)} context symbols.")
+        return sorted_fqns
+
 # Example Usage (conceptual, as it needs a populated RepositoryDigester)
 if __name__ == '__main__':
+    from unittest.mock import MagicMock # Import MagicMock for the faiss part if faiss is None
     print("SymbolRetriever example usage requires a populated RepositoryDigester.")
 
     if np: # Check if numpy is available for the mock example
         class MockEmbeddingModel:
             def encode(self, texts, show_progress_bar=False):
                 return np.array([np.random.rand(384).astype(np.float32) for _ in texts])
-            def get_sentence_embedding_dimension(self): # Needed by digester init
+            def get_sentence_embedding_dimension(self):
                 return 384
 
         class MockFaissIndex:
             def __init__(self, dim): self.dim = dim; self.ntotal = 0
             def search(self, query_vec, k):
-                num_results = min(k, 2) # Simulate finding 2 items
-                # Simulate distances: 0.5 (high sim), 1.0 (medium sim)
-                dists = np.array([[0.5**0.5 * np.sqrt(2), 1.0**0.5 * np.sqrt(2)] + [2.0]*(k-2)], dtype=np.float32) if k > 0 else np.array([[]], dtype=np.float32)
-                # Corrected L2 for cosine: L2_dist = sqrt(2 - 2*cos_sim)
-                # So, if target cos_sim = 0.875 -> L2_dist = sqrt(2 - 1.75) = sqrt(0.25) = 0.5
-                # If target cos_sim = 0.5   -> L2_dist = sqrt(2 - 1.0) = sqrt(1.0) = 1.0
+                num_results = min(k, 2)
                 dists_corrected = np.array([
-                    [np.sqrt(2 - 2 * 0.875), np.sqrt(2 - 2 * 0.5)] + [2.0]*(k-2) # Sim: 0.875, 0.5
+                    [np.sqrt(2 - 2 * 0.875), np.sqrt(2 - 2 * 0.5)] + [2.0]*(k-num_results)
                 ], dtype=np.float32)
-
-                ids = np.array([[0, 1] + [-1]*(k-2)], dtype=np.int64) if k > 0 else np.array([[]], dtype=np.int64)
+                ids = np.array([[0, 1] + ([-1]*(k-num_results) if k > num_results else [])], dtype=np.int64)
                 return dists_corrected[:, :num_results], ids[:, :num_results]
             def add(self, vectors): self.ntotal += len(vectors)
 
 
-        class MockDigester: # Mocking RepositoryDigester for example
-            def __init__(self):
+        class MockDigester:
+            def __init__(self, verbose_retriever=False):
                 self.embedding_model = MockEmbeddingModel()
                 self.embedding_dimension = self.embedding_model.get_sentence_embedding_dimension()
-                # Mock faiss module for this example's scope if not available globally
+
                 global faiss
-                if faiss is None: # If global faiss is None (not imported)
+                if faiss is None:
                     faiss_mock_for_example = MagicMock()
                     faiss_mock_for_example.IndexFlatL2 = MockFaissIndex
                     self.faiss_index = faiss_mock_for_example.IndexFlatL2(self.embedding_dimension)
-                elif self.embedding_dimension: # global faiss is available
-                     self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension) # Use real if available, or mock if needed
-                     # For this example, let's ensure it's our mock for predictable search
-                     self.faiss_index = MockFaissIndex(self.embedding_dimension)
-
+                elif self.embedding_dimension:
+                     self.faiss_index = MockFaissIndex(self.embedding_dimension) # Ensure mock for predictability
                 else:
                     self.faiss_index = None
 

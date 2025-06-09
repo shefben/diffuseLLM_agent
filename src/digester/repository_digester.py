@@ -916,42 +916,69 @@ class RepositoryDigester:
                 pyanalyze_options = Options(paths=[str(self.repo_path)])
                 pyanalyze_config = Config.from_options(pyanalyze_options)
                 self.pyanalyze_checker = Checker(config=pyanalyze_config)
-            except Exception as e: print(f"Warning: Failed to initialize Pyanalyze Checker: {e}."); self.pyanalyze_checker = None
+            except Exception as e: print(f"RepositoryDigester Warning: Failed to initialize Pyanalyze Checker: {e}."); self.pyanalyze_checker = None
         elif not (pyanalyze and Checker and Config and Options):
-             print("Warning: Pyanalyze library or its core components not found. Type inference disabled.")
+             print("RepositoryDigester Warning: Pyanalyze library or its core components not found. Type inference disabled.")
              self.pyanalyze_checker = None
 
         # Embedding model initialization
         self.embedding_model: Optional[SentenceTransformer] = None
         self.embedding_dimension: Optional[int] = None
-        if SentenceTransformer:
-            try:
-                print(f"RepositoryDigester: Initializing embedding model '{embedding_model_name}'...")
-                self.embedding_model = SentenceTransformer(embedding_model_name)
-                if self.embedding_model:
-                    self.embedding_dimension = self.embedding_model.get_sentence_embedding_dimension()
-                print(f"RepositoryDigester: Embedding model initialized. Dimension: {self.embedding_dimension}.")
-            except Exception as e:
-                print(f"Error initializing SentenceTransformer model '{embedding_model_name}': {e}")
-                self.embedding_model = None
-        else:
-            print("RepositoryDigester: sentence-transformers library not available. Embedding generation disabled.")
 
-        # NEW: Initialize FAISS Index
-        self.faiss_index: Optional[faiss.Index] = None # type: ignore
+        if SentenceTransformer and embedding_model_name:
+            model_load_path: Optional[Union[str, Path]] = None
+            default_local_st_model_path = Path("./models/sentence_transformer_model/")
+
+            # 1. Check if embedding_model_name is a direct path to an existing model directory
+            potential_path = Path(embedding_model_name)
+            if potential_path.is_dir():
+                model_load_path = potential_path
+                print(f"RepositoryDigester Info: Attempting to load SentenceTransformer model from provided path: {model_load_path}")
+            # 2. Else, if it's a known HF name (e.g., 'all-MiniLM-L6-v2') AND default local path exists, use local
+            elif embedding_model_name == 'all-MiniLM-L6-v2' and default_local_st_model_path.is_dir():
+                model_load_path = default_local_st_model_path
+                print(f"RepositoryDigester Info: Found default local SentenceTransformer model at: {model_load_path}. Prioritizing this.")
+            # 3. Else, treat embedding_model_name as a Hugging Face model name (for download or cache)
+            else:
+                model_load_path = embedding_model_name
+                if is_placeholder_path := embedding_model_name.endswith("sentence_transformer_model/"): # Check if it's the default placeholder
+                    print(f"RepositoryDigester Warning: Provided model path '{embedding_model_name}' seems to be a placeholder or does not exist. Will attempt to load from Hugging Face if it's a valid model name.")
+                else:
+                    print(f"RepositoryDigester Info: Attempting to load SentenceTransformer model from Hugging Face Hub: '{embedding_model_name}'")
+
+            if model_load_path:
+                try:
+                    self.embedding_model = SentenceTransformer(str(model_load_path))
+                    if self.embedding_model:
+                        self.embedding_dimension = self.embedding_model.get_sentence_embedding_dimension()
+                    print(f"RepositoryDigester Info: SentenceTransformer model '{model_load_path}' loaded successfully. Dimension: {self.embedding_dimension}.")
+                except Exception as e:
+                    print(f"RepositoryDigester Error: Failed to load SentenceTransformer model from '{model_load_path}': {e}")
+                    self.embedding_model = None
+            else: # Should not happen if logic above is correct
+                 print("RepositoryDigester Warning: No valid model path or name determined for SentenceTransformer.")
+
+        elif not SentenceTransformer:
+            print("RepositoryDigester Warning: sentence-transformers library not available. Embedding generation disabled.")
+        elif not embedding_model_name:
+            print("RepositoryDigester Warning: No embedding_model_name provided. Embedding generation disabled.")
+
+
+        # FAISS Index Initialization (depends on successful model loading)
+        self.faiss_index: Optional[faiss.Index] = None
         self.faiss_id_to_metadata: List[Dict[str, Any]] = []
         if faiss and self.embedding_model and self.embedding_dimension:
             try:
-                print(f"RepositoryDigester: Initializing FAISS IndexFlatL2 with dimension {self.embedding_dimension}...")
-                self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension)
-                print("RepositoryDigester: FAISS Index initialized.")
+                print(f"RepositoryDigester Info: Initializing FAISS IndexFlatL2 with dimension {self.embedding_dimension}...")
+                self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension) # type: ignore
+                print("RepositoryDigester Info: FAISS Index initialized.")
             except Exception as e:
-                print(f"Error initializing FAISS index: {e}")
+                print(f"RepositoryDigester Error: Error initializing FAISS index: {e}")
                 self.faiss_index = None
         elif not faiss:
-            print("RepositoryDigester: faiss library not available. FAISS indexing disabled.")
+            print("RepositoryDigester Warning: faiss library not available. FAISS indexing disabled.")
         elif not self.embedding_model or not self.embedding_dimension:
-            print("RepositoryDigester: Embedding model not available or dimension unknown. FAISS indexing disabled.")
+            print("RepositoryDigester Warning: Embedding model not loaded or dimension unknown. FAISS indexing disabled.")
 
     def _extract_symbols_and_docstrings_from_ast(
         self,
@@ -1264,61 +1291,54 @@ class RepositoryDigester:
             if all_text_contents:
                 print(f"RepositoryDigester: Generating embeddings for {len(all_text_contents)} text items...")
                 try:
-                    embeddings_np_array = self.embedding_model.encode(
-                        all_text_contents,
-                        show_progress_bar=False
-                    )
-                    print(f"RepositoryDigester: Generated {len(embeddings_np_array)} embeddings.")
+                    embeddings_np_array = self.embedding_model.encode(all_text_contents, show_progress_bar=False) # type: ignore
+                    print(f"RepositoryDigester Info: Generated {len(embeddings_np_array)} embeddings.")
 
                     if len(embeddings_np_array) == len(all_symbol_references):
                         for i, symbol_dict_ref in enumerate(all_symbol_references):
                             symbol_dict_ref["embedding"] = embeddings_np_array[i]
                     else:
-                        print("Warning: Mismatch between number of text items and generated embeddings. Embeddings not stored back.")
-
+                        print("RepositoryDigester Warning: Mismatch between number of text items and generated embeddings. Embeddings not stored back.")
                 except Exception as e_embed:
-                    print(f"Error during embedding generation: {e_embed}")
+                    print(f"RepositoryDigester Error: Error during embedding generation: {e_embed}")
             else:
-                print("RepositoryDigester: No text content found to generate embeddings for.")
+                print("RepositoryDigester Info: No text content found to generate embeddings for.")
         elif not self.embedding_model:
-            print("RepositoryDigester: Embedding model not available. Skipping embedding generation.")
-        elif not np:
-            print("RepositoryDigester: Numpy not available. Skipping embedding generation.")
+            print("RepositoryDigester Warning: Embedding model not available. Skipping embedding generation.")
+        elif not np: # Should always be available if SentenceTransformer is, but good check.
+            print("RepositoryDigester Warning: Numpy not available. Skipping embedding generation.")
 
-        # --- NEW: FAISS Index Population ---
-        if self.faiss_index is not None and np is not None:
-            print("RepositoryDigester: Populating FAISS index...")
-            embeddings_to_add_list: List[NumpyNdarray] = []
+        # --- FAISS Index Population ---
+        if self.faiss_index is not None and np is not None: # np check for np.vstack and np.float32
+            print("RepositoryDigester Info: Populating FAISS index...")
+            embeddings_to_add_list: List[NumpyNdarray] = [] # type: ignore
             metadata_to_add_list: List[Dict[str, Any]] = []
 
-            for file_path_ordered in self._all_py_files:
+            for file_path_ordered in self._all_py_files: # Ensure consistent order if IDs depend on it
                 parsed_result_item = self.digested_files.get(file_path_ordered)
                 if parsed_result_item and parsed_result_item.extracted_symbols:
                     for symbol_dict in parsed_result_item.extracted_symbols:
-                        if "embedding" in symbol_dict and isinstance(symbol_dict["embedding"], np.ndarray):
+                        if "embedding" in symbol_dict and isinstance(symbol_dict["embedding"], np.ndarray): # type: ignore
                             embeddings_to_add_list.append(symbol_dict["embedding"])
                             metadata_to_add_list.append({
-                                "fqn": symbol_dict.get("fqn"),
-                                "item_type": symbol_dict.get("item_type"),
+                                "fqn": symbol_dict.get("fqn"), "item_type": symbol_dict.get("item_type"),
                                 "file_path": str(symbol_dict.get("file_path")),
-                                "start_line": symbol_dict.get("start_line"),
-                                "end_line": symbol_dict.get("end_line"),
+                                "start_line": symbol_dict.get("start_line"), "end_line": symbol_dict.get("end_line"),
                             })
-
             if embeddings_to_add_list:
                 try:
-                    embeddings_2d_array = np.vstack(embeddings_to_add_list)
-                    self.faiss_index.add(embeddings_2d_array.astype(np.float32))
+                    embeddings_2d_array = np.vstack(embeddings_to_add_list).astype(np.float32) # type: ignore
+                    self.faiss_index.add(embeddings_2d_array) # type: ignore
                     self.faiss_id_to_metadata.extend(metadata_to_add_list)
-                    print(f"RepositoryDigester: Added {self.faiss_index.ntotal} embeddings to FAISS index.")
-                except Exception as e_faiss:
-                    print(f"Error adding embeddings to FAISS index: {e_faiss}")
+                    print(f"RepositoryDigester Info: Added {self.faiss_index.ntotal} embeddings to FAISS index.") # type: ignore
+                except Exception as e_faiss_add: # More specific FAISS add error
+                    print(f"RepositoryDigester Error: Error adding embeddings to FAISS index: {e_faiss_add}")
             else:
-                print("RepositoryDigester: No embeddings found to add to FAISS index.")
+                print("RepositoryDigester Info: No embeddings found to add to FAISS index.")
         elif not self.faiss_index:
-            print("RepositoryDigester: FAISS index not available. Skipping FAISS population.")
+            print("RepositoryDigester Warning: FAISS index not available. Skipping FAISS population.")
         elif not np:
-            print("RepositoryDigester: Numpy not available. Skipping FAISS population.")
+            print("RepositoryDigester Warning: Numpy not available. Skipping FAISS population.")
 
         print(f"RepositoryDigester: Digestion complete. Processed files: {len(self.digested_files)}")
         files_fully_ok_both_parsers = sum(1 for r in self.digested_files.values() if r.libcst_module and not r.libcst_error and r.treesitter_tree and not r.treesitter_has_errors)
@@ -1360,39 +1380,40 @@ class RepositoryDigester:
         try:
             self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension)
         except Exception as e_faiss_init:
-            print(f"Error re-initializing FAISS index: {e_faiss_init}")
+            print(f"RepositoryDigester Error: Error re-initializing FAISS index: {e_faiss_init}")
             self.faiss_index = None
             self.faiss_id_to_metadata = []
             return
 
-        self.faiss_id_to_metadata = []
+        self.faiss_id_to_metadata = [] # Clear existing metadata
 
-        all_embeddings_list: List[NumpyNdarray] = []
-        all_metadata_list: List[Dict[str, Any]] = []
+        embeddings_to_rebuild_list: List[NumpyNdarray] = [] # type: ignore
+        metadata_to_rebuild_list: List[Dict[str, Any]] = []
 
-        for parsed_result in self.digested_files.values():
+        for parsed_result in self.digested_files.values(): # Iterate through all currently digested files
             if parsed_result and parsed_result.extracted_symbols:
                 for symbol_dict in parsed_result.extracted_symbols:
-                    if "embedding" in symbol_dict and isinstance(symbol_dict["embedding"], np.ndarray):
-                        all_embeddings_list.append(symbol_dict["embedding"])
-                        all_metadata_list.append({
-                            "fqn": symbol_dict.get("fqn"),
-                            "item_type": symbol_dict.get("item_type"),
+                    if "embedding" in symbol_dict and isinstance(symbol_dict["embedding"], np.ndarray): # type: ignore
+                        embeddings_to_rebuild_list.append(symbol_dict["embedding"])
+                        metadata_to_rebuild_list.append({
+                            "fqn": symbol_dict.get("fqn"), "item_type": symbol_dict.get("item_type"),
                             "file_path": str(symbol_dict.get("file_path")),
-                            "start_line": symbol_dict.get("start_line"),
-                            "end_line": symbol_dict.get("end_line"),
+                            "start_line": symbol_dict.get("start_line"), "end_line": symbol_dict.get("end_line"),
                         })
 
-        if all_embeddings_list and self.faiss_index is not None:
+        if embeddings_to_rebuild_list and self.faiss_index is not None:
             try:
-                embeddings_2d_array = np.vstack(all_embeddings_list).astype(np.float32)
-                self.faiss_index.add(embeddings_2d_array)
-                self.faiss_id_to_metadata = all_metadata_list
-                print(f"RepositoryDigester: FAISS index rebuilt with {self.faiss_index.ntotal} items.")
-            except Exception as e_rebuild:
-                print(f"Error rebuilding FAISS index: {e_rebuild}")
-                if self.embedding_dimension:
-                    self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension)
+                embeddings_2d_array_rebuild = np.vstack(embeddings_to_rebuild_list).astype(np.float32) # type: ignore
+                self.faiss_index.add(embeddings_2d_array_rebuild) # type: ignore
+                self.faiss_id_to_metadata = metadata_to_rebuild_list # Replace with new full list
+                print(f"RepositoryDigester Info: FAISS index rebuilt with {self.faiss_index.ntotal} items.") # type: ignore
+            except Exception as e_rebuild_add:
+                print(f"RepositoryDigester Error: Error adding embeddings during FAISS index rebuild: {e_rebuild_add}")
+                # Attempt to reset to a clean state if add fails mid-rebuild
+                try:
+                    if self.embedding_dimension: self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension) # type: ignore
+                    else: self.faiss_index = None # Should not happen if model loaded
+                except Exception as e_final_reset: print(f"RepositoryDigester Error: Critical error resetting FAISS index post-rebuild failure: {e_final_reset}")
                 else:
                     self.faiss_index = None
                 self.faiss_id_to_metadata = []
