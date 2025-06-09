@@ -2,13 +2,17 @@ from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List # Added List
 import json # Add json import for dumping dicts in prompt
 
+import ast # For validating polished script syntax
+import re # For parsing LLM scaffold output (already present)
+
 # Attempt to import the new LLM interfacer function
 try:
-    from src.profiler.llm_interfacer import get_llm_code_fix_suggestion, get_llm_cst_scaffold
+    from src.profiler.llm_interfacer import get_llm_code_fix_suggestion, get_llm_cst_scaffold, get_llm_polished_cst_script
 except ImportError:
     get_llm_code_fix_suggestion = None
-    get_llm_cst_scaffold = None # Also handle if this specific one is missing
-    print("LLMCore Warning: Failed to import one or more LLM interfacer functions. Related LLM capabilities will be disabled.")
+    get_llm_cst_scaffold = None
+    get_llm_polished_cst_script = None
+    print("LLMCore Warning: Failed to import one or more LLM interfacer functions (get_llm_code_fix_suggestion, get_llm_cst_scaffold, get_llm_polished_cst_script). Related LLM capabilities will be disabled.")
 
 
 class LLMCore:
@@ -259,29 +263,103 @@ Begin Polished Script:
         print(prompt[:1000] + "..." if len(prompt) > 1000 else prompt) # Print snippet if too long
         print("--- End of Polishing Prompt ---\n")
 
-        # Mock LLM Interaction
-        print("LLMCore: Using MOCK LLM response for polishing.")
+        if get_llm_polished_cst_script is None:
+            print("LLMCore Warning: get_llm_polished_cst_script not available. Skipping real LLM polishing.")
+            return completed_patch_script
 
-        polished_script = "# Script polished by mock LLM (LLMCore.polish_patch)\n" + completed_patch_script
+        # Determine model path for polishing: uses llm_model_path from common_agent_llm_config passed by PhasePlanner
+        # or falls back to self.llm_model_path (originally intended for repair GGUF) if not in config.
+        polishing_model_path = self.config.get("llm_model_path", self.llm_model_path)
+        if not polishing_model_path:
+            print("LLMCore Warning: No model path configured for polishing ('llm_model_path' in config or as direct param). Skipping real LLM polishing.")
+            return completed_patch_script
 
-        # Simulate identifier harmonization (very superficial mock)
-        # Example: if the scaffold/expansion used a generic name like "placeholder_var" or "temp_method_name"
-        # This would typically require parsing the script, identifying symbols, and applying rules.
-        if "placeholder_content" in polished_script and "placeholder_content =" not in polished_script : # Avoid replacing variable assignment
-             polished_script = polished_script.replace("placeholder_content", "polished_placeholder_content_var")
-             print("  Mock Polish: Replaced 'placeholder_content' with 'polished_placeholder_content_var'")
+        # Extract relevant information from context_data
+        style_profile = context_data.get("style_profile", {})
+        naming_conventions_db_path = context_data.get("naming_conventions_db_path") # Path object
+        # Type environment / digester access is conceptual for the prompt, not directly used here to query types.
 
-        # Simulate adding a missing import (very superficial mock)
-        if "VisitorBasedCodemodCommand" in polished_script and "from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand" not in polished_script:
-            if "import libcst.matchers as m" in polished_script: # find a line to insert after
-                 polished_script = polished_script.replace(
-                    "import libcst.matchers as m",
-                    "import libcst.matchers as m\nfrom libcst.codemod import CodemodContext, VisitorBasedCodemodCommand"
-                )
-            else: # prepend
-                 polished_script = "from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand\n" + polished_script
-            print("  Mock Polish: Added 'from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand'")
+        prompt = f"""[TASK DESCRIPTION]
+You are an expert Python programmer specializing in reviewing and polishing LibCST (Concrete Syntax Tree) refactoring scripts.
+Your goal is to refine the provided LibCST script for clarity, correctness, and adherence to coding conventions.
 
+[INPUT LibCST SCRIPT TO POLISH]
+```python
+{completed_patch_script}
+```
+
+[CONTEXTUAL INFORMATION FOR POLISHING]
+1.  **Style Profile (for the script's own code, if applicable, and for generated code):**
+    ```json
+    {json.dumps(style_profile, indent=2)}
+    ```
+2.  **Naming Conventions Database Path (general guidance for identifier naming within the script):**
+    {str(naming_conventions_db_path) if naming_conventions_db_path else "Not provided. Use standard Python conventions."}
+    (Note: You do not have direct access to this database. Use this information as a general guideline for naming consistency.)
+
+3.  **Target File for the Original Codemod Operation:** {context_data.get("phase_target_file", "N/A")}
+4.  **Phase Parameters for the Original Codemod Operation:**
+    ```json
+    {json.dumps(context_data.get("phase_parameters", {}), indent=2)}
+    ```
+
+[POLISHING INSTRUCTIONS]
+1.  **Harmonize Identifier Style:** Review variable names, function names, and class names *within the LibCST script itself*. Ensure they are consistent and follow standard Python conventions (e.g., snake_case for functions and variables, CamelCase for classes).
+2.  **Ensure Necessary Imports:** Check if the script uses Python modules that require imports (e.g., `typing.List`, `collections.defaultdict`). If such imports are obviously missing from the top of the script, add them. Alternatively, if you are unsure about global import scope, list them in a comment block: `# REQUIRED_IMPORTS_START\n# import os\n# import typing\n# REQUIRED_IMPORTS_END`.
+3.  **Review and Repair Obvious Issues:** Correct any clear type mismatches, syntax errors, or minor logical flaws *within the LibCST script's own logic*. This does NOT mean altering the intended refactoring behavior of the script on the target codebase.
+4.  **Do NOT alter placeholders like `__HOLE_0__`, `__HOLE_1__`, etc.** These are intentional and will be filled by another process.
+5.  **Output ONLY the complete, polished Python LibCST script string.** Do not add any explanations, apologies, or markdown formatting before or after the script block.
+
+[POLISHED LibCST SCRIPT]
+```python
+""" # Prompt asks for the script to start after this line, assuming LLM will complete the ```python block.
+
+        if self.config.get("verbose_prompts", self.config.get("llm_verbose", False)):
+            print("\n--- LLMCore: Constructed Prompt for Polishing Pass ---")
+            print(prompt)
+            print("--- End of Polishing Prompt ---\n")
+        else:
+            print("\n--- LLMCore: Constructed Prompt for Polishing Pass (summary shown) ---")
+            print(prompt[:500] + "...") # Print a larger snippet for polish prompt
+            print("--- End of Polishing Prompt Summary ---\n")
+
+        # Get LLM parameters from config, with defaults suitable for polishing
+        llm_params = self.config.get("llm_polish_params", {})
+        max_tokens = llm_params.get("max_tokens", self.config.get("max_tokens_for_polished_script", 2048))
+        temperature = llm_params.get("temperature", self.config.get("temperature_for_polish", 0.2))
+        n_gpu_layers = self.config.get("llm_n_gpu_layers", -1)
+        n_ctx = llm_params.get("n_ctx", self.config.get("n_ctx", 4096))
+        verbose_llm = self.config.get("llm_verbose", False)
+
+
+        llm_output_string = get_llm_polished_cst_script(
+            model_path=polishing_model_path,
+            prompt=prompt,
+            verbose=verbose_llm,
+            n_gpu_layers=n_gpu_layers,
+            n_ctx=n_ctx,
+            max_tokens_for_polished_script=max_tokens,
+            temperature=temperature
+        )
+
+        if not llm_output_string: # Handles None or empty string
+            print("LLMCore Warning: LLM polishing returned no content. Proceeding with the unpolished script.")
+            return completed_patch_script
+
+        # LLM might sometimes include the closing ``` in its output.
+        if llm_output_string.endswith("```"):
+            llm_output_string = llm_output_string[:-3].rstrip()
+
+        polished_script = llm_output_string
+
+        # Basic validation of the polished script
+        try:
+            ast.parse(polished_script)
+            print(f"LLMCore: Polished script is valid Python syntax. Length: {len(polished_script)}.")
+        except SyntaxError as e_syn:
+            print(f"LLMCore Error: Polished script has syntax errors: {e_syn}. Returning original script.")
+            if verbose_llm: print(f"Problematic polished script:\n{polished_script}")
+            return completed_patch_script
 
         print(f"LLMCore: Polishing complete. Returning script (len: {len(polished_script)}).")
         return polished_script
@@ -327,9 +405,18 @@ class ReuseHelperInsteadCommand(cst.VisitorBasedCodemodCommand):
             return f"# LLM model path not configured. Generic mock repair for: {traceback_str[:100]}"
 
         print(f"LLMCore: Attempting LLM-based repair for traceback: {traceback_str[:200]}...")
-        current_failed_script = context_data.get('current_patch_candidate', '# No script provided in context_data["current_patch_candidate"]')
-        if not isinstance(current_failed_script, str): # Ensure it's a string
-            current_failed_script = str(current_failed_script)
+
+        current_failed_script_from_context = context_data.get('current_patch_candidate')
+        if isinstance(current_failed_script_from_context, str) and current_failed_script_from_context.strip():
+            current_failed_script = current_failed_script_from_context
+        elif current_failed_script_from_context is not None: # It's not a string or it's an empty string
+            current_failed_script = str(current_failed_script_from_context) # Convert to string if not None
+            if not current_failed_script.strip(): # If empty after conversion
+                 current_failed_script = "# Original script was empty or whitespace."
+        else: # It was None
+            current_failed_script = "# Original script was not provided in context_data['current_patch_candidate']."
+            print("LLMCore Warning: 'current_patch_candidate' not found or is None in context_data for repair.")
+
 
         phase_description = context_data.get("phase_description", "N/A")
         target_file = context_data.get("phase_target_file")
@@ -349,10 +436,10 @@ class ReuseHelperInsteadCommand(cst.VisitorBasedCodemodCommand):
             target_file=target_file,
             additional_context=additional_llm_context,
             # n_gpu_layers, max_tokens, temperature can be sourced from self.config if needed
-            n_gpu_layers=self.config.get("llm_repair_n_gpu_layers", -1),
-            max_tokens=self.config.get("llm_repair_max_tokens", 1024),
-            temperature=self.config.get("llm_repair_temperature", 0.4),
-            verbose=self.config.get("llm_repair_verbose", False)
+            n_gpu_layers=self.config.get("llm_repair_n_gpu_layers", self.config.get("llm_n_gpu_layers", -1)), # Fallback to common n_gpu_layers
+            max_tokens=self.config.get("llm_repair_max_tokens", self.config.get("max_tokens_for_fix", 2048)), # Increased default idea, get from config
+            temperature=self.config.get("llm_repair_temperature", self.config.get("temperature_for_fix", 0.3)), # Lower temp for corrective task
+            verbose=self.config.get("llm_repair_verbose", self.config.get("llm_verbose", False)) # Fallback to common verbose
         )
 
         if suggested_fix_script:

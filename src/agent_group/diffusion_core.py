@@ -28,9 +28,8 @@ class DiffusionCore:
         """
         self.style_profile = style_profile
         self.config = config if config else {}
-        # Ensure essential config keys have defaults if not provided, or handle their absence in methods.
-        # For this refactor, we assume expand_scaffold will handle missing keys gracefully.
-        print(f"DiffusionCore initialized with style_profile, config: {self.config}")
+        self.verbose = self.config.get("verbose", False) # Initialize self.verbose
+        print(f"DiffusionCore initialized with style_profile, config: {self.config}, verbose: {self.verbose}")
 
     def expand_scaffold(self, scaffold_patch_script: Optional[str], edit_summary_str: Optional[str], context_data: Dict[str, Any]) -> Optional[str]:
         """
@@ -200,32 +199,34 @@ Provide only the code snippet to replace `{hole_marker}`:"""
             proposed_fix_script: The new script suggested by LLMCore.propose_repair_diff.
             context_data: Comprehensive context data dictionary.
         Returns:
-            The script to be used for the next repair attempt (currently, proposed_fix_script).
+            The script to be used for the next repair attempt (currently, proposed_fix_script), or None.
         """
-        print(f"DiffusionCore.re_denoise_spans called. Context keys: {list(context_data.keys())}.")
-        # print(f"  Failed patch script (start): '{failed_patch_script[:100] if failed_patch_script else 'None'}...'")
-        # print(f"  Proposed fix script (start): '{proposed_fix_script[:100] if proposed_fix_script else 'None'}...'")
-
-        # Current pass-through implementation:
-        # The LLMCore.propose_repair_diff (via get_llm_code_fix_suggestion) is already tasked
-        # with returning a complete, revised script. So, re_denoise_spans will just pass this through.
-        # A more complex future version might:
-        # 1. Identify specific "spans" or "holes" in the original failed_patch_script that correspond
-        #    to the error described in the traceback (from context_data if needed).
-        # 2. Use the proposed_fix_script as a strong hint or guide.
-        # 3. Apply a diffusion model or another LLM to "in-fill" or "re-denoise" only those spans,
-        #    potentially merging the LLM's broad fix with the more structured parts of failed_patch_script.
-        # For now, the "repair" is wholesale replacement by the LLM's suggested script.
-
-        if proposed_fix_script is not None:
-            print(f"DiffusionCore: Passing through proposed fix script from LLMCore. Length: {len(proposed_fix_script)}")
-            return proposed_fix_script
+        if self.verbose:
+            failed_script_preview = f"(length: {len(failed_patch_script)}) {failed_patch_script[:100]}..." if failed_patch_script else "None"
+            proposed_script_preview = f"(length: {len(proposed_fix_script)}) {proposed_fix_script[:100]}..." if proposed_fix_script else "None"
+            print(f"DiffusionCore.re_denoise_spans called. Context keys: {list(context_data.keys())}.")
+            print(f"  Verbose: Failed patch script (preview): {failed_script_preview}")
+            print(f"  Verbose: Proposed fix script (preview): {proposed_script_preview}")
         else:
-            print("DiffusionCore: No proposed fix script from LLMCore. Returning the original failed script for retry if applicable.")
-            # This implies LLMCore couldn't suggest a fix. Returning the failed script might lead to a loop
-            # if not handled carefully in CollaborativeAgentGroup (e.g., by max_repair_attempts).
-            # However, CollaborativeAgentGroup's logic already handles None from propose_repair_diff by breaking the loop.
-            # So, this path (returning failed_patch_script if proposed_fix_script is None) might be less common.
-            # It's safer to return None if proposed_fix_script is None, aligning with LLMCore's inability to fix.
+            print(f"DiffusionCore.re_denoise_spans called.")
+
+        # This method acts as a pass-through for the script proposed by LLMCore.
+        # The primary role of LLMCore.propose_repair_diff is to provide a complete, revised script.
+        # DiffusionCore here confirms that proposal and passes it on.
+        # Future enhancements for more complex merging/denoising are out of scope for this refinement.
+
+        if proposed_fix_script is None:
+            print("DiffusionCore: No proposed fix script received from LLMCore. Passing through None.")
             return None
-        return patch_with_failed_validation
+        else:
+            # Ensure proposed_fix_script is a string, though type hints suggest it should be.
+            if not isinstance(proposed_fix_script, str):
+                print(f"DiffusionCore Warning: proposed_fix_script is not a string (type: {type(proposed_fix_script)}). Attempting to cast. This is unexpected.")
+                try:
+                    proposed_fix_script = str(proposed_fix_script)
+                except Exception as e_cast:
+                    print(f"DiffusionCore Error: Failed to cast proposed_fix_script to string: {e_cast}. Returning None.")
+                    return None
+
+            print(f"DiffusionCore: Passing through proposed fix script (length: {len(proposed_fix_script)}) from LLMCore as the 're-denoised' script.")
+            return proposed_fix_script

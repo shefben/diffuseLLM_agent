@@ -55,42 +55,127 @@ class CollaborativeAgentGroup:
 
         print("CollaborativeAgentGroup initialized with LLMCore, DiffusionCore, and max_repair_attempts.")
 
-    def _perform_duplicate_guard(self, patch_script_str: Optional[str], context_data: Dict[str, Any]) -> bool:
-        """
-        Checks if the proposed patch script might be creating a duplicate function/method.
-        This is a mock implementation.
-        """
-        if not patch_script_str:
-            return False
+import ast # For parsing modified code in duplicate guard
+from src.digester.signature_trie import generate_function_signature_string # For duplicate guard
+from src.transformer import apply_libcst_codemod_script, PatchApplicationError # For applying script in run
 
-        print(f"CollaborativeAgentGroup._perform_duplicate_guard called for script (first 100 chars): '{patch_script_str[:100]}...'")
+class CollaborativeAgentGroup:
+    def __init__(self,
+                 style_profile: Dict[str, Any],
+                 naming_conventions_db_path: Path,
+                 validator_instance: 'Validator', # New parameter
+                 llm_core_config: Optional[Dict[str, Any]] = None,
+                 diffusion_core_config: Optional[Dict[str, Any]] = None,
+                 llm_model_path: Optional[str] = None
+                 ):
+        """
+        Initializes the CollaborativeAgentGroup.
+        Args:
+            style_profile: Dictionary containing style profile information.
+            naming_conventions_db_path: Path to the naming conventions database.
+            validator_instance: An instance of the Validator class.
+            llm_core_config: Optional configuration for LLMCore.
+            diffusion_core_config: Optional configuration for DiffusionCore.
+            llm_model_path: Optional path to GGUF model for LLMCore repairs.
+        """
+        self.style_profile = style_profile
+        self.naming_conventions_db_path = naming_conventions_db_path
+        self.validator = validator_instance # Store the validator instance
+        self.max_repair_attempts = 3
+        self.digester: Optional['RepositoryDigester'] = None # Will be set in run()
+
+        # Initialize Core Agents
+        self.llm_agent = LLMCore(
+            style_profile=self.style_profile,
+            naming_conventions_db_path=self.naming_conventions_db_path,
+            config=llm_core_config,
+            llm_model_path=llm_model_path
+        )
+        self.diffusion_agent = DiffusionCore(
+            style_profile=self.style_profile,
+            config=diffusion_core_config
+        )
+
+        self.current_patch_candidate: Optional[Any] = None
+        self.patch_history: list = [] # To store (script, validation_result, score, error) tuples
+        self._current_run_context_data: Optional[Dict[str, Any]] = None # For preview context
+
+        print("CollaborativeAgentGroup initialized with LLMCore, DiffusionCore, and max_repair_attempts.")
+
+    def _perform_duplicate_guard(self, modified_code_str: Optional[str], target_file_path: Path, context_data: Dict[str, Any]) -> bool:
+        """
+        Checks if the modified code string contains any function/method signatures
+        that already exist in the project's signature trie.
+        """
+        if not modified_code_str:
+            print("DuplicateGuard: No modified code string provided. Skipping check.")
+            return False
 
         digester = context_data.get("repository_digester")
-        if not digester or not hasattr(digester, 'signature_trie'):
-            print("  DuplicateGuard: Digester or SignatureTrie not available in context. Skipping check.")
+        if not digester or not hasattr(digester, 'signature_trie') or not hasattr(digester, 'repo_path'):
+            print("DuplicateGuard: Digester, signature_trie, or repo_path not available in context. Skipping check.")
             return False
 
-        # Mock duplicate detection logic:
-        # Try to find if the script defines a function named "new_mock_function"
-        # This is highly simplified. A real implementation would parse the script,
-        # extract defined function/method signatures, and check them.
-        if "def new_mock_function(" in patch_script_str or "function_name=\"new_mock_function\"" in patch_script_str :
-            # This specific signature is hardcoded in SignatureTrie.search to return True for testing
-            mock_function_signature = "new_mock_function(arg1: int) -> str"
-            print(f"  DuplicateGuard: Mocking check for signature: '{mock_function_signature}'")
+        print(f"DuplicateGuard: Checking for duplicate signatures in modified code for target: {target_file_path.name}")
 
-            try:
-                # The SignatureTrie.search method was updated to return bool
-                is_duplicate = digester.signature_trie.search(mock_function_signature)
-                print(f"  DuplicateGuard: SignatureTrie search result for '{mock_function_signature}': {is_duplicate}")
-                if is_duplicate:
-                    print("  DuplicateGuard: Mock duplicate signature detected!")
+        try:
+            module_ast = ast.parse(modified_code_str, filename=str(target_file_path))
+        except SyntaxError as e:
+            print(f"DuplicateGuard: SyntaxError parsing modified code for {target_file_path.name}: {e}. Cannot check for duplicates.")
+            return False # Let validator handle syntax error
+
+        project_root = digester.repo_path
+        # Assuming _get_module_qname_from_path is a static or instance method on digester
+        module_qname = digester._get_module_qname_from_path(target_file_path, project_root)
+
+        def simple_type_resolver(node: ast.AST, hint_category: str) -> Optional[str]:
+            # For nodes within modified_code_str, we don't have Pyanalyze types yet.
+            # Fallback to "Any" or try to get text from annotation if present.
+            # Node is the annotation node itself if category is 'return_annotation'
+            # Node is ast.arg if category is parameter-related.
+            annotation_node = None
+            if category_hint.endswith("return_annotation"):
+                annotation_node = node # node is the annotation itself
+            elif hasattr(node, 'annotation') and node.annotation:
+                annotation_node = node.annotation
+
+            if annotation_node:
+                if isinstance(annotation_node, ast.Name): return annotation_node.id
+                if isinstance(annotation_node, ast.Constant): # Python 3.8+ for str/None consts in annotations
+                    if isinstance(annotation_node.value, str): return annotation_node.value
+                    return str(annotation_node.value)
+                if hasattr(ast, 'unparse'): # Attempt to unparse more complex annotations
+                    try: return ast.unparse(annotation_node)
+                    except: pass # Fall through if unparse fails
+                # For older Pythons or complex types not handled by unparse if simple,
+                # a more basic representation might be needed, or just default to Any.
+                # For now, ast.unparse is a good general attempt for Py 3.9+.
+            return "typing.Any" # Default to Any
+
+        for item_node in module_ast.body:
+            if isinstance(item_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # For top-level functions
+                # The generate_function_signature_string expects func_node, type_resolver, and optional class_name
+                signature_str = generate_function_signature_string(item_node, simple_type_resolver)
+                # SignatureTrie.search returns List[str] of FQNs if found, or empty list.
+                # We need to check if the list is non-empty.
+                # The mock in SignatureTrie was returning bool, this needs to be aligned.
+                # Assuming search now returns List[str] as per its typical design.
+                if digester.signature_trie.search(signature_str): # If list is not empty, a duplicate exists
+                    print(f"DuplicateGuard: Duplicate top-level function signature found for '{module_qname}.{item_node.name}': {signature_str}")
                     return True
-            except Exception as e:
-                print(f"  DuplicateGuard: Error during SignatureTrie search: {e}")
-                return False # Fail safe
+            elif isinstance(item_node, ast.ClassDef):
+                class_name_simple = item_node.name
+                # class_fqn_prefix = f"{module_qname}.{class_name_simple}" # Full FQN not needed for prefix arg
+                for method_node in item_node.body:
+                    if isinstance(method_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        # Pass simple class name as prefix for method name part of signature string
+                        signature_str = generate_function_signature_string(method_node, simple_type_resolver, class_fqn_prefix_for_method_name=class_name_simple)
+                        if digester.signature_trie.search(signature_str):
+                            print(f"DuplicateGuard: Duplicate method signature found for '{module_qname}.{class_name_simple}.{method_node.name}': {signature_str}")
+                            return True
 
-        print("  DuplicateGuard: No duplicate detected by mock logic.")
+        print(f"DuplicateGuard: No duplicate signatures found in {target_file_path.name}.")
         return False
 
     def run(
@@ -188,66 +273,111 @@ class CollaborativeAgentGroup:
         # This will need adjustment in Phase 5 Step 3 (Validate Patch).
         self.current_patch_candidate = completed_patch_script
 
-        # --- Iterative Refinement Loop (Simplified Placeholder) ---
-        # max_iterations renamed to self.max_repair_attempts and defined in __init__
-        for i in range(self.max_repair_attempts): # Use self.max_repair_attempts
+        # --- Iterative Refinement Loop ---
+        # self.max_repair_attempts defined in __init__
+        # self.current_patch_candidate holds the LibCST SCRIPT string.
+
+        self.digester = digester # Store digester instance for access in other methods if needed, or pass via context
+
+        for i in range(self.max_repair_attempts):
             print(f"\n--- Repair Iteration {i + 1}/{self.max_repair_attempts} ---")
 
-            # --- Step 5 (Part A): Duplicate Guard ---
-            # self.current_patch_candidate holds the script string from diffusion or previous repair
-            is_duplicate_detected = self._perform_duplicate_guard(self.current_patch_candidate, context_data)
-
-            # Initialize validation results for the iteration
-            is_valid = True
+            modified_code_content_for_iteration: Optional[str] = None
             error_traceback: Optional[str] = None
             validation_payload: Any = None
+            is_duplicate_detected = False # Initialize
 
-            if is_duplicate_detected:
-                print("CollaborativeAgentGroup: Duplicate detected by guard! Attempting repair to reuse existing functionality.")
-                is_valid = False # Mark as not valid to trigger repair logic
-                error_traceback = "DUPLICATE_DETECTED: REUSE_EXISTING_HELPER"
-                # Skip direct validation if duplicate is found, proceed to repair logic.
-                # The style score might not be relevant here, or could be set to a low value.
-                style_score = 0.0 # Or skip scoring for duplicates
-                self.patch_history.append((self.current_patch_candidate, is_valid, style_score, error_traceback))
+            target_file_str = context_data.get("phase_target_file")
+            original_content: Optional[str] = None
+
+            if not target_file_str:
+                is_valid = False
+                error_traceback = "PhaseConfigurationError: Missing target_file in phase context."
+                print(f"CollaborativeAgentGroup Error: {error_traceback}")
+            elif not self.current_patch_candidate: # Should be a LibCST script string
+                is_valid = False
+                error_traceback = "AgentError: No current patch candidate (script) to apply."
+                print(f"CollaborativeAgentGroup Error: {error_traceback}")
             else:
-                # --- Step 5 (Part B): Validate Patch (if not a duplicate) ---
-                # The validator_handle currently in PhasePlanner is a mock that takes (patch, digester, phase_ctx)
-                # The 'patch' it receives will be the completed_patch_script string.
-                # This mock validator needs to be aware it might receive a script string.
-                is_valid, validation_payload, error_traceback = validator_handle(
-                    self.current_patch_candidate, # This is the script string
+                # Attempt to apply the patch script
+                original_content = self.digester.get_file_content(Path(target_file_str))
+                if original_content is None:
+                    # Check if it's a new file scenario (target might not exist yet)
+                    # For new files, original_content should be effectively empty.
+                    # This needs to be determined based on phase intention, e.g. "create_file" op.
+                    # For now, if get_file_content returns None, and it's not explicitly a new file op, it's an issue.
+                    # Assuming for now that if target_file is specified, it should exist unless it's a new file op.
+                    # Let's assume for new file, original_content would be "" (handled by get_file_content or here)
+                    # If it's not a new file op and content is None, that's an issue.
+                    # For simplicity, if get_file_content returns None, we'll treat as empty for application.
+                    print(f"CollaborativeAgentGroup Info: Original content for '{target_file_str}' not found. Assuming empty for patch application (e.g. new file).")
+                    original_content = ""
+
+                try:
+                    modified_code_content_for_iteration = apply_libcst_codemod_script(
+                        original_content,
+                        self.current_patch_candidate # This is the LibCST script string
+                    )
+                    print(f"CollaborativeAgentGroup: Successfully applied script for iteration {i+1}.")
+                except PatchApplicationError as pae:
+                    is_valid = False
+                    error_traceback = f"PatchApplicationError: Failed to apply LibCST script: {pae}"
+                    modified_code_content_for_iteration = None # Ensure it's None on failure
+                    print(f"CollaborativeAgentGroup Error: {error_traceback}")
+                except Exception as e_apply: # Catch other unexpected errors during application
+                    is_valid = False
+                    error_traceback = f"UnexpectedErrorApplyingPatch: {type(e_apply).__name__} - {e_apply}"
+                    modified_code_content_for_iteration = None
+                    print(f"CollaborativeAgentGroup Error: {error_traceback}")
+
+            # --- Step 5 (Part A): Duplicate Guard (if script application was successful) ---
+            if is_valid and modified_code_content_for_iteration is not None and target_file_str:
+                is_duplicate_detected = self._perform_duplicate_guard(modified_code_content_for_iteration, Path(target_file_str), context_data)
+                if is_duplicate_detected:
+                    is_valid = False
+                    error_traceback = "DUPLICATE_DETECTED: REUSE_EXISTING_HELPER"
+                    print(f"CollaborativeAgentGroup: {error_traceback}")
+
+            # --- Step 5 (Part B): Validate Patch (if script applied and no duplicate) ---
+            # This now expects validator_handle to take modified_code_content_str.
+            # The actual change to Validator.validate_patch's signature is the next step.
+            if is_valid and modified_code_content_for_iteration is not None and target_file_str:
+                # Assuming validator_handle's signature will be:
+                # (modified_code_content: str, target_file: Path, digester: 'RepositoryDigester', project_root: Path)
+                # -> (bool, Optional[str], Optional[str]) where payload is now the error string.
+                # For now, the payload from validator_handle is still Any.
+                is_valid, validation_payload, error_traceback_validator = validator_handle(
+                    modified_code_content_for_iteration, # Pass applied code content
+                    Path(target_file_str), # Pass Path object
                     digester,
-                    phase_ctx
+                    digester.repo_path # Pass project_root
                 )
-                print(f"Loop Step A (Validation): Validation result for script: is_valid={is_valid}, payload={validation_payload}, error='{bool(error_traceback)}'")
+                if not is_valid and error_traceback_validator: # If validator provides an error, use it.
+                    error_traceback = error_traceback_validator
+                print(f"Loop Step A (Validation on content): is_valid={is_valid}, payload={validation_payload}, error='{bool(error_traceback)}'")
+            elif is_valid and modified_code_content_for_iteration is None: # Should have been caught by patch application checks
+                is_valid = False
+                error_traceback = "InternalError: modified_code_content is None despite is_valid being True before validation call."
+                print(f"CollaborativeAgentGroup Error: {error_traceback}")
 
-            # --- Phase 5: Step 4 (Score Patch Style - was Step 4, now part of loop) ---
-            # This step is now after duplicate check and potential direct validation skip.
-            # If duplicate, style_score was set to 0.0. Otherwise, calculate it.
-            if not is_duplicate_detected:
-                style_score = score_style_handle(
-                    self.current_patch_candidate, # This is the script string
-                    self.style_profile
-                )
-                print(f"Loop Step B (Style Score): Style score for script: {style_score:.2f}")
-                self.patch_history.append((self.current_patch_candidate, is_valid, style_score, error_traceback))
 
-            # Decision logic based on validation (and duplicate check)
-            if is_valid: # This means not a duplicate AND validator_handle returned True
-                print(f"Script validated successfully in iteration {i+1}. Proceeding to polish.")
-                # --- Phase 5: Step 4 (LLM Polishing Pass - was Step 5 in old numbering) ---
-            # The score_style_handle also takes the patch (script string here)
-            style_score = score_style_handle(
-                self.current_patch_candidate, # This is the script string
-                self.style_profile
-            )
-            print(f"Loop Step B (Style Score): Style score for script: {style_score:.2f}")
+            # --- Score Patch Style ---
+            # Style scoring should ideally run on the modified_code_content_for_iteration.
+            # However, score_style_handle expects the "patch" which has been the script.
+            # For now, we continue passing the script to style scorer. This could be refined.
+            style_score_content_to_score = self.current_patch_candidate # Default to script
+            if is_duplicate_detected : # If duplicate, style score is low.
+                 style_score = 0.0
+            else:
+                 style_score = score_style_handle(style_score_content_to_score, self.style_profile)
 
+            print(f"Loop Step B (Style Score on script): Style score: {style_score:.2f}")
+            # Record history using the SCRIPT that was attempted.
             self.patch_history.append((self.current_patch_candidate, is_valid, style_score, error_traceback))
 
+            # --- Decision logic based on validation ---
             if is_valid:
-                print(f"Script validated successfully in iteration {i+1}. Proceeding to polish.")
+                print(f"Script validated successfully in iteration {i+1}. Proceeding to polish the SCRIPT.")
                 # --- Phase 5: Step 4 (LLM Polishing Pass - was Step 5 in old numbering) ---
                 polished_script = self.llm_agent.polish_patch(self.current_patch_candidate, context_data)
                 print(f"Loop Step C (Polish): LLMCore polished the script. New length: {len(polished_script) if polished_script else 'N/A'}.")

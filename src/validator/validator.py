@@ -1,4 +1,8 @@
 # src/validator/validator.py
+import subprocess
+import tempfile
+import os
+import json # Added for Pyright JSON output parsing
 from typing import Optional, Tuple, Dict, List, Any, TYPE_CHECKING
 from pathlib import Path
 import re # Import re for regular expressions
@@ -15,6 +19,12 @@ class Validator:
             config: Optional dictionary for validator configurations (e.g., tool paths).
         """
         self.config = config if config else {}
+        self.verbose = self.config.get("verbose", False)
+        self.ruff_path = self.config.get("ruff_path", "ruff")
+        self.black_path = self.config.get("black_path", "black")
+        self.pyright_path = self.config.get("pyright_path", "pyright")
+        # TODO: Add path for pytest when it is unmocked
+
         self.common_stdlib_modules = [
             "os", "sys", "math", "re", "json", "collections", "pathlib",
             "datetime", "time", "argparse", "logging", "subprocess", "multiprocessing",
@@ -22,8 +32,7 @@ class Validator:
             "glob", "io", "pickle", "base64", "hashlib", "hmac", "uuid", "functools", "itertools",
             "operator", "typing", "dataclasses", "enum", "inspect", "gc", "weakref"
         ]
-        # Example: self.ruff_path = self.config.get("ruff_path", "ruff")
-        print(f"Validator initialized (mock tools). Config: {self.config}. Known stdlib modules: {len(self.common_stdlib_modules)}")
+        print(f"Validator initialized. Ruff: '{self.ruff_path}', Black: '{self.black_path}', Pyright: '{self.pyright_path}', Verbose: {self.verbose}. Known stdlib: {len(self.common_stdlib_modules)}")
 
     def attempt_heuristic_fixes(
         self,
@@ -81,46 +90,202 @@ class Validator:
             print(f"Validator: Heuristic fix made but did not return early (unexpected). Returning modified script for {target_file_path_str}.")
             return modified_script
 
+    # _apply_patch_script removed as it's no longer used by validate_patch.
+    # validate_patch now receives the already modified code content.
 
-    def _apply_patch_script(self, original_content: str, patch_script_str: str) -> str:
-        """
-        Placeholder for applying a LibCST patch script to original content.
-        For now, it simulates a modification. In a real scenario, this would involve
-        parsing the script, instantiating the CodemodCommand, and applying it.
-        """
-        print(f"Validator._apply_patch_script: Applying mock patch. Original len: {len(original_content)}, Script len: {len(patch_script_str)}")
-        # For this mock, assume the patch_script_str itself isn't the full new content,
-        # but a script that would generate some additions/changes.
-        # A more realistic mock for validation would be if patch_script_str IS the new content.
-        # However, current agent flow produces a CST script.
-        # Let's simulate the script adding its own content as a comment block for now.
-        return original_content + f"\n\n# --- Mock Patch Applied by Validator ---\n# Script content was:\n# {patch_script_str.replacechr(10,chr(10)+'# ')}\n# --- End Mock Patch ---"
+    def _run_ruff(self, file_content: str, file_path: Path) -> Optional[str]:
+        """Runs Ruff linter on the provided file content."""
+        errors = []
+        tmp_file_path_str = None # Ensure it's defined for finally block
+        try:
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False, encoding='utf-8') as tmp_file:
+                tmp_file.write(file_content)
+                tmp_file_path_str = tmp_file.name
 
-    def _run_ruff(self, modified_content: str, file_path: Path) -> Optional[str]:
-        """Mock for running Ruff linter."""
-        print(f"Validator._run_ruff: Running mock Ruff on content for {file_path.name} (len: {len(modified_content)}).")
-        if "# FIXME_RUFF" in modified_content:
-            return f"Ruff error: Found FIXME_RUFF in {file_path.name}"
-        return None
+            command = [self.ruff_path, "check", "--no-cache", "--quiet", tmp_file_path_str]
+            # For Ruff > 0.3.0, consider --output-format=json for structured output.
+            # Example: command = [self.ruff_path, "check", "--no-cache", "--quiet", "--output-format=json", tmp_file_path_str]
 
-    def _run_pyright(self, modified_content: str, file_path: Path, project_root: Path) -> Optional[str]:
-        """Mock for running Pyright type checker."""
-        print(f"Validator._run_pyright: Running mock Pyright on content for {file_path.name} (len: {len(modified_content)}) in project {project_root}.")
-        # In a real scenario, Pyright would need the content written to a temporary file
-        # or use its language server capabilities.
-        if "# FIXME_PYRIGHT" in modified_content:
-            return f"Pyright error: Found FIXME_PYRIGHT in {file_path.name}"
-        return None
+            if self.verbose: print(f"Validator: Running Ruff: {' '.join(command)}")
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
 
-    def _run_black_diff(self, modified_content: str, file_path: Path) -> Optional[str]:
-        """Mock for running Black formatter check (diff)."""
-        print(f"Validator._run_black_diff: Running mock Black-diff on content for {file_path.name} (len: {len(modified_content)}).")
-        # A simple check: does it end with a newline if it has content?
-        if modified_content and not modified_content.endswith("\n"):
-            return f"Black-diff: Would add trailing newline to {file_path.name}"
-        if "  unformatted_code = True" in modified_content: # Look for some obviously unformatted code
-             return f"Black-diff: Code requires reformatting in {file_path.name}"
-        return None
+            if result.returncode != 0:
+                # Ruff's default output for errors is to stdout. Stderr is for operational errors.
+                if result.stdout:
+                    errors.append(f"Ruff found issues in '{file_path.name}':\n{result.stdout.strip()}")
+                # Include stderr if it contains information, often Ruff operational errors
+                if result.stderr:
+                    errors.append(f"Ruff operational error for '{file_path.name}':\n{result.stderr.strip()}")
+
+            # If returncode is 0 but there's still stderr output, it might be a warning or other message.
+            elif result.stderr:
+                 print(f"Validator: Ruff stderr (even with exit code 0) for '{file_path.name}':\n{result.stderr.strip()}")
+
+
+        except FileNotFoundError:
+            return f"Ruff executable not found at '{self.ruff_path}'. Please configure 'ruff_path' or ensure Ruff is in PATH."
+        except Exception as e:
+            return f"An unexpected error occurred while running Ruff on '{file_path.name}': {e}"
+        finally:
+            if tmp_file_path_str and Path(tmp_file_path_str).exists():
+                os.remove(tmp_file_path_str)
+
+        return "\n".join(errors) if errors else None
+    def _run_ruff(self, file_content: str, file_path: Path) -> Optional[str]:
+        """Runs Ruff linter on the provided file content."""
+        errors = []
+        tmp_file_path_str = None # Ensure it's defined for finally block
+        try:
+            # Ruff works best with a file path, so write content to a temporary file.
+            # Using NamedTemporaryFile with delete=False, and manual deletion in finally.
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False, encoding='utf-8') as tmp_file:
+                tmp_file.write(file_content)
+                tmp_file_path_str = tmp_file.name # Get the path for the command
+
+            # Command for Ruff: check the temporary file.
+            # --no-cache: Disables caching, ensuring a fresh check.
+            # --quiet: Suppresses non-error output.
+            # --force-exclude: Could be added if Ruff respects project excludes for temp files.
+            #                However, usually, we want to lint the exact content provided.
+            command = [self.ruff_path, "check", "--no-cache", "--quiet", tmp_file_path_str]
+            # Consider --output-format=json for easier parsing if available and stable.
+
+            if self.verbose: print(f"Validator: Running Ruff: {' '.join(command)}")
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+
+            # Ruff typically exits with 1 if linting errors are found.
+            if result.returncode != 0:
+                # Ruff's default output for errors is to stdout. Stderr is for operational errors.
+                if result.stdout: # This should contain the linting errors
+                    errors.append(f"Ruff found issues in '{file_path.name}':\n{result.stdout.strip()}")
+
+                # Include stderr if it contains information (e.g., Ruff operational errors)
+                # but only if stdout was empty, to avoid redundancy if Ruff also prints its own errors to stderr.
+                if result.stderr and not result.stdout:
+                    errors.append(f"Ruff operational error for '{file_path.name}':\n{result.stderr.strip()}")
+                elif result.stderr and result.stdout: # If both, log stderr for debugging but don't add to main errors
+                     print(f"Validator (Ruff verbose): Stderr for '{file_path.name}':\n{result.stderr.strip()}")
+
+            # If returncode is 0 but there's still stderr output, it might be a warning or other message.
+            elif result.stderr: # e.g. warning about config, but no lint errors
+                 print(f"Validator (Ruff verbose): Stderr (even with exit code 0) for '{file_path.name}':\n{result.stderr.strip()}")
+
+        except FileNotFoundError:
+            return f"Ruff executable not found at '{self.ruff_path}'. Please configure 'ruff_path' or ensure Ruff is in PATH."
+        except Exception as e:
+            return f"An unexpected error occurred while running Ruff on '{file_path.name}': {e}"
+        finally:
+            if tmp_file_path_str and Path(tmp_file_path_str).exists():
+                os.remove(tmp_file_path_str)
+
+        return "\n".join(errors) if errors else None
+
+    def _run_pyright(self, file_content: str, file_path: Path, project_root: Path) -> Optional[str]:
+        """Runs Pyright type checker on the provided file content."""
+        errors = []
+        tmp_file_path_str = None # Ensure defined for finally block
+        try:
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False, encoding='utf-8') as tmp_file:
+                tmp_file.write(file_content)
+                tmp_file_path_str = tmp_file.name
+
+            # Pyright command: use --outputjson to get structured error information.
+            # It's crucial to run Pyright in the context of the project_root for it to find configs (pyrightconfig.json or pyproject.toml) and resolve imports.
+            command = [self.pyright_path, "--outputjson", tmp_file_path_str]
+
+            if self.verbose:
+                print(f"Validator: Running Pyright: {' '.join(command)} in dir {project_root}")
+                print(f"Validator: Note - Pyright's accuracy on a temporary file ('{tmp_file_path_str}') relies on it being analyzed within the project context ('{project_root}') for correct import resolution and configuration loading.")
+
+            # Pyright is often installed via npm; ensure it's accessible.
+            # Using project_root as cwd is important.
+            result = subprocess.run(command, capture_output=True, text=True, check=False, cwd=project_root)
+
+            # Pyright exit codes: 0 (no errors), 1 (errors), 2 (fatal error), 3 (option error)
+            if result.returncode != 0:
+                try:
+                    output_json = json.loads(result.stdout)
+                    num_errors = output_json.get("summary", {}).get("errorCount", 0)
+
+                    if num_errors > 0:
+                        formatted_errors = [f"Pyright found {num_errors} error(s) in '{file_path.name}':"]
+                        for diag in output_json.get("generalDiagnostics", []):
+                            if diag.get("severity") == "error":
+                                message = diag.get("message", "No message")
+                                # Pyright line/char are 0-indexed
+                                line = diag.get("range", {}).get("start", {}).get("line", -1) + 1
+                                col = diag.get("range", {}).get("start", {}).get("character", -1) + 1
+                                rule = diag.get("rule", "") # Include rule if available
+                                error_tag = f" ({rule})" if rule else ""
+                                formatted_errors.append(f"  - {file_path.name}:{line}:{col}: {message}{error_tag}")
+                        errors.extend(formatted_errors)
+
+                    # If JSON is valid but errorCount is 0 despite non-zero exit code, or if no diagnostics:
+                    if not errors and result.returncode !=0 : # Still no specific errors parsed, but Pyright indicated an issue
+                        errors.append(f"Pyright exited with code {result.returncode} for '{file_path.name}'.")
+                        if result.stdout.strip(): errors.append(f"Pyright output (stdout):\n{result.stdout.strip()}")
+                        if result.stderr.strip(): errors.append(f"Pyright error (stderr):\n{result.stderr.strip()}")
+
+                except json.JSONDecodeError:
+                    errors.append(f"Pyright returned exit code {result.returncode} for '{file_path.name}', but output was not valid JSON.")
+                    if result.stdout.strip(): errors.append(f"Pyright output (stdout):\n{result.stdout.strip()}")
+                    if result.stderr.strip(): errors.append(f"Pyright error (stderr):\n{result.stderr.strip()}")
+
+            # Capture stderr if verbose, even on success, for warnings etc.
+            elif result.stderr and self.verbose:
+                 print(f"Validator: Pyright stderr (even on success) for '{file_path.name}':\n{result.stderr.strip()}")
+
+        except FileNotFoundError:
+            return f"Pyright executable not found at '{self.pyright_path}'. Please configure 'pyright_path' or ensure Pyright (e.g., from npm) is in PATH."
+        except Exception as e:
+            return f"An unexpected error occurred while running Pyright on '{file_path.name}': {e}"
+        finally:
+            if tmp_file_path_str and Path(tmp_file_path_str).exists():
+                os.remove(tmp_file_path_str) # Corrected variable name here
+
+        return "\n".join(errors) if errors else None
+
+    def _run_black_diff(self, file_content: str, file_path: Path) -> Optional[str]:
+        """Runs Black formatter check (diff) on the provided file content."""
+        tmp_file_path_str = None # Ensure defined for finally
+        try:
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False, encoding='utf-8') as tmp_file:
+                tmp_file.write(file_content)
+                tmp_file_path_str = tmp_file.name
+
+            command = [self.black_path, "--check", "--diff", tmp_file_path_str]
+            if self.verbose: print(f"Validator: Running Black: {' '.join(command)}")
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+
+            # Black with --check exits with 0 if no changes needed.
+            # Exits with 1 if changes would be made.
+            # Exits with >1 for other errors (e.g., invalid syntax, which Ruff/Pyright should catch first).
+            if result.returncode == 1: # Indicates Black would reformat the file.
+                error_message = f"Black-diff: Code in '{file_path.name}' is not formatted. Black would make changes."
+                if self.verbose and result.stdout: # stdout contains the diff
+                     error_message += f"\nDiff:\n{result.stdout.strip()}"
+                if result.stderr: # stderr might contain additional info from Black
+                    error_message += f"\nBlack stderr (when changes needed):\n{result.stderr.strip()}"
+                return error_message
+            elif result.returncode > 1 : # Other Black errors
+                 # These are often syntax errors that Black itself cannot parse.
+                 # Ruff should ideally catch these first.
+                 error_detail = result.stderr.strip() if result.stderr else result.stdout.strip()
+                 return f"Black operational error for '{file_path.name}' (exit code {result.returncode}):\n{error_detail}"
+
+            # If returncode is 0, but there's still stderr (e.g. warning about config), log it.
+            if result.returncode == 0 and result.stderr:
+                print(f"Validator (Black verbose): Stderr (even with exit code 0) for '{file_path.name}':\n{result.stderr.strip()}")
+
+            return None # No formatting issues found by Black --check
+
+        except FileNotFoundError:
+            return f"Black executable not found at '{self.black_path}'. Please configure 'black_path' or ensure Black is in PATH."
+        except Exception as e:
+            return f"An unexpected error occurred while running Black on '{file_path.name}': {e}"
+        finally:
+            if tmp_file_path_str and Path(tmp_file_path_str).exists():
+                os.remove(tmp_file_path_str)
 
     def _run_pytest(self, target_file_path: Path, project_root: Path, digester: 'RepositoryDigester') -> Optional[str]:
         """
@@ -170,95 +335,57 @@ class Validator:
 
     def validate_patch(
         self,
-        patch_script_str: Optional[str],
+        modified_code_content_str: Optional[str],
         target_file_path_str: str,
         digester: 'RepositoryDigester',
         project_root: Path
-    ) -> Tuple[bool, Optional[str]]:
+    ) -> Tuple[bool, Optional[str]]: # Error message is now the second element, payload removed
         """
-        Validates a patch script by applying it to the original content and running mock tools.
+        Validates the modified code content by running mock tools.
         Args:
-            patch_script_str: The LibCST script string representing the patch.
-            target_file_path_str: String path of the file to be patched.
-            digester: RepositoryDigester instance to get original file content.
+            modified_code_content_str: The string content of the file AFTER the patch script has been applied.
+                                       If None, indicates a failure prior to validation (e.g. patch application error).
+            target_file_path_str: String path of the file that was patched (relative to project_root).
+            digester: RepositoryDigester instance (can be used by tools like Pytest for broader context).
             project_root: Path to the project root for context (e.g., for Pyright).
         Returns:
             A tuple: (is_valid: bool, error_message: Optional[str])
         """
-        print(f"\nValidator.validate_patch: Validating script for {target_file_path_str}.")
-        if patch_script_str is None:
-            print("  Validation failed: Patch script is None.")
-            return False, "Patch script is None."
+        print(f"\nValidator.validate_patch: Validating content for {target_file_path_str}.")
 
-        target_file_path = project_root / target_file_path_str # Assume target_file_path_str is relative to project_root
+        if modified_code_content_str is None:
+            print("  Validation failed: Input modified_code_content_str was None, possibly due to a patch application failure upstream.")
+            return False, "Input modified_code_content was None, possibly due to patch application failure."
+
+        # Ensure target_file_path is absolute for tools that might need it
+        target_file_path = project_root / target_file_path_str
         if not target_file_path.is_absolute():
              target_file_path = target_file_path.resolve()
 
-
-        original_content = digester.get_file_content(target_file_path)
-        if original_content is None:
-            # If the file doesn't exist, it might be a new file patch.
-            # For this mock, let's assume if original content is None, it's a new file.
-            # And the patch_script_str should then be treated as the full new content.
-            print(f"  Original content for {target_file_path} not found. Assuming new file scenario.")
-            original_content = "" # Treat as new file
-
-        # In a real scenario, _apply_patch_script would execute the LibCST script.
-        # The current mock _apply_patch_script just appends the script content as a comment.
-        # For validation tools to be meaningful, they need to run on the *result* of the script.
-        # Let's adjust the thinking for mock: if patch_script_str is a full file content (dev-provided),
-        # then _apply_patch_script should just return that.
-        # If patch_script_str is a LibCST script (agent-generated), then _apply_patch_script
-        # should ideally execute it.
-        # FOR THIS MOCK: We'll assume patch_script_str from agent is a full file content for simplicity of validation.
-        # This contradicts the agent's output of a "LibCST script string".
-        # This is a known tension in the current mock design.
-        # Let's proceed with the idea that validator needs the *intended final content*.
-        # The _apply_patch_script mock will be updated to reflect this more directly for now.
-
-        # If the patch_script_str is a LibCST script, this step is too simple.
-        # A real version would run the script using LibCST against original_content.
-        # For now, let's assume the "patch_script_str" IS the modified content FOR VALIDATION PURPOSES.
-        # This is a temporary simplification to make the mock validator work on some content.
-        # This means CollaborativeAgentGroup currently passes a LibCST script string here.
-        # Validator's _apply_patch_script mock needs to be smart or this needs adjustment.
-
-        # Let's refine _apply_patch_script's mock behavior slightly:
-        # If patch_script_str seems like a full Python module (e.g. starts with "import" or "def" or "class")
-        # then treat IT as the modified content. Otherwise, use the previous append behavior.
-        # This is still a heuristic.
-
-        # For the purpose of this subtask, we assume the 'patch_script_str' IS the new content.
-        # This is a simplification that will need to be addressed when LibCST execution is implemented.
-        # modified_content = self._apply_patch_script(original_content, patch_script_str)
-
-        # REVISED MOCK APPROACH for validate_patch:
-        # The `patch_script_str` is a LibCST Python *script*.
-        # The `_apply_patch_script` should *simulate* running this script.
-        # The tools then run on this *simulated output*.
-        modified_content = self._apply_patch_script(original_content, patch_script_str)
-
+        # The modified_code_content_str IS the content to validate. No script application here.
+        # The old _apply_patch_script method is no longer used by this method.
 
         all_errors: List[str] = []
 
-        # Run Tools (Placeholders)
-        ruff_errors = self._run_ruff(modified_content, target_file_path)
+        # Run Tools (Placeholders) on the provided modified_code_content_str
+        ruff_errors = self._run_ruff(modified_code_content_str, target_file_path)
         if ruff_errors: all_errors.append(ruff_errors)
 
-        pyright_errors = self._run_pyright(modified_content, target_file_path, project_root)
+        pyright_errors = self._run_pyright(modified_code_content_str, target_file_path, project_root)
         if pyright_errors: all_errors.append(pyright_errors)
 
-        black_diff_errors = self._run_black_diff(modified_content, target_file_path)
+        black_diff_errors = self._run_black_diff(modified_code_content_str, target_file_path)
         if black_diff_errors: all_errors.append(black_diff_errors)
 
-        # Pytest is more complex: it runs on the project state *after* the patch is (conceptually) applied.
-        # The modified_content is of the single target file. Pytest might test interactions.
-        # The mock _run_pytest takes target_file_path and digester to potentially access other files or project info.
-        pytest_errors = self._run_pytest(target_file_path, project_root, digester)
+        # Pytest runs on the project state. The modified_code_content_str represents the change
+        # to one file. A real pytest would run against the filesystem.
+        # The mock _run_pytest uses digester to potentially access other content if needed.
+        pytest_errors = self._run_pytest(target_file_path, project_root, digester) # target_file_path is the path of the modified file
         if pytest_errors: all_errors.append(pytest_errors)
 
         if not all_errors:
             print(f"  Validation successful for {target_file_path_str}.")
+            # The 'payload' (second element of tuple) is now the error string, so None for success.
             return True, None
         else:
             error_summary = "\n".join(all_errors)

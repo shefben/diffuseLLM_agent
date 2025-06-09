@@ -276,7 +276,7 @@ def get_deepseek_polished_json(cleaned_key_value_string: str, model_path: str, n
         error_msg = f"Error during GGUF model (polish pass) inference: {e}"; print(f"LLM_Interfacer Error: {error_msg}")
         return None
 
-def get_llm_code_fix_suggestion(model_path: str, original_code_script: str, error_traceback: str, phase_description: str, target_file: Optional[str], additional_context: Optional[Dict[str, Any]], n_gpu_layers: int = -1, max_tokens: int = 1024, temperature: float = 0.4, verbose: bool = False) -> Optional[str]:
+def get_llm_code_fix_suggestion(model_path: str, original_code_script: str, error_traceback: str, phase_description: str, target_file: Optional[str], additional_context: Optional[Dict[str, Any]], n_gpu_layers: int = -1, max_tokens: int = 2048, temperature: float = 0.4, verbose: bool = False) -> Optional[str]:
     if Llama is None:
         print("LLM_Interfacer Error: llama-cpp-python not installed. Cannot get LLM code fix suggestion.")
         return f"# Mock fix for error: {error_traceback[:100]}...\n# Original script had {len(original_code_script)} chars.\npass # LLM disabled - Apply actual fix here"
@@ -295,21 +295,71 @@ def get_llm_code_fix_suggestion(model_path: str, original_code_script: str, erro
     except Exception as e:
         print(f"LLM_Interfacer Error: Error loading LLM repair model from {resolved_model_path}: {e}")
         return f"# Mock fix due to model load error for: {error_traceback[:100]}...\npass"
-    prompt_parts = ["You are an expert Python programmer and code assistant, specialized in writing and debugging LibCST refactoring scripts.", f"The following LibCST script was intended to perform a refactoring operation but failed validation or execution.\nRefactoring Operation Description: {phase_description}\nTarget File for Refactoring: {target_file if target_file else 'N/A'}"]
+
+    # Construct the prompt for the LLM
+    # This structure should be clear for the LLM to understand distinct pieces of information.
+    prompt = f"""You are an expert Python programmer and code assistant, specialized in writing and debugging LibCST refactoring scripts.
+Your task is to revise the provided failing LibCST codemod script to address the specified error.
+
+**Error Traceback:**
+```text
+{error_traceback}
+```
+
+**Original LibCST Script that Failed:**
+```python
+{original_code_script}
+```
+
+**Context for the Refactoring Task:**
+- **Overall Goal:** {phase_description if phase_description else "Not specified."}
+- **Target File:** {target_file if target_file else "Not specified."}
+"""
+
     if additional_context:
         if 'style_profile' in additional_context and additional_context['style_profile']:
-            try: prompt_parts.append(f"Project Style Profile (relevant parts for context):\n{json.dumps(additional_context['style_profile'], indent=2)}")
-            except (TypeError, OverflowError) as json_e: prompt_parts.append(f"Project Style Profile (relevant parts for context): Error serializing - {json_e}")
+            try:
+                style_profile_str = json.dumps(additional_context['style_profile'], indent=2)
+                prompt += f"\n- **Project Style Profile (for context):**\n```json\n{style_profile_str}\n```\n"
+            except (TypeError, OverflowError) as json_e:
+                prompt += f"\n- **Project Style Profile (for context):** Error serializing - {json_e}\n"
+
         if 'code_snippets' in additional_context and additional_context['code_snippets']:
-            for fname, snippet in additional_context['code_snippets'].items(): prompt_parts.append(f"Relevant code snippet from '{fname}':\n```python\n{snippet}\n```")
-    prompt_parts.extend(["Original LibCST script that failed:\n```python", original_code_script, "```", "Validation Error Traceback or Description:\n```text", error_traceback, "```", "Please provide a revised version of the LibCST script that fixes the error. Output only the complete, revised Python script for the LibCST code. Do not add any explanations or markdown formatting before or after the script block."])
-    full_prompt = "\n\n".join(prompt_parts)
-    if verbose: print(f"LLM Code Fix Prompt (first 1000 chars):\n{full_prompt[:1000]}...")
-    else: print(f"LLM Code Fix Prompt (first 200 chars):\n{full_prompt[:200]}...")
+            snippets_str = ""
+            for fname, snippet in additional_context['code_snippets'].items():
+                snippets_str += f"  - Snippet from '{fname}':\n    ```python\n{snippet}\n    ```\n"
+            if snippets_str:
+                prompt += f"\n- **Relevant Code Snippets from Target File(s) (for context):**\n{snippets_str}"
+
+    prompt += """
+**Instructions:**
+Please output a new, complete, and syntactically correct Python script for the revised LibCST codemod that addresses the error.
+Focus on fixing the error indicated in the traceback in relation to the original LibCST script.
+Output ONLY the Python code for the LibCST script. Do not include explanations, apologies, or markdown formatting before or after the script block.
+Ensure the revised script is complete and runnable.
+
+**Revised LibCST Script:**
+```python
+""" # End of prompt, LLM should start its response with the script content.
+
+    if verbose: print(f"LLM Code Fix Prompt (first 1000 chars):\n{prompt[:1000]}...")
+    else: print(f"LLM Code Fix Prompt (first 200 chars):\n{prompt[:200]}...")
+
     try:
-        response = llm.create_chat_completion(prompt=full_prompt, max_tokens=max_tokens, temperature=temperature, stop=["```python\n", "\n```\n", "\n```"], echo=False) # Changed to create_chat_completion
-        suggested_script = response['choices'][0]['message']['content'].strip() # Adjusted for chat completion response
-        if suggested_script.startswith("```python"): suggested_script = suggested_script[len("```python"):].strip()
+        # Using create_completion as the prompt is now fully formed.
+        # Stop sequences are kept to try and ensure only the script block is returned.
+        response = llm.create_completion( # Changed from create_chat_completion back to create_completion
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=["```python\n", "\n```\n", "\n```", "\n```text"], # Added \n```text as a potential stop
+            echo=False
+        )
+        suggested_script = response['choices'][0]['text'].strip()
+
+        # Clean up potential ```python prefix or ``` suffix if LLM includes them despite stop tokens.
+        if suggested_script.startswith("```python"):
+            suggested_script = suggested_script[len("```python"):].strip()
         if suggested_script.startswith("```"): suggested_script = suggested_script[len("```"):].strip()
         if suggested_script.endswith("```"): suggested_script = suggested_script[:-len("```")].strip()
         return suggested_script
@@ -463,6 +513,74 @@ def get_llm_code_infill(
 
     except Exception as e_infer:
         print(f"LLM_Interfacer Error: Error during LLM code infill inference: {e_infer}")
+        return None
+
+
+def get_llm_polished_cst_script(
+    model_path: str,
+    prompt: str, # Specifically crafted prompt for polishing a CST script
+    verbose: bool = False,
+    n_gpu_layers: int = -1,
+    n_ctx: int = 4096,
+    max_tokens_for_polished_script: int = 2048, # Max tokens for the full polished script
+    temperature: float = 0.2 # Low temperature for precise edits
+) -> Optional[str]: # Returns raw LLM string output for the polished script
+    """
+    Polishes a LibCST script using a GGUF model based on the provided prompt.
+    """
+    if Llama is None:
+        print("LLM_Interfacer Error: LlamaCPP not installed, cannot perform CST script polishing.")
+        return None
+
+    resolved_model_path_str = model_path
+    is_placeholder_path = False
+    # Default to a general agent model if not specified or clearly a placeholder
+    if not model_path or model_path.endswith("placeholder_llm_agent.gguf") or model_path.endswith("placeholder_deepseek.gguf"):
+        resolved_model_path_str = "./models/placeholder_llm_agent.gguf" # Default model for general agent tasks
+        is_placeholder_path = True
+        print(f"LLM_Interfacer Warning: Using default model path '{resolved_model_path_str}' for CST script polishing (original path: '{model_path}').")
+
+    resolved_model_path = Path(resolved_model_path_str)
+    if not resolved_model_path.is_file():
+        error_msg = f"LLM_Interfacer Error: Model file not found at '{resolved_model_path}' for CST script polishing."
+        if is_placeholder_path:
+            error_msg += f" (This was determined to be a placeholder. Ensure '{resolved_model_path_str}' exists or provide a valid model path.)"
+        print(error_msg)
+        return None
+
+    try:
+        llm = Llama(
+            model_path=str(resolved_model_path),
+            n_gpu_layers=n_gpu_layers,
+            n_ctx=n_ctx,
+            verbose=verbose
+        )
+    except Exception as e_load:
+        print(f"LLM_Interfacer Error: Error loading GGUF model from '{resolved_model_path}' for CST script polishing: {e_load}")
+        return None
+
+    if verbose:
+        print(f"LLM_Interfacer: Polishing CST script with prompt (first 300 chars):\n{prompt[:300]}...")
+
+    try:
+        response = llm.create_completion(
+            prompt=prompt,
+            max_tokens=max_tokens_for_polished_script,
+            temperature=temperature,
+            echo=False
+        )
+
+        if response and response['choices'] and response['choices'][0]['text']:
+            polished_script_str = response['choices'][0]['text'].strip()
+            if verbose:
+                print(f"LLM_Interfacer: Raw polished script output from LLM (first 300 chars):\n{polished_script_str[:300]}...")
+            return polished_script_str
+        else:
+            print("LLM_Interfacer Warning: LLM returned no content for CST script polishing.")
+            return None
+
+    except Exception as e_infer:
+        print(f"LLM_Interfacer Error: Error during LLM CST script polishing inference: {e_infer}")
         return None
 
 # Main block for testing (commented out as per original structure)

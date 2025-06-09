@@ -96,13 +96,14 @@ class SignatureTrie:
         return False # FQN not found for that signature
 
 def generate_function_signature_string(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef, # Corrected type hint from ast.FunctionDef to Union[ast.FunctionDef, ast.AsyncFunctionDef] is implicitly handled by Python's dynamic typing, but for strictness could be Union. ast.FunctionDef is base for AsyncFunctionDef in terms of args structure.
     type_resolver: Callable[[ast.AST, str], Optional[str]],
+    class_fqn_prefix_for_method_name: Optional[str] = None,
 ) -> str:
     """
     Generates a canonical signature string for a function or method node.
     Example: "my_function(int,str,Optional[List[int]])->bool"
-             "my_method(MyClass,str,**Any)->Any" (param names excluded)
+             "ClassName.my_method(MyClass,str,**Any)->Any" (param names excluded, method name prefixed with class name)
 
     Args:
         func_node: The ast.FunctionDef or ast.AsyncFunctionDef node.
@@ -110,16 +111,24 @@ def generate_function_signature_string(
                        or the ast.Name/ast.Attribute node of a return annotation) and a
                        category hint (e.g., "parameter", "return_annotation"), and returns
                        its type string or None.
+        class_fqn_prefix_for_method_name: Optional string. If provided (e.g., "ClassName"),
+                                          it's prepended to the function name for methods.
+                                          This prefix should be the simple class name, not its full FQN.
     Returns:
         A canonical string representation of the function's signature.
     """
     param_type_strings: List[str] = []
     args_processed = False # To help decide where to put '*'
 
+    # Determine the effective function name (e.g., "ClassName.method" or "function_name")
+    effective_func_name = func_node.name
+    if class_fqn_prefix_for_method_name:
+        effective_func_name = f"{class_fqn_prefix_for_method_name}.{func_node.name}"
+
     # Positional-only arguments (Python 3.8+)
     if hasattr(func_node.args, 'posonlyargs') and func_node.args.posonlyargs:
         for arg_node in func_node.args.posonlyargs:
-            param_type = type_resolver(arg_node, f"{func_node.name}.{arg_node.arg}:parameter_posonly") or "Any"
+            param_type = type_resolver(arg_node, f"{effective_func_name}.{arg_node.arg}:parameter_posonly") or "Any" # Use effective_func_name
             param_type_strings.append(param_type)
         param_type_strings.append("/") # Add PEP 570 marker
         args_processed = True
@@ -127,37 +136,33 @@ def generate_function_signature_string(
     # Regular positional or keyword arguments
     if func_node.args.args:
         for arg_node in func_node.args.args:
-            param_type = type_resolver(arg_node, f"{func_node.name}.{arg_node.arg}:parameter") or "Any"
+            param_type = type_resolver(arg_node, f"{effective_func_name}.{arg_node.arg}:parameter") or "Any" # Use effective_func_name
             param_type_strings.append(param_type)
         args_processed = True
 
     # Vararg (*args)
     if func_node.args.vararg:
         if args_processed and not param_type_strings[-1] == "/":
-            # This case is complex: e.g. def foo(a, /, *args) vs def foo(a, *args)
-            # The '*' for varargs itself acts as a separator if there were previous args.
-            # If only posonlyargs ending with '/' were present, no explicit '*' needed before vararg name.
             pass # The '*' will be part of the vararg string itself.
 
         vararg_name = func_node.args.vararg.arg
         vararg_type_node = func_node.args.vararg.annotation
         vararg_type_str = "Any"
         if vararg_type_node:
-            vararg_type_str = type_resolver(vararg_type_node, f"{func_node.name}.*{vararg_name}:parameter_vararg_annotation") or "Any"
+            vararg_type_str = type_resolver(vararg_type_node, f"{effective_func_name}.*{vararg_name}:parameter_vararg_annotation") or "Any" # Use effective_func_name
 
-        param_type_strings.append(f"*{vararg_type_str}") # Store as *Type, not *name:Type
+        param_type_strings.append(f"*{vararg_type_str}")
         args_processed = True
 
 
     # Keyword-only arguments
     if func_node.args.kwonlyargs:
-        # Add '*' separator if not already implicitly there by *args or by / with no regular args
         if not func_node.args.vararg:
             if not param_type_strings or param_type_strings[-1] != "/":
                  param_type_strings.append("*")
 
         for arg_node in func_node.args.kwonlyargs:
-            param_type = type_resolver(arg_node, f"{func_node.name}.{arg_node.arg}:parameter_kwonly") or "Any"
+            param_type = type_resolver(arg_node, f"{effective_func_name}.{arg_node.arg}:parameter_kwonly") or "Any" # Use effective_func_name
             param_type_strings.append(param_type)
         args_processed = True
 
@@ -168,16 +173,16 @@ def generate_function_signature_string(
         kwarg_type_node = func_node.args.kwarg.annotation
         kwarg_type_str = "Any"
         if kwarg_type_node:
-            kwarg_type_str = type_resolver(kwarg_type_node, f"{func_node.name}.**{kwarg_name}:parameter_kwarg_annotation") or "Any"
+            kwarg_type_str = type_resolver(kwarg_type_node, f"{effective_func_name}.**{kwarg_name}:parameter_kwarg_annotation") or "Any" # Use effective_func_name
         param_type_strings.append(f"**{kwarg_type_str}")
 
 
     # Return type
     return_type_str = "Any"
     if func_node.returns:
-        return_type_str = type_resolver(func_node.returns, f"{func_node.name}:return_annotation") or "Any"
+        return_type_str = type_resolver(func_node.returns, f"{effective_func_name}:return_annotation") or "Any" # Use effective_func_name
 
-    return f"{func_node.name}({','.join(param_type_strings)})->{return_type_str}"
+    return f"{effective_func_name}({','.join(param_type_strings)})->{return_type_str}" # Use effective_func_name
 
 
 if __name__ == '__main__':
