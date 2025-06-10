@@ -10,11 +10,27 @@ except ImportError:
     print("Warning: joblib library not found. CorePredictor model persistence will be disabled.")
 
 class CorePredictor:
+    # Define at class level or in __init__. Let's do it here for clarity of definition.
+    # These should represent the typical 'name' field from an OperationSpec in a Phase.
+    TYPICAL_OPERATION_NAMES = sorted([
+        "add_function", "extract_method", "rename_variable", "add_decorator",
+        "add_import", "remove_import", "change_function_signature",
+        "modify_function_logic", "add_class", "modify_class_structure",
+        "delete_file", "create_file", "add_comments", "remove_comments",
+        "refactor_conditional", "optimize_loop", "replace_string_literal",
+        "format_code_style", # This might be too generic for core selection
+        "unknown_operation" # Fallback
+    ])
+
     def __init__(self, model_path: Optional[Path] = None, verbose: bool = False):
         self.verbose = verbose
         self.model_path = model_path if model_path else Path("./models/core_predictor.joblib")
         self.model: Any = None # To store the loaded scikit-learn model
         self.is_ready: bool = False
+
+        # Make KNOWN_OPERATION_TYPES an instance variable for easier access and potential modification per instance if ever needed.
+        self.KNOWN_OPERATION_TYPES = self.TYPICAL_OPERATION_NAMES
+
         self._load_model()
 
     def _load_model(self) -> None:
@@ -51,27 +67,37 @@ class CorePredictor:
             if self.verbose:
                 print(f"CorePredictor: Real model loaded. Using placeholder prediction logic for now. Features: {str(features)[:200]}...")
             # Fall through to placeholder if real prediction logic (feature transform + model.predict) isn't implemented yet
-            # For now, even if model is loaded, we use placeholder to ensure functionality.
+    def predict(self, features: Dict[str, Any]) -> Optional[str]:
+        if not self.is_ready or self.model is None:
+            if self.verbose: print("CorePredictor Info: Model not ready or not loaded. Using placeholder prediction logic.")
+            # Fall through to placeholder logic defined below
+        else: # Real model is loaded
+            feature_vector = self._transform_features(features)
+            if feature_vector is None:
+                if self.verbose: print("CorePredictor Error: Feature transformation failed. Cannot predict with real model, falling back to placeholder.")
+                # Fall through to placeholder logic
+            else:
+                try:
+                    # Scikit-learn models expect a 2D array: [n_samples, n_features]
+                    prediction = self.model.predict([feature_vector])
+                    predicted_label = str(prediction[0])
+                    if self.verbose: print(f"CorePredictor: Model prediction: '{predicted_label}' from features: {str(features)[:100]}...")
+                    return predicted_label
+                except Exception as e:
+                    print(f"CorePredictor Error: Real model prediction failed: {e}. Falling back to placeholder.")
+                    # Fall through to placeholder logic
 
-        if self.verbose and not (self.is_ready and self.model is not None) :
-            print(f"CorePredictor: Using placeholder prediction logic (model not loaded/ready or real prediction not implemented). Features: {str(features)[:200]}...")
+        # Fallback / Placeholder prediction logic
+        if self.verbose:
+            print(f"CorePredictor: Using placeholder prediction logic. Features: {str(features)[:200]}...")
 
-        # Example placeholder:
         op_type = features.get("operation_type", "")
-        # A more elaborate feature check could go here.
-        # e.g. num_input_files = features.get("num_target_files", 0)
-        # e.g. estimated_complexity = features.get("estimated_complexity_metric", 0)
 
         if "extract" in op_type.lower() or "refactor" in op_type.lower() or "rename" in op_type.lower():
             return "LLMCore"
         elif "add" in op_type.lower() or "create" in op_type.lower() or "implement" in op_type.lower():
-            # DiffusionCore is more for filling holes, LLMCore for scaffold of new things
-            # This decision might be more nuanced. For "add_function", scaffold is LLMCore.
-            # If "add" implies filling in a small, well-defined part, maybe DiffusionCore.
-            # Let's assume "add" could mean generating new structures.
-            return "LLMCore" # LLMCore often handles initial generation/scaffolding
+            return "LLMCore"
 
-        # Default random choice with a bias if no strong signal
         return random.choice(["LLMCore", "DiffusionCore", "LLMCore"])
 
     def train(self, training_data_path: Path, model_output_path: Optional[Path] = None) -> bool:
@@ -97,17 +123,49 @@ class CorePredictor:
     # Placeholder for feature transformation logic needed before calling a real model's predict
     # def _transform_features(self, features: Dict[str, Any]) -> Any:
     #     # This would convert the dict of features into a numerical vector
-    #     # suitable for a scikit-learn model. This is highly dependent on
-    #     # the chosen features and model type.
-    #     if self.verbose: print("CorePredictor: _transform_features() placeholder called.")
-    #     # Example: return [features.get("some_numeric_feature", 0)]
-    #     # This needs to match the feature set used during training.
-    #     # For now, returning a dummy vector that might match a simple LogisticRegression.
-    #     # The number of features must be consistent.
-    #     # E.g., op_type_encoded = 1 if "extract" in features.get("operation_type","").lower() else 0
-    #     #        complexity_val = float(features.get("code_complexity", 0.0))
-    #     # return [[op_type_encoded, complexity_val]] # Must be 2D array for scikit-learn
-    #     return [[1.0, 0.0, float(len(str(features.get("operation_type",""))))]] # Dummy
+    def _transform_features(self, features: Dict[str, Any]) -> Optional[List[float]]:
+        if not isinstance(features, dict):
+            if self.verbose: print("CorePredictor Error: Input features must be a dictionary.")
+            return None
+
+        feature_vector: List[float] = []
+
+        # 1. One-hot encode 'operation_type'
+        op_type = features.get("operation_type", "unknown_operation")
+        if op_type not in self.KNOWN_OPERATION_TYPES:
+            op_type = "unknown_operation"
+        for known_op in self.KNOWN_OPERATION_TYPES:
+            feature_vector.append(1.0 if op_type == known_op else 0.0)
+
+        # 2. Numerical features (with defaults and simple scaling/passthrough)
+        # These are conceptual features. Actual extraction from phase_ctx/context_data happens elsewhere.
+
+        # Example: Number of lines in the primary code snippet being affected (conceptual)
+        # Assuming this would be pre-calculated and passed in `features` if used.
+        num_input_code_lines = float(features.get("num_input_code_lines", 0))
+        feature_vector.append(min(num_input_code_lines / 100.0, 5.0)) # Cap at 5 (e.g. 500 lines)
+
+        # Example: Number of symbols targeted by the operation (conceptual)
+        num_target_symbols = float(features.get("num_target_symbols", 0))
+        feature_vector.append(min(num_target_symbols / 10.0, 5.0)) # Cap at 5 (e.g. 50 symbols)
+
+        # Example: Number of parameters in the operation spec (conceptual)
+        # Assuming 'operation_parameters' is a dict passed in features
+        operation_params = features.get("operation_parameters", {})
+        num_parameters_in_op = float(len(operation_params) if isinstance(operation_params, dict) else 0)
+        feature_vector.append(min(num_parameters_in_op / 5.0, 3.0)) # Cap at 3 (e.g. 15 params)
+
+        # Example: A boolean feature (conceptual)
+        # is_multi_file_operation = 1.0 if features.get("is_multi_file", False) else 0.0
+        # feature_vector.append(is_multi_file_operation)
+
+        if self.verbose: print(f"CorePredictor: Transformed features to vector (length {len(feature_vector)}): {str(feature_vector)[:200]}...")
+
+        # Ensure the number of features matches what a trained model would expect.
+        # This is a placeholder; a real model would have a fixed feature set size.
+        # If self.model is trained, it might have n_features_in_ or similar.
+        # For now, this is flexible.
+        return feature_vector
 
 
 if __name__ == '__main__':
@@ -118,15 +176,32 @@ if __name__ == '__main__':
     Path("./models").mkdir(parents=True, exist_ok=True)
 
     predictor_no_model = CorePredictor(model_path=Path("./models/non_existent_predictor.joblib"), verbose=True)
-    sample_features_1 = {"operation_type": "add_function", "code_complexity": 10, "num_target_files": 1}
+
+    # Updated sample features to include conceptual keys used in _transform_features
+    sample_features_1 = {
+        "operation_type": "add_function",
+        "num_input_code_lines": 50,
+        "num_target_symbols": 1,
+        "operation_parameters": {"name": "new_func", "params": "x, y"} # 2 params
+    }
     prediction1 = predictor_no_model.predict(sample_features_1)
     print(f"Prediction for features_1 ({str(sample_features_1)[:100]}...): {prediction1}")
 
-    sample_features_2 = {"operation_type": "extract_method", "file_type": ".py", "estimated_complexity_metric": 5}
+    sample_features_2 = {
+        "operation_type": "extract_method",
+        "num_input_code_lines": 120,
+        "num_target_symbols": 3,
+        "operation_parameters": {"start_line": 10, "end_line": 25, "new_name": "extracted"} # 3 params
+    }
     prediction2 = predictor_no_model.predict(sample_features_2)
     print(f"Prediction for features_2 ({str(sample_features_2)[:100]}...): {prediction2}")
 
-    sample_features_3 = {"operation_type": "generic_edit", "description_length": 150}
+    sample_features_3 = { # Test fallback for unknown operation_type
+        "operation_type": "super_specific_custom_op",
+        "num_input_code_lines": 10,
+        "num_target_symbols": 0,
+        "operation_parameters": {}
+    }
     prediction3 = predictor_no_model.predict(sample_features_3)
     print(f"Prediction for features_3 ({str(sample_features_3)[:100]}...): {prediction3}")
 

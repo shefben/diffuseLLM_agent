@@ -225,6 +225,85 @@ def get_divot5_refined_output(code_snippet: str, raw_fingerprint_dict: Dict[str,
     except Exception as e:
         print(f"LLM_Interfacer Error: Error during DivoT5 model inference: {e}"); return None
 
+def get_divot5_code_infill(
+    model_path: str,
+    prompt: str,
+    verbose: bool = False,
+    device_str: Optional[str] = None,
+    max_length_infill: int = 256,
+    num_beams_infill: int = 3,
+    temperature_infill: float = 0.5
+) -> Optional[str]:
+    """
+    Performs code in-filling using a DivoT5 model.
+    The prompt should be formatted according to the specific DivoT5 FIM model's requirements
+    (e.g., using special tokens like <PREFIX>, <SUFFIX>, <MIDDLE>).
+    """
+    if T5ForConditionalGeneration is None or T5TokenizerFast is None or torch is None:
+        print("LLM_Interfacer Error: Transformers/PyTorch not installed. Cannot use DivoT5 for code infill.")
+        return None
+
+    resolved_model_path_str = model_path
+    is_placeholder_path = False
+    default_placeholder = "./models/placeholder_divot5_infill_model/"
+
+    if not model_path or model_path == "path/to/your/divot5_infill_model_dir" or model_path.endswith("placeholder_divot5_infill_model/"):
+        resolved_model_path_str = default_placeholder
+        is_placeholder_path = True
+        print(f"LLM_Interfacer Warning: DivoT5 infill model path is a placeholder or not provided. Using standard placeholder: '{resolved_model_path_str}'.")
+
+    resolved_model_path = Path(resolved_model_path_str)
+    if not resolved_model_path.is_dir():
+        error_msg = f"DivoT5 infill model directory does not exist at resolved path: {resolved_model_path}"
+        if is_placeholder_path:
+            error_msg += f" (This is a placeholder path. Ensure '{default_placeholder}' exists or provide a valid model path.)"
+        print(f"LLM_Interfacer Error: {error_msg}")
+        return None
+
+    device = device_str if device_str else ("cuda" if torch.cuda.is_available() else "cpu")
+    log_prefix = "LLM_Interfacer (DivoT5 Infill):"
+
+    if verbose: print(f"{log_prefix} Attempting to load model from {resolved_model_path} onto device: {device}")
+    else: print(f"{log_prefix} Loading model from {resolved_model_path}...")
+
+    try:
+        tokenizer = T5TokenizerFast.from_pretrained(str(resolved_model_path))
+        model = T5ForConditionalGeneration.from_pretrained(str(resolved_model_path)).to(device)
+        model.eval()
+    except Exception as e_load:
+        print(f"{log_prefix} Error: Failed to load DivoT5 infill model from {resolved_model_path}: {e_load}")
+        return None
+
+    if verbose: print(f"{log_prefix} Prompt for infill (first 300 chars):\n{prompt[:300]}...")
+
+    try:
+        # Max_length for input tokenization; DivoT5 typically handles up to 1024 or 2048.
+        # This should be long enough for prefix + suffix context.
+        inputs = tokenizer(prompt, return_tensors="pt", max_length=1024, truncation=True, padding="longest").to(device)
+
+        outputs = model.generate(
+            inputs.input_ids,
+            max_length=max_length_infill, # Max length of the *generated* infill part
+            num_beams=num_beams_infill,
+            temperature=temperature_infill,
+            early_stopping=True
+        )
+
+        if outputs is not None and len(outputs) > 0:
+            infilled_code = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+            if verbose: print(f"{log_prefix} Raw infilled output: '{infilled_code}'")
+            if not infilled_code: # Check if the decoded string is empty
+                 print(f"{log_prefix} Warning: DivoT5 infill model returned an empty string after decoding.")
+                 return None # Treat empty string as failure to infill
+            return infilled_code
+        else:
+            print(f"{log_prefix} Warning: DivoT5 infill model returned no output or unexpected output structure.")
+            return None
+
+    except Exception as e_infer:
+        print(f"{log_prefix} Error: Error during DivoT5 infill model inference: {e_infer}")
+        return None
+
 JSON_FINGERPRINT_GRAMMAR_STR = r'''
 root   ::= object
 value  ::= object | array | string | number | boolean | "null"
@@ -706,3 +785,33 @@ def get_llm_polished_cst_script(
 #         print(f"LLM Infill Output (from __main__):\n{infill_output}")
 #     else:
 #         print("LLM Code Infill (from __main__): Failed to get output.")
+
+#     # Test get_divot5_code_infill
+#     main_divot5_infill_model_path = "./models/placeholder_divot5_infill_model/" # Example path
+#     print("\n--- Testing DivoT5 Code Infill (from __main__) ---")
+#     # Example FIM prompt - actual format depends on the DivoT5 FIM model training
+#     # This is a common format: <PREFIX_FILE_PATH>path/to/file.py<PREFIX_BEFORE_CURSOR>def foo():\n    print("hello")\n <SUFFIX_AFTER_CURSOR>\n    print("world")<MIDDLE>
+#     # Or a simpler natural language + context:
+#     mock_divot5_infill_prompt = """Fill in the missing Python code.
+# Context: We are trying to complete a function that prints two messages.
+# File Path: example/test.py
+# Code before missing part:
+# ```python
+# def my_incomplete_function():
+#     print("Starting...")
+# ```
+# Code after missing part:
+# ```python
+#     print("Finished.")
+# ```
+# Fill in the middle part:"""
+
+#     divot5_infill_output = get_divot5_code_infill(
+#         model_path=main_divot5_infill_model_path,
+#         prompt=mock_divot5_infill_prompt,
+#         verbose=True
+#     )
+#     if divot5_infill_output:
+#         print(f"DivoT5 Infill Output (from __main__):\n{divot5_infill_output}")
+#     else:
+#         print("DivoT5 Code Infill (from __main__): Failed to get output (this is expected if placeholder model/path is used).")
