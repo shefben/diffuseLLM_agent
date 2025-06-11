@@ -8,32 +8,41 @@ import re # For parsing LLM scaffold output (already present)
 # Attempt to import the new LLM interfacer function
 try:
     from src.profiler.llm_interfacer import get_llm_code_fix_suggestion, get_llm_cst_scaffold, get_llm_polished_cst_script
+    from src.utils.config_loader import DEFAULT_APP_CONFIG # For default model paths
 except ImportError:
     get_llm_code_fix_suggestion = None
     get_llm_cst_scaffold = None
     get_llm_polished_cst_script = None
-    print("LLMCore Warning: Failed to import one or more LLM interfacer functions (get_llm_code_fix_suggestion, get_llm_cst_scaffold, get_llm_polished_cst_script). Related LLM capabilities will be disabled.")
+    DEFAULT_APP_CONFIG = {"models": {"agent_llm_gguf": "./models/placeholder_llm_agent.gguf"}} # Basic fallback
+    print("LLMCore Warning: Failed to import one or more LLM interfacer functions or DEFAULT_APP_CONFIG. Related LLM capabilities will be disabled or use basic fallbacks.")
 
 
 class LLMCore:
     def __init__(self,
+                 app_config: Dict[str, Any],
                  style_profile: Dict[str, Any],
-                 naming_conventions_db_path: Path,
-                 config: Optional[Dict[str, Any]] = None,
-                 llm_model_path: Optional[str] = None): # New parameter
+                 naming_conventions_db_path: Path
+                 ):
         """
         Initializes the LLMCore.
         Args:
+            app_config: The main application configuration dictionary.
             style_profile: Dictionary containing style profile information.
             naming_conventions_db_path: Path to the naming conventions database.
-            config: Optional dictionary for LLM core specific configurations.
-            llm_model_path: Optional path to GGUF model for repairs.
         """
+        self.app_config = app_config
         self.style_profile = style_profile
         self.naming_conventions_db_path = naming_conventions_db_path
-        self.config = config if config else {}
-        self.llm_model_path = llm_model_path # Store new parameter
-        print(f"LLMCore initialized with style_profile, naming_conventions_db_path: {naming_conventions_db_path}, config: {self.config}, llm_model_path: {self.llm_model_path}")
+
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
+
+        default_agent_llm_path = DEFAULT_APP_CONFIG.get("models", {}).get("agent_llm_gguf", "./models/placeholder_llm_agent.gguf")
+        self.llm_model_path = self.app_config.get("models", {}).get("agent_llm_gguf", default_agent_llm_path)
+
+        if self.verbose:
+            print(f"LLMCore initialized. Verbose: {self.verbose}, Model Path: {self.llm_model_path}")
+            print(f"  Style profile keys: {list(self.style_profile.keys())}")
+            print(f"  Naming conventions DB: {self.naming_conventions_db_path}")
 
     def generate_scaffold_patch(self, context_data: Dict[str, Any]) -> Tuple[Optional[str], Optional[List[str]]]:
         """
@@ -43,11 +52,17 @@ class LLMCore:
         Returns:
             A tuple (cst_script_str, edit_summary_list), or (None, None) on failure.
         """
-        print(f"LLMCore.generate_scaffold_patch called. Context keys: {list(context_data.keys())}")
+        if self.verbose: print(f"LLMCore.generate_scaffold_patch called. Context keys: {list(context_data.keys())}")
 
         if get_llm_cst_scaffold is None or not self.llm_model_path:
             print("LLMCore Error: get_llm_cst_scaffold is not available or llm_model_path not configured. Cannot generate scaffold.")
             return None, None
+
+        llm_params = self.app_config.get("llm_params", {})
+        # General verbosity for LLMCore's own prints is self.verbose
+        # llm_interfacer_verbose is for the get_llm_... function's internal logging
+        llm_interfacer_verbose = self.app_config.get("general", {}).get("verbose_llm_calls", self.verbose)
+
 
         phase_description = context_data.get("phase_description", "N/A")
         target_file = str(context_data.get("phase_target_file", "N/A")) # Ensure string for prompt
@@ -94,8 +109,8 @@ Relevant Code Snippets:
 {json.dumps(code_snippets, indent=2)}
 
 Style Profile (for generated code within the CST script, if applicable, and for the modification itself):
-Indent Width: {style_profile.get('indent_size', style_profile.get('tab_width', 4))}
-Quote Style: {style_profile.get('quote_style', 'double')}
+Indent Width: {style_profile.get('indent_size', style_profile.get('tab_width', DEFAULT_APP_CONFIG.get('style_profile_defaults', {}).get('indent_size', 4)))}
+Quote Style: {style_profile.get('quote_style', DEFAULT_APP_CONFIG.get('style_profile_defaults', {}).get('quote_style', 'double'))}
 
 [INSTRUCTIONS]
 - Ensure the script is syntactically correct Python and uses LibCST correctly.
@@ -103,25 +118,29 @@ Quote Style: {style_profile.get('quote_style', 'double')}
 - Use placeholders like '__HOLE_0__' for complex logic within the generated code segments in the CST script.
 - Ensure the edit summary is concise and uses the specified format.
 """
-        if self.config.get("verbose_prompts", False): # Control verbosity of prompt logging
+        if llm_params.get("verbose_prompts", self.verbose): # Control verbosity of prompt logging
             print("\n--- LLMCore: Constructed Prompt for Scaffold Generation ---")
             print(prompt)
             print("--- End of Prompt ---\n")
         else:
-            print("\n--- LLMCore: Constructed Prompt for Scaffold Generation (summary shown) ---")
-            print(prompt[:300] + "...")
-            print("--- End of Prompt Summary ---\n")
+            if self.verbose: print("\n--- LLMCore: Constructed Prompt for Scaffold Generation (summary shown) ---")
+            if self.verbose: print(prompt[:300] + "...")
+            if self.verbose: print("--- End of Prompt Summary ---\n")
 
+        scaffold_model_path = self.llm_model_path
+        scaffold_n_gpu_layers = llm_params.get("n_gpu_layers_default", DEFAULT_APP_CONFIG["llm_params"]["n_gpu_layers_default"])
+        scaffold_n_ctx = llm_params.get("n_ctx_default", DEFAULT_APP_CONFIG["llm_params"]["n_ctx_default"])
+        scaffold_max_tokens = llm_params.get("agent_scaffold_max_tokens", DEFAULT_APP_CONFIG["llm_params"]["agent_scaffold_max_tokens"])
+        scaffold_temp = llm_params.get("agent_scaffold_temp", llm_params.get("temperature_default", DEFAULT_APP_CONFIG["llm_params"]["temperature_default"]))
 
-        llm_params = self.config.get("llm_scaffold_params", {})
         raw_llm_output = get_llm_cst_scaffold(
-            model_path=self.llm_model_path,
+            model_path=scaffold_model_path,
             prompt=prompt,
-            verbose=self.config.get("llm_verbose", False),
-            n_gpu_layers=self.config.get("llm_n_gpu_layers", -1),
-            n_ctx=llm_params.get("n_ctx", 4096),
-            max_tokens_for_scaffold=llm_params.get("max_tokens", 2048),
-            temperature=llm_params.get("temperature", 0.3)
+            verbose=llm_interfacer_verbose, # For the interfacer function's logging
+            n_gpu_layers=scaffold_n_gpu_layers,
+            n_ctx=scaffold_n_ctx,
+            max_tokens_for_scaffold=scaffold_max_tokens,
+            temperature=scaffold_temp
         )
 
         if raw_llm_output is None:
@@ -214,17 +233,18 @@ Quote Style: {style_profile.get('quote_style', 'double')}
         Returns:
             The polished LibCST script string.
         """
-        print(f"LLMCore.polish_patch called. Context keys: {list(context_data.keys())}")
+        if self.verbose: print(f"LLMCore.polish_patch called. Context keys: {list(context_data.keys())}")
 
         if not completed_patch_script:
-            print("LLMCore.polish_patch Warning: Received None or empty completed_patch_script. Returning as is.")
+            if self.verbose: print("LLMCore.polish_patch Warning: Received None or empty completed_patch_script. Returning as is.")
             return completed_patch_script
 
+        llm_params = self.app_config.get("llm_params", {})
+        llm_interfacer_verbose = self.app_config.get("general", {}).get("verbose_llm_calls", self.verbose)
+
         # Extract relevant information from context_data
-        style_profile = context_data.get("style_profile", {})
-        naming_conventions_db_path = context_data.get("naming_conventions_db_path") # Path object
-        # repository_digester = context_data.get("repository_digester") # Digester instance
-        # target_file = context_data.get("phase_target_file")
+        style_profile = context_data.get("style_profile", self.style_profile) # Use instance style_profile as fallback
+        naming_conventions_db_path = context_data.get("naming_conventions_db_path", self.naming_conventions_db_path) # Use instance path as fallback
 
         prompt = f"""[LLM TASK: Polish LibCST Python Edit Script]
 
@@ -259,26 +279,33 @@ Instructions for Polishing:
 
 Begin Polished Script:
 """
-        print("\n--- LLMCore: Constructed Prompt for Polishing Pass ---")
-        print(prompt[:1000] + "..." if len(prompt) > 1000 else prompt) # Print snippet if too long
-        print("--- End of Polishing Prompt ---\n")
+        # This prompt is complex, so verbose printing is more likely useful
+        if llm_params.get("verbose_prompts", self.verbose):
+            print("\n--- LLMCore: Constructed Prompt for Polishing Pass ---")
+            print(prompt)
+            print("--- End of Polishing Prompt ---\n")
+        else:
+            if self.verbose: print("\n--- LLMCore: Constructed Prompt for Polishing Pass (summary shown) ---")
+            if self.verbose: print(prompt[:500] + "...")
+            if self.verbose: print("--- End of Polishing Prompt Summary ---\n")
 
         if get_llm_polished_cst_script is None:
-            print("LLMCore Warning: get_llm_polished_cst_script not available. Skipping real LLM polishing.")
+            if self.verbose: print("LLMCore Warning: get_llm_polished_cst_script not available. Skipping real LLM polishing.")
             return completed_patch_script
 
-        # Determine model path for polishing: uses llm_model_path from common_agent_llm_config passed by PhasePlanner
-        # or falls back to self.llm_model_path (originally intended for repair GGUF) if not in config.
-        polishing_model_path = self.config.get("llm_model_path", self.llm_model_path)
-        if not polishing_model_path:
-            print("LLMCore Warning: No model path configured for polishing ('llm_model_path' in config or as direct param). Skipping real LLM polishing.")
+        polishing_model_path = self.llm_model_path # Uses the main agent LLM
+        if not polishing_model_path: # Should be caught by __init__ or earlier checks
+            print("LLMCore Warning: No model path configured for polishing. Skipping real LLM polishing.")
             return completed_patch_script
 
-        # Extract relevant information from context_data
-        style_profile = context_data.get("style_profile", {})
-        naming_conventions_db_path = context_data.get("naming_conventions_db_path") # Path object
-        # Type environment / digester access is conceptual for the prompt, not directly used here to query types.
+        # Parameters for the call to get_llm_polished_cst_script
+        polish_n_gpu_layers = llm_params.get("n_gpu_layers_default", DEFAULT_APP_CONFIG["llm_params"]["n_gpu_layers_default"])
+        polish_n_ctx = llm_params.get("n_ctx_default", DEFAULT_APP_CONFIG["llm_params"]["n_ctx_default"])
+        polish_max_tokens = llm_params.get("agent_polish_max_tokens", DEFAULT_APP_CONFIG["llm_params"]["agent_polish_max_tokens"])
+        polish_temp = llm_params.get("agent_polish_temp", llm_params.get("temperature_default", DEFAULT_APP_CONFIG["llm_params"]["temperature_default"]))
 
+        # Re-construct the prompt for polishing with potentially updated context_data values
+        # (style_profile and naming_conventions_db_path are now correctly sourced before this point)
         prompt = f"""[TASK DESCRIPTION]
 You are an expert Python programmer specializing in reviewing and polishing LibCST (Concrete Syntax Tree) refactoring scripts.
 Your goal is to refine the provided LibCST script for clarity, correctness, and adherence to coding conventions.
@@ -312,38 +339,20 @@ Your goal is to refine the provided LibCST script for clarity, correctness, and 
 
 [POLISHED LibCST SCRIPT]
 ```python
-""" # Prompt asks for the script to start after this line, assuming LLM will complete the ```python block.
-
-        if self.config.get("verbose_prompts", self.config.get("llm_verbose", False)):
-            print("\n--- LLMCore: Constructed Prompt for Polishing Pass ---")
-            print(prompt)
-            print("--- End of Polishing Prompt ---\n")
-        else:
-            print("\n--- LLMCore: Constructed Prompt for Polishing Pass (summary shown) ---")
-            print(prompt[:500] + "...") # Print a larger snippet for polish prompt
-            print("--- End of Polishing Prompt Summary ---\n")
-
-        # Get LLM parameters from config, with defaults suitable for polishing
-        llm_params = self.config.get("llm_polish_params", {})
-        max_tokens = llm_params.get("max_tokens", self.config.get("max_tokens_for_polished_script", 2048))
-        temperature = llm_params.get("temperature", self.config.get("temperature_for_polish", 0.2))
-        n_gpu_layers = self.config.get("llm_n_gpu_layers", -1)
-        n_ctx = llm_params.get("n_ctx", self.config.get("n_ctx", 4096))
-        verbose_llm = self.config.get("llm_verbose", False)
-
+"""
 
         llm_output_string = get_llm_polished_cst_script(
             model_path=polishing_model_path,
             prompt=prompt,
-            verbose=verbose_llm,
-            n_gpu_layers=n_gpu_layers,
-            n_ctx=n_ctx,
-            max_tokens_for_polished_script=max_tokens,
-            temperature=temperature
+            verbose=llm_interfacer_verbose,
+            n_gpu_layers=polish_n_gpu_layers,
+            n_ctx=polish_n_ctx,
+            max_tokens_for_polished_script=polish_max_tokens,
+            temperature=polish_temp
         )
 
         if not llm_output_string: # Handles None or empty string
-            print("LLMCore Warning: LLM polishing returned no content. Proceeding with the unpolished script.")
+            if self.verbose: print("LLMCore Warning: LLM polishing returned no content. Proceeding with the unpolished script.")
             return completed_patch_script
 
         # LLM might sometimes include the closing ``` in its output.
@@ -355,13 +364,13 @@ Your goal is to refine the provided LibCST script for clarity, correctness, and 
         # Basic validation of the polished script
         try:
             ast.parse(polished_script)
-            print(f"LLMCore: Polished script is valid Python syntax. Length: {len(polished_script)}.")
+            if self.verbose: print(f"LLMCore: Polished script is valid Python syntax. Length: {len(polished_script)}.")
         except SyntaxError as e_syn:
             print(f"LLMCore Error: Polished script has syntax errors: {e_syn}. Returning original script.")
-            if verbose_llm: print(f"Problematic polished script:\n{polished_script}")
+            if llm_interfacer_verbose: print(f"Problematic polished script:\n{polished_script}")
             return completed_patch_script
 
-        print(f"LLMCore: Polishing complete. Returning script (len: {len(polished_script)}).")
+        if self.verbose: print(f"LLMCore: Polishing complete. Returning script (len: {len(polished_script)}).")
         return polished_script
 
     def propose_repair_diff(self, traceback_str: str, context_data: Dict[str, Any]) -> Optional[str]: # Return type changed to Optional[str] for script
@@ -373,10 +382,13 @@ Your goal is to refine the provided LibCST script for clarity, correctness, and 
         Returns:
             A mock repair script string (or None).
         """
-        print(f"LLMCore.propose_repair_diff called with traceback: '{traceback_str}'. Context keys: {list(context_data.keys())}")
+        if self.verbose: print(f"LLMCore.propose_repair_diff called with traceback: '{traceback_str}'. Context keys: {list(context_data.keys())}")
+
+        llm_params = self.app_config.get("llm_params", {})
+        llm_interfacer_verbose = self.app_config.get("general", {}).get("verbose_llm_calls", self.verbose)
 
         if "DUPLICATE_DETECTED: REUSE_EXISTING_HELPER" in traceback_str:
-            print("LLMCore: Received DUPLICATE_DETECTED. Attempting to generate a patch that reuses existing helper.")
+            if self.verbose: print("LLMCore: Received DUPLICATE_DETECTED. Attempting to generate a patch that reuses existing helper.")
             target_file = context_data.get("phase_target_file", "unknown_target.py")
             original_planned_func_name = context_data.get("phase_parameters", {}).get("function_name", "original_planned_function")
 
@@ -397,55 +409,59 @@ class ReuseHelperInsteadCommand(cst.VisitorBasedCodemodCommand):
             return mock_reuse_script
 
         # Generic error handling using LLM if model path is configured
-        if not self.llm_model_path or get_llm_code_fix_suggestion is None:
-            print("LLMCore Warning: LLM model path not configured or get_llm_code_fix_suggestion not available. Falling back to generic mock fix for other errors.")
-            if "SyntaxError" in traceback_str: # Keep basic syntax error mock as fallback
-                print("LLMCore: Proposing a generic syntax fix (fallback).")
+        # Use the specific repair_llm_gguf if defined, else fallback to agent_llm_gguf
+        repair_model_path = self.app_config.get("models", {}).get("repair_llm_gguf", self.llm_model_path)
+
+        if not repair_model_path or get_llm_code_fix_suggestion is None:
+            if self.verbose: print("LLMCore Warning: LLM repair model path not configured or get_llm_code_fix_suggestion not available. Falling back to generic mock fix for other errors.")
+            if "SyntaxError" in traceback_str:
+                if self.verbose: print("LLMCore: Proposing a generic syntax fix (fallback).")
                 return f"# Mock syntax repair for: {traceback_str[:100]}\nimport libcst as cst\nclass MinimalSyntaxFix(cst.VisitorBasedCodemodCommand):\n    pass"
             return f"# LLM model path not configured. Generic mock repair for: {traceback_str[:100]}"
 
-        print(f"LLMCore: Attempting LLM-based repair for traceback: {traceback_str[:200]}...")
+        if self.verbose: print(f"LLMCore: Attempting LLM-based repair for traceback: {traceback_str[:200]}... using model {repair_model_path}")
 
         current_failed_script_from_context = context_data.get('current_patch_candidate')
         if isinstance(current_failed_script_from_context, str) and current_failed_script_from_context.strip():
             current_failed_script = current_failed_script_from_context
-        elif current_failed_script_from_context is not None: # It's not a string or it's an empty string
-            current_failed_script = str(current_failed_script_from_context) # Convert to string if not None
-            if not current_failed_script.strip(): # If empty after conversion
+        elif current_failed_script_from_context is not None:
+            current_failed_script = str(current_failed_script_from_context)
+            if not current_failed_script.strip():
                  current_failed_script = "# Original script was empty or whitespace."
-        else: # It was None
+        else:
             current_failed_script = "# Original script was not provided in context_data['current_patch_candidate']."
-            print("LLMCore Warning: 'current_patch_candidate' not found or is None in context_data for repair.")
-
+            if self.verbose: print("LLMCore Warning: 'current_patch_candidate' not found or is None in context_data for repair.")
 
         phase_description = context_data.get("phase_description", "N/A")
         target_file = context_data.get("phase_target_file")
 
-        # Prepare additional context for the fix suggestion more carefully
         additional_llm_context = {
-            "style_profile": context_data.get("style_profile"),
+            "style_profile": context_data.get("style_profile", self.style_profile),
             "code_snippets": context_data.get("retrieved_code_snippets")
-            # Avoid passing the whole digester or complex objects like handles directly to LLM prompt
         }
 
+        repair_n_gpu_layers = llm_params.get("agent_repair_n_gpu_layers", llm_params.get("n_gpu_layers_default", DEFAULT_APP_CONFIG["llm_params"]["n_gpu_layers_default"]))
+        repair_n_ctx = llm_params.get("agent_repair_n_ctx", llm_params.get("n_ctx_default", DEFAULT_APP_CONFIG["llm_params"]["n_ctx_default"]))
+        repair_max_tokens = llm_params.get("agent_repair_max_tokens", DEFAULT_APP_CONFIG["llm_params"]["agent_repair_max_tokens"])
+        repair_temp = llm_params.get("agent_repair_temp", llm_params.get("temperature_default", DEFAULT_APP_CONFIG["llm_params"]["temperature_default"]))
+
         suggested_fix_script = get_llm_code_fix_suggestion(
-            model_path=self.llm_model_path,
+            model_path=repair_model_path,
             original_code_script=current_failed_script,
             error_traceback=traceback_str,
             phase_description=phase_description,
             target_file=target_file,
             additional_context=additional_llm_context,
-            # n_gpu_layers, max_tokens, temperature can be sourced from self.config if needed
-            n_gpu_layers=self.config.get("llm_repair_n_gpu_layers", self.config.get("llm_n_gpu_layers", -1)), # Fallback to common n_gpu_layers
-            max_tokens=self.config.get("llm_repair_max_tokens", self.config.get("max_tokens_for_fix", 2048)), # Increased default idea, get from config
-            temperature=self.config.get("llm_repair_temperature", self.config.get("temperature_for_fix", 0.3)), # Lower temp for corrective task
-            verbose=self.config.get("llm_repair_verbose", self.config.get("llm_verbose", False)) # Fallback to common verbose
+            n_gpu_layers=repair_n_gpu_layers,
+            n_ctx=repair_n_ctx,
+            max_tokens=repair_max_tokens,
+            temperature=repair_temp,
+            verbose=llm_interfacer_verbose
         )
 
         if suggested_fix_script:
-            print(f"LLMCore: LLM suggested a fix script (len: {len(suggested_fix_script)}).")
-            # print(f"  Suggested fix script preview:\n{suggested_fix_script[:300]}...") # For debugging
+            if self.verbose: print(f"LLMCore: LLM suggested a fix script (len: {len(suggested_fix_script)}).")
         else:
-            print("LLMCore: LLM did not return a suggestion. Returning None.")
+            if self.verbose: print("LLMCore: LLM did not return a suggestion. Returning None.")
 
         return suggested_fix_script

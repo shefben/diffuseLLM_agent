@@ -15,45 +15,50 @@ if TYPE_CHECKING:
 
 class CollaborativeAgentGroup:
     def __init__(self,
+                 app_config: Dict[str, Any],
+                 digester: 'RepositoryDigester', # Added digester
                  style_profile: Dict[str, Any],
                  naming_conventions_db_path: Path,
-                 validator_instance: 'Validator', # New parameter
-                 llm_core_config: Optional[Dict[str, Any]] = None,
-                 diffusion_core_config: Optional[Dict[str, Any]] = None,
-                 llm_model_path: Optional[str] = None
+                 validator_instance: 'Validator'
                  ):
         """
         Initializes the CollaborativeAgentGroup.
         Args:
+            app_config: The main application configuration dictionary.
+            digester: An instance of RepositoryDigester.
             style_profile: Dictionary containing style profile information.
             naming_conventions_db_path: Path to the naming conventions database.
             validator_instance: An instance of the Validator class.
-            llm_core_config: Optional configuration for LLMCore.
-            diffusion_core_config: Optional configuration for DiffusionCore.
-            llm_model_path: Optional path to GGUF model for LLMCore repairs.
         """
+        self.app_config = app_config
+        self.digester = digester # Store digester instance, will also be passed in run()
         self.style_profile = style_profile
         self.naming_conventions_db_path = naming_conventions_db_path
-        self.validator = validator_instance # Store the validator instance
-        self.max_repair_attempts = 3
+        self.validator = validator_instance
+        self.max_repair_attempts = self.app_config.get("agent_group", {}).get("max_repair_attempts", 3)
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
 
-        # Initialize Core Agents
+        # Initialize Core Agents using app_config
         self.llm_agent = LLMCore(
+            app_config=self.app_config,
             style_profile=self.style_profile,
-            naming_conventions_db_path=self.naming_conventions_db_path,
-            config=llm_core_config,
-            llm_model_path=llm_model_path
+            naming_conventions_db_path=self.naming_conventions_db_path
         )
+        # Assuming DiffusionCore will also be refactored to take app_config
+        # For now, its existing signature might be config and style_profile.
+        # We'll pass app_config as its 'config' for now.
         self.diffusion_agent = DiffusionCore(
-            style_profile=self.style_profile,
-            config=diffusion_core_config
+            # app_config=self.app_config, # If DiffusionCore is updated
+            config=self.app_config, # Passing app_config as the 'config' dict
+            style_profile=self.style_profile
         )
 
         self.current_patch_candidate: Optional[Any] = None
         self.patch_history: list = [] # To store (script, validation_result, score, error) tuples
         self._current_run_context_data: Optional[Dict[str, Any]] = None # For preview context
 
-        print("CollaborativeAgentGroup initialized with LLMCore, DiffusionCore, and max_repair_attempts.")
+        if self.verbose:
+            print(f"CollaborativeAgentGroup initialized. Max repair attempts: {self.max_repair_attempts}")
 
 import ast # For parsing modified code in duplicate guard
 from src.digester.signature_trie import generate_function_signature_string # For duplicate guard
@@ -61,39 +66,42 @@ from src.transformer import apply_libcst_codemod_script, PatchApplicationError #
 
 class CollaborativeAgentGroup:
     def __init__(self,
+                 app_config: Dict[str, Any],
+                 digester: 'RepositoryDigester', # Added digester
                  style_profile: Dict[str, Any],
                  naming_conventions_db_path: Path,
-                 validator_instance: 'Validator', # New parameter
-                 llm_core_config: Optional[Dict[str, Any]] = None,
-                 diffusion_core_config: Optional[Dict[str, Any]] = None,
-                 llm_model_path: Optional[str] = None
+                 validator_instance: 'Validator'
                  ):
         """
         Initializes the CollaborativeAgentGroup.
         Args:
+            app_config: The main application configuration dictionary.
+            digester: An instance of RepositoryDigester.
             style_profile: Dictionary containing style profile information.
             naming_conventions_db_path: Path to the naming conventions database.
             validator_instance: An instance of the Validator class.
-            llm_core_config: Optional configuration for LLMCore.
-            diffusion_core_config: Optional configuration for DiffusionCore.
-            llm_model_path: Optional path to GGUF model for LLMCore repairs.
         """
+        self.app_config = app_config
+        self.digester = digester # Store digester instance, will also be passed in run()
         self.style_profile = style_profile
         self.naming_conventions_db_path = naming_conventions_db_path
-        self.validator = validator_instance # Store the validator instance
-        self.max_repair_attempts = 3
-        self.digester: Optional['RepositoryDigester'] = None # Will be set in run()
+        self.validator = validator_instance
+        self.max_repair_attempts = self.app_config.get("agent_group", {}).get("max_repair_attempts", 3)
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
 
-        # Initialize Core Agents
+        # Initialize Core Agents using app_config
         self.llm_agent = LLMCore(
+            app_config=self.app_config,
             style_profile=self.style_profile,
-            naming_conventions_db_path=self.naming_conventions_db_path,
-            config=llm_core_config,
-            llm_model_path=llm_model_path
+            naming_conventions_db_path=self.naming_conventions_db_path
         )
+        # Assuming DiffusionCore will also be refactored to take app_config
+        # For now, its existing signature might be config and style_profile.
+        # We'll pass app_config as its 'config' for now.
         self.diffusion_agent = DiffusionCore(
-            style_profile=self.style_profile,
-            config=diffusion_core_config
+            # app_config=self.app_config, # If DiffusionCore is updated
+            config=self.app_config, # Passing app_config as the 'config' dict
+            style_profile=self.style_profile
         )
 
         self.current_patch_candidate: Optional[Any] = None
@@ -613,65 +621,96 @@ Script Content (first 1000 chars):
 
 # Example Usage (Conceptual - requires mock objects for Phase, Digester etc.)
 if __name__ == '__main__':
+    from src.utils.config_loader import load_app_config # For __main__
+    from src.validator.validator import Validator # For __main__
+
     print("\n--- CollaborativeAgentGroup Example Usage (Conceptual) ---")
+
+    app_cfg_main = load_app_config()
+    app_cfg_main["general"]["verbose"] = True
+    if not app_cfg_main["general"].get("project_root"):
+        app_cfg_main["general"]["project_root"] = str(Path.cwd())
+
 
     # Mock Phase (replace with actual Phase import and instantiation if available)
     class MockPhase:
-        def __init__(self, op_name, target, params=None):
+        def __init__(self, op_name, target, params=None, description="Mock phase description"):
             self.operation_name = op_name
             self.target_file = target
             self.parameters = params if params else {}
+            self.description = description
+
 
     # Mock Digester (replace with actual Digester import and instantiation)
     class MockDigester:
-        def get_project_overview(self): return {"files": 2, "language": "python"}
+        def __init__(self, app_config_param): # Mock accepts app_config
+            self.app_config = app_config_param
+            self.repo_path = Path(app_config_param.get("general",{}).get("project_root", "."))
+            self.verbose = app_config_param.get("general",{}).get("verbose", False)
+            if self.verbose: print(f"MockDigester initialized for CollaborativeAgentGroup main, repo_path: {self.repo_path}")
+
+        def get_project_overview(self): return {"files": 2, "language": "python", "mock_overview": True}
         def get_file_content(self, path: Path): return f"# Content of {path}\npass" if path else None
+        def get_code_snippets_for_phase(self, phase_ctx_param: Any) -> Dict[str, str]:
+            return {"mock_snippet.py": "def mock_func(): pass"}
+        def get_pdg_slice_for_phase(self, phase_ctx_param: Any) -> Dict[str, Any]:
+            return {"nodes": [], "edges": [], "info": "Mock PDG"}
+        def _get_module_qname_from_path(self, file_path: Path, project_root: Path) -> str:
+            return file_path.stem # Simplified for mock
 
-    # Mock validator and scorer
-    def mock_validator(patch, digester, phase_ctx):
-        print(f"MockValidator: Validating patch: {patch}")
-        if patch.get("value") and "ERROR" in patch["value"]:
-            return False, {"reason": "Contains ERROR string"}, "Traceback: Something went wrong due to ERROR"
-        if patch.get("path") == "/src/invalid.py":
-            return False, {"reason": "Invalid path"}, "Traceback: InvalidPathError"
-        return True, {"lines_changed": 1}, None
+    # Mock validator and scorer (Validator itself will be refactored later)
+    mock_validator_instance = Validator(app_config=app_cfg_main) # Pass app_config
 
-    def mock_score_style(patch, style_profile):
-        print(f"MockScoreStyle: Scoring patch: {patch} with profile: {style_profile}")
-        if patch.get("value") and "bad_style" in patch["value"]:
+    def mock_validator_handle(modified_code: str, target_file: Path, digester_param: Any, project_root_param: Path) -> Tuple[bool, Optional[str], Optional[str]]:
+        if "ERROR" in modified_code:
+            return False, "Contains ERROR string", "Traceback: Something went wrong due to ERROR"
+        if target_file.name == "invalid.py":
+            return False, "Invalid path", "Traceback: InvalidPathError"
+        return True, "Validated by mock", None
+
+    def mock_score_style(patch_script: Any, style_profile_param: Dict[str, Any]) -> float:
+        if isinstance(patch_script, str) and "bad_style" in patch_script:
             return 0.2
         return 0.85
 
     # Setup
-    mock_llm_config = {"other_common_context": {"api_key": "llm_mock_key"}}
-    mock_diffusion_config = {"other_common_context": {"model_strength": 0.7}}
     mock_style_profile = {"line_length": 88, "indent_style": "space"}
-    mock_naming_db_path = Path("mock_naming_db.json")
+    mock_naming_db_path = Path(app_cfg_main["general"]["project_root"]) / "mock_naming_db.json" # Relative to project root
 
     # Create dummy naming db file
+    mock_naming_db_path.parent.mkdir(parents=True, exist_ok=True)
     with open(mock_naming_db_path, "w") as f:
-        f.write('{"function_prefix": "get_"}')
+        json.dump({"function_prefix": "get_"}, f)
+
+    mock_digester_for_cag = MockDigester(app_config_param=app_cfg_main)
 
     agent_group = CollaborativeAgentGroup(
-        llm_config=mock_llm_config,
-        diffusion_config=mock_diffusion_config,
+        app_config=app_cfg_main,
+        digester=mock_digester_for_cag, # type: ignore
         style_profile=mock_style_profile,
-        naming_conventions_db_path=mock_naming_db_path
+        naming_conventions_db_path=mock_naming_db_path,
+        validator_instance=mock_validator_instance
     )
 
     mock_phase_ctx = MockPhase(op_name="add_function", target="src/example.py", params={"function_name": "my_func"})
-    mock_digester_instance = MockDigester()
 
     print("\nStarting agent_group.run...")
-    final_patch_result = agent_group.run(
-        phase_ctx=mock_phase_ctx,
-        digester=mock_digester_instance,
-        validator_handle=mock_validator,
-        score_style_handle=mock_score_style
-    )
+    try:
+        final_patch_script_result, final_patch_source_info = agent_group.run(
+            phase_ctx=mock_phase_ctx,
+            digester=mock_digester_for_cag, # type: ignore
+            validator_handle=mock_validator_handle, # type: ignore
+            score_style_handle=mock_score_style
+        )
+        print(f"\nAgent group run completed. Final patch script: '{str(final_patch_script_result)[:100]}...', Source: {final_patch_source_info}")
+        if final_patch_script_result : print(f"Patch preview: {agent_group.generate_patch_preview()}")
 
-    print(f"\nAgent group run completed. Final patch: {final_patch_result}")
-    print(f"Patch preview: {agent_group.generate_patch_preview()}")
+    except PhaseFailure as pf:
+        print(f"CollaborativeAgentGroup Main: PhaseFailure encountered: {pf}")
+    except Exception as e:
+        print(f"CollaborativeAgentGroup Main: Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
 
     # Example of a patch that might fail validation then get repaired (conceptually)
     print("\n--- Example with failing patch ---")

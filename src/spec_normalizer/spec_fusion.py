@@ -35,18 +35,21 @@ class SpecFusion:
         self,
         t5_client: T5Client,
         symbol_retriever: 'SymbolRetriever',
-        verbose: bool = False
+        app_config: Dict[str, Any]
     ):
         """
         Initializes the SpecFusion component.
         Args:
             t5_client: An instance of T5Client.
             symbol_retriever: An instance of SymbolRetriever.
-            verbose: If True, enables detailed logging.
+            app_config: Application configuration dictionary.
+                        Expected keys:
+                        - general.verbose (bool, optional)
         """
         self.t5_client = t5_client
         self.symbol_retriever = symbol_retriever
-        self.verbose = verbose
+        self.app_config = app_config
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
         if self.verbose:
             print(f"SpecFusion initialized. T5Client ready: {self.t5_client.is_ready}, SymbolRetriever type: {type(self.symbol_retriever)}")
 
@@ -156,6 +159,7 @@ class SpecFusion:
 
 if __name__ == '__main__':
     from unittest.mock import MagicMock
+    from src.utils.config_loader import load_app_config # For __main__
     # Ensure RepositoryDigester is available for the mock setup, even if just a placeholder
     try:
         from src.digester.repository_digester import RepositoryDigester
@@ -163,16 +167,24 @@ if __name__ == '__main__':
         print("Warning (__main__): src.digester.repository_digester.RepositoryDigester not found. Using placeholder.")
         class RepositoryDigester: # type: ignore
              def __init__(self, repo_path: Any): self.repo_path = repo_path; self.faiss_id_to_metadata = []
+             # Add app_config to mock if real one takes it
+            # def __init__(self, repo_path: Any, app_config: Dict[str, Any]):
+            #     self.repo_path = repo_path; self.app_config = app_config; self.faiss_id_to_metadata = []
 
     print("--- SpecFusion __main__ Example ---")
 
+    app_cfg_main = load_app_config()
+    app_cfg_main["general"]["verbose"] = True
+    if not app_cfg_main["general"].get("project_root"): # Needed by SymbolRetriever's data_dir logic
+        app_cfg_main["general"]["project_root"] = str(Path.cwd())
+
     # Mock T5Client
     class MockT5Client:
-        def __init__(self, model_path_or_name: str, verbose: bool = False):
-            self.model_path_or_name = model_path_or_name
-            self.verbose = verbose
+        def __init__(self, app_config: Dict[str, Any]): # Updated mock signature
+            self.app_config = app_config
+            self.verbose = self.app_config.get("general",{}).get("verbose",False)
             self.is_ready = True # Assume ready for mock
-            print(f"MockT5Client initialized with model: {model_path_or_name}, verbose: {verbose}")
+            print(f"MockT5Client initialized, verbose: {self.verbose}")
 
         def request_spec_from_text(self, raw_issue_text: str, context_symbols_string: Optional[str] = None) -> Optional[str]:
             if self.verbose: print(f"MockT5Client.request_spec_from_text called. Issue: '{raw_issue_text[:50]}...', Symbols: '{str(context_symbols_string)[:50]}...'")
@@ -216,13 +228,14 @@ acceptance_tests:
     except ImportError:
         print("Warning (__main__): Real SymbolRetriever not found or import issue. Using local MockSymbolRetrieverForFusionMain.")
         class MockSymbolRetrieverForFusionMain:
-            def __init__(self, digester: Any, verbose: bool = False):
-                self.verbose = verbose
-                print(f"MockSymbolRetrieverForFusionMain initialized, verbose: {verbose}")
-            def get_context_symbols_for_spec_fusion(self, max_symbols: Optional[int] = 500) -> List[str]:
-                if self.verbose: print(f"MockSymbolRetrieverForFusionMain.get_context_symbols_for_spec_fusion called, max_symbols={max_symbols}")
+            def __init__(self, digester: Any, app_config: Dict[str, Any]): # Updated mock signature
+                self.app_config = app_config
+                self.verbose = self.app_config.get("general",{}).get("verbose",False)
+                print(f"MockSymbolRetrieverForFusionMain initialized, verbose: {self.verbose}")
+            def get_enriched_context_for_spec_fusion(self, raw_issue_text: str, max_fqns: int = 300, max_success_examples: int = 2) -> Dict[str, Any]: # Match real signature
+                if self.verbose: print(f"MockSymbolRetrieverForFusionMain.get_enriched_context_for_spec_fusion called, issue: '{raw_issue_text[:20]}...'")
                 symbols = ["example.utils.helper_a", "example.services.main_service.process_data", "another.mock.symbol"]
-                return symbols[:max_symbols] if max_symbols is not None else symbols
+                return {"fqns": symbols[:max_fqns] if max_fqns is not None else symbols, "success_examples": []}
         SymbolRetrieverToUseInMain = MockSymbolRetrieverForFusionMain # type: ignore
 
     # Setup
@@ -240,30 +253,33 @@ acceptance_tests:
             self.embedding_model = MagicMock() # SymbolRetriever __init__ checks this
             self.faiss_index = MagicMock()     # And this
             self.np_module = MagicMock()       # And this (if np is None globally in retriever)
+             # Add app_config if real RepositoryDigester takes it (it does now)
+            # self.app_config = app_cfg_main # Assuming it's in scope
             print(f"MockDigesterForFusionMain initialized for {repo_path}")
 
-    mock_digester = MockDigesterForFusionMain("dummy_repo_for_specfusion_main")
+    # If RepositoryDigester takes app_config, pass it to the mock.
+    # mock_digester = RepositoryDigester(repo_path="dummy_repo_for_specfusion_main", app_config=app_cfg_main) # If using real
+    mock_digester = MockDigesterForFusionMain(repo_path="dummy_repo_for_specfusion_main") # Basic mock
 
-    mock_t5_client = MockT5Client(model_path_or_name="./models/placeholder_t5_spec_normalizer/", verbose=True)
+    mock_t5_client = MockT5Client(app_config=app_cfg_main)
 
     try:
-        # If SymbolRetrieverToUseInMain is the real one, it needs a valid digester.
-        # Our MockDigesterForFusionMain is basic; real SymbolRetriever init might require more.
-        mock_symbol_retriever = SymbolRetrieverToUseInMain(digester=mock_digester, verbose=True) # type: ignore
+        # If SymbolRetrieverToUseInMain is the real one, it needs a valid digester and app_config.
+        mock_symbol_retriever = SymbolRetrieverToUseInMain(digester=mock_digester, app_config=app_cfg_main) # type: ignore
     except Exception as e_sr_init:
         print(f"Error initializing SymbolRetrieverToUseInMain: {e_sr_init}. Falling back to basic mock for __main__.")
         # Fallback to an even simpler mock if the chosen one fails with MockDigester
         class BasicMockSymbolRetriever:
-            def __init__(self, digester:Any, verbose:bool=False): pass
-            def get_context_symbols_for_spec_fusion(self, max_symbols: Optional[int] = 500) -> List[str]:
-                return ["fallback.symbol1", "fallback.symbol2"][:max_symbols] if max_symbols is not None else []
-        mock_symbol_retriever = BasicMockSymbolRetriever(digester=mock_digester, verbose=True)
+            def __init__(self, digester:Any, app_config: Dict[str, Any]): pass
+            def get_enriched_context_for_spec_fusion(self, raw_issue_text: str, max_fqns: int = 300, max_success_examples: int = 2) -> Dict[str, Any]:
+                return {"fqns": ["fallback.symbol1", "fallback.symbol2"][:max_fqns] if max_fqns is not None else [], "success_examples": []}
+        mock_symbol_retriever = BasicMockSymbolRetriever(digester=mock_digester, app_config=app_cfg_main)
 
 
     spec_fuser = SpecFusion(
         t5_client=mock_t5_client,
         symbol_retriever=mock_symbol_retriever,
-        verbose=True
+        app_config=app_cfg_main
     )
 
     test_issue_1 = "User wants to add function `calculate_total` in `billing.py` with items and discount."

@@ -26,10 +26,14 @@ DEFAULT_APP_CONFIG: Dict[str, Any] = {
         "agent_llm_gguf": "./models/placeholder_llm_agent.gguf", # General agent model
         "repair_llm_gguf": "./models/placeholder_repair_model.gguf", # Specific repair model (can be same as agent_llm_gguf)
         "infill_llm_gguf": "./models/placeholder_llm_agent.gguf", # Specific infill model (can be same as agent_llm_gguf)
+        "divot5_infill_model_dir": "./models/placeholder_divot5_infill/", # For DivoT5 FIM
         # Embeddings
         "sentence_transformer_model": "all-MiniLM-L6-v2", # Default to HF Hub name
         # Core Predictor
         "core_predictor_model": "./models/core_predictor.joblib"
+    },
+    "agent_infill": {
+        "type": "gguf",  # Options: "gguf", "divot5"
     },
     "tools": {
         "ruff_path": "ruff",
@@ -49,10 +53,13 @@ DEFAULT_APP_CONFIG: Dict[str, Any] = {
         "agent_infill_gguf_temp": 0.4, "agent_infill_gguf_max_tokens": 512, # For GGUF infill in DiffusionCore
         "agent_polish_temp": 0.2, "agent_polish_max_tokens": 2048,
         "agent_repair_temp": 0.3, "agent_repair_max_tokens": 2048 # For LLMCore repair
-        # Parameters for DivoT5 infill (if different from general T5 params)
-        # "divot5_infill_max_length": 256,
-        # "divot5_infill_num_beams": 3,
-        # "divot5_infill_temperature": 0.5,
+    },
+    "divot5_fim_params": { # Parameters specific to DivoT5 Fill-In-Middle models
+        "infill_max_length": 256,
+        "infill_num_beams": 3,
+        "infill_temperature": 0.5,
+        "top_p": 0.9, # Example, common DivoT5 param
+        # Add other relevant DivoT5 FIM parameters here
     }
 }
 

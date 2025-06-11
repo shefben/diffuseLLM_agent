@@ -15,11 +15,20 @@ if TYPE_CHECKING:
     # REFACTOR_OPERATION_INSTANCES is used directly.
 
 # Actual imports
+from src.utils.config_loader import DEFAULT_APP_CONFIG # For default model paths
 from .spec_model import Spec
 from .phase_model import Phase
 from .refactor_grammar import BaseRefactorOperation, REFACTOR_OPERATION_INSTANCES
+
+# Child component imports
+from src.profiler.t5_client import T5Client # Assuming direct import is fine
+from src.retriever.symbol_retriever import SymbolRetriever # Assuming direct import
+from src.spec_normalizer.spec_fusion import SpecFusion # Assuming direct import
 from src.validator.validator import Validator
 from src.builder.commit_builder import CommitBuilder
+from src.agent_group.collaborative_agent_group import CollaborativeAgentGroup
+
+# Other necessary imports
 from src.agent_group.exceptions import PhaseFailure
 from src.profiler.llm_interfacer import get_llm_score_for_text
 from src.utils.memory_logger import log_successful_patch # For Success Memory Logging
@@ -30,7 +39,6 @@ from src.utils.memory_logger import log_successful_patch # For Success Memory Lo
 # This is primarily for type hinting if RepositoryDigester cannot be imported directly.
 # The actual instance is passed to __init__.
 if TYPE_CHECKING:
-    from src.agent_group.collaborative_agent_group import CollaborativeAgentGroup
     # Ensure Phase is available for type hints if not already.
     from .phase_model import Phase
 
@@ -64,108 +72,106 @@ class PhasePlanner:
 
     def __init__(
         self,
-        style_fingerprint_path: Path,
-        digester: 'RepositoryDigester',
-        scorer_model_config: Any,
-        naming_conventions_db_path: Path,
         project_root_path: Path,
-        llm_model_path: Optional[str] = None,
+        app_config: Dict[str, Any],
+        digester: 'RepositoryDigester',
         refactor_op_map: Optional[Dict[str, BaseRefactorOperation]] = None,
-        beam_width: int = 3,
-        verbose: bool = False,
-        data_dir_path: Optional[Path] = None # For Success Memory
+        # beam_width is now primarily from app_config, but can be overridden if passed for testing
+        beam_width: Optional[int] = None
     ):
-        self.style_fingerprint: Dict[str, Any] = {}
-        self.verbose = verbose
-        self.data_dir_path = data_dir_path if data_dir_path else project_root_path / ".agent_data" # Default data_dir_path
-        if self.verbose: print(f"PhasePlanner: Data directory for logs (e.g. success memory): {self.data_dir_path}")
-        try:
-            if style_fingerprint_path.exists():
-                with open(style_fingerprint_path, "r", encoding="utf-8") as f:
-                    self.style_fingerprint = json.load(f)
-                print(f"PhasePlanner: Loaded style fingerprint from {style_fingerprint_path}")
-            else:
-                print(f"Warning: Style fingerprint file not found at {style_fingerprint_path}. Using empty fingerprint.")
-        except json.JSONDecodeError as e:
-            print(f"Warning: Error decoding style fingerprint JSON from {style_fingerprint_path}: {e}. Using empty fingerprint.")
-        except Exception as e_gen:
-             print(f"Warning: Could not load style fingerprint from {style_fingerprint_path} due to: {e_gen}. Using empty fingerprint.")
+        """
+        Initializes the PhasePlanner.
 
+        Args:
+            project_root_path: The root path of the project being worked on.
+            app_config: The application configuration dictionary.
+            digester: An instance of RepositoryDigester for the project.
+            refactor_op_map: Optional map of refactoring operations.
+            beam_width: Optional override for beam width in plan search.
+        """
+        self.project_root_path = project_root_path
+        self.app_config = app_config
         self.digester = digester
-        self.scorer_model_config = scorer_model_config
-        self.naming_conventions_db_path = naming_conventions_db_path # Store
-        self.project_root_path = project_root_path # Store
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
+
+        # Load/Determine Paths & Style Fingerprint
+        style_fp_path = self.project_root_path / "style_fingerprint.json" # Standard name
+        self.style_fingerprint: Dict[str, Any] = {}
+        try:
+            if style_fp_path.exists():
+                with open(style_fp_path, "r", encoding="utf-8") as f:
+                    self.style_fingerprint = json.load(f)
+                if self.verbose: print(f"PhasePlanner: Loaded style fingerprint from {style_fp_path}")
+            else:
+                if self.verbose: print(f"PhasePlanner Warning: Style fingerprint file not found at {style_fp_path}. Using empty fingerprint.")
+        except json.JSONDecodeError as e:
+            print(f"PhasePlanner Warning: Error decoding style fingerprint JSON from {style_fp_path}: {e}. Using empty fingerprint.")
+        except Exception as e_gen:
+             print(f"PhasePlanner Warning: Could not load style fingerprint from {style_fp_path} due to: {e_gen}. Using empty fingerprint.")
+
+        self.naming_conventions_db_path = self.project_root_path / "naming_conventions.db" # Standard name
+        self.data_dir_path = Path(self.app_config.get("general", {}).get("data_dir", str(self.project_root_path / ".agent_data")))
+        self.data_dir_path.mkdir(parents=True, exist_ok=True) # Ensure data_dir exists
+        if self.verbose: print(f"PhasePlanner: Data directory for logs (e.g. success memory): {self.data_dir_path}")
+
+        # Configure self.scorer_model_config (for internal use by _score_candidate_plan_with_llm)
+        llm_params_config = self.app_config.get("llm_params", {})
+        scorer_model_p = self.app_config.get("models", {}).get("planner_scorer_gguf", DEFAULT_APP_CONFIG["models"]["planner_scorer_gguf"])
+
+        self.scorer_model_config = {
+            "model_path": str(Path(scorer_model_p).resolve()), # Resolve path
+            "enabled": True, # Assuming enabled if path is provided; can add specific config key later
+            "verbose": self.verbose,
+            "n_gpu_layers": llm_params_config.get("n_gpu_layers_default", DEFAULT_APP_CONFIG["llm_params"]["n_gpu_layers_default"]),
+            "n_ctx": llm_params_config.get("n_ctx_default", DEFAULT_APP_CONFIG["llm_params"]["n_ctx_default"]),
+            "temperature": llm_params_config.get("plan_score_temp", llm_params_config.get("temperature_default", DEFAULT_APP_CONFIG["llm_params"]["temperature_default"])),
+            "max_tokens": llm_params_config.get("plan_score_max_tokens", 16) # Renamed from max_tokens_for_score
+        }
+        if not Path(self.scorer_model_config["model_path"]).is_file():
+            print(f"PhasePlanner Warning: Scorer model not found at {self.scorer_model_config['model_path']}. Plan scoring will use fallback.")
+            self.scorer_model_config["enabled"] = False
+        else:
+            if self.verbose: print(f"PhasePlanner: Real LLM scorer configured with model: {self.scorer_model_config['model_path']}")
 
         self.refactor_op_map: Dict[str, BaseRefactorOperation] = refactor_op_map if refactor_op_map is not None else REFACTOR_OPERATION_INSTANCES
-
-        self.beam_width = beam_width
+        self.beam_width = beam_width if beam_width is not None else self.app_config.get("planner",{}).get("beam_width", DEFAULT_APP_CONFIG["planner"]["beam_width"])
         if self.beam_width <= 0:
             raise ValueError("Beam width must be a positive integer.")
+        if self.verbose: print(f"PhasePlanner: Beam width set to {self.beam_width}")
 
-        # Scorer configuration logging
-        if self.scorer_model_config and self.scorer_model_config.get("enabled", True):
-            scorer_model_path = self.scorer_model_config.get("model_path")
-            if scorer_model_path and Path(scorer_model_path).is_file():
-                 print(f"PhasePlanner Info: Real LLM scorer configured with model: {scorer_model_path}.")
-                 # self.phi2_scorer attribute is no longer needed for primary logic
-            elif scorer_model_path: # Path provided but not found
-                 print(f"PhasePlanner Warning: Scorer GGUF model_path '{scorer_model_path}' not found. Scoring will use fallback logic within _score_candidate_plan_with_llm.")
-            else: # No path provided
-                 print("PhasePlanner Warning: LLM scorer enabled but no 'model_path' provided in scorer_model_config. Scoring will use placeholder/fallback logic within _score_candidate_plan_with_llm.")
-        else:
-            print("PhasePlanner Info: LLM scorer is disabled in config or no scorer_model_config provided. Plan scoring will use random fallback.")
+        # Instantiate Child Components (Passing app_config or derived configs)
+        self.t5_client = T5Client(app_config=self.app_config)
+        self.symbol_retriever = SymbolRetriever(digester=self.digester, app_config=self.app_config)
+        self.spec_normalizer = SpecFusion(t5_client=self.t5_client, symbol_retriever=self.symbol_retriever, app_config=self.app_config)
+        self.validator = Validator(app_config=self.app_config)
+        if self.verbose: print("PhasePlanner: Validator instance initialized.")
 
-        # Import and Initialize CollaborativeAgentGroup
-        from src.agent_group.collaborative_agent_group import CollaborativeAgentGroup
-
-        # Initialize Validator
-        self.validator = Validator(config=None) # Pass config if PhasePlanner has one for Validator
-        print("PhasePlanner: Validator instance initialized.")
-
-        # Import and Initialize CollaborativeAgentGroup
-        from src.agent_group.collaborative_agent_group import CollaborativeAgentGroup
-        # Prepare a common config for LLM agents if specific settings are needed.
-        # For now, it will primarily carry the llm_model_path for both cores.
-        # Other parameters like n_gpu_layers, n_ctx, verbose can be added here if they
-        # should be controlled from PhasePlanner's initialization.
-        # DiffusionCore.expand_scaffold expects:
-        # "infill_model_path", "llm_model_path", "verbose", "n_gpu_layers", "n_ctx",
-        # "max_tokens_for_infill", "temperature", "stop_sequences_for_infill"
-        # LLMCore.propose_repair_diff also uses similar params from its config.
-
-        # Let's assume llm_model_path is the primary model for all agent tasks for now.
-        # Specific configs can override this if needed.
-        common_agent_llm_config = {
-            "llm_model_path": llm_model_path, # Path to the GGUF model for general agent tasks
-            "infill_model_path": llm_model_path, # Explicitly set for DiffusionCore, can be overridden by more specific config
-            "verbose": False, # Default verbosity for LLM operations
-            "n_gpu_layers": -1, # Default: all layers to GPU if possible
-            "n_ctx": 4096,      # Default context size
-            # Add other common parameters if they are available or make sense at PhasePlanner level
-            # "temperature": 0.4, # Example, might be too specific here
-            # "max_tokens_for_infill": 512, # Example
-        }
-        # If llm_core_config or diffusion_core_config are ever passed as actual dicts to PhasePlanner,
-        # they could be merged with common_agent_llm_config here.
-
+        # Agent Group requires specific model paths from app_config
+        agent_llm_model_p = self.app_config.get("models", {}).get("agent_llm_gguf", DEFAULT_APP_CONFIG["models"]["agent_llm_gguf"])
+        # CollaborativeAgentGroup __init__ currently takes llm_model_path and specific core_configs
+        # For now, we pass app_config and let it derive, or pass specific paths as before if its __init__ is not yet updated.
+        # Based on previous structure of CollaborativeAgentGroup, it took llm_core_config, diffusion_core_config, and llm_model_path.
+        # We will pass app_config to it, and it should become responsible for deriving these.
+        # For the purpose of this subtask, we assume CollaborativeAgentGroup will be updated to take app_config.
         self.agent_group: 'CollaborativeAgentGroup' = CollaborativeAgentGroup(
+            app_config=self.app_config, # Pass the full app_config
+            digester=self.digester, # Pass digester instance
             style_profile=self.style_fingerprint,
             naming_conventions_db_path=self.naming_conventions_db_path,
-            validator_instance=self.validator,
-            llm_core_config=common_agent_llm_config.copy(), # Pass a copy for LLMCore
-            diffusion_core_config=common_agent_llm_config.copy(), # Pass a copy for DiffusionCore
-            llm_model_path=llm_model_path # This is specifically for LLMCore's repair GGUF model path, distinct from general task model
+            validator_instance=self.validator
+            # Old parameters like llm_core_config, diffusion_core_config, llm_model_path
+            # are assumed to be handled by CollaborativeAgentGroup internally using app_config.
         )
-        print(f"PhasePlanner: CollaborativeAgentGroup initialized with common_agent_llm_config: {common_agent_llm_config}")
+        if self.verbose: print(f"PhasePlanner: CollaborativeAgentGroup initialized.")
 
         # Store actual validator handle and mock score style handle
         self.validator_handle: Callable[[Optional[str], str, 'RepositoryDigester', Path], Tuple[bool, Optional[str]]] = self.validator.validate_patch
         self.score_style_handle: Callable[[Any, Dict[str, Any]], float] = PhasePlanner.mock_score_style_handle
-        print("PhasePlanner: Validator handle set to actual validator. Mock style scorer configured.")
+        if self.verbose: print("PhasePlanner: Validator handle set. Mock style scorer configured.")
 
         # Initialize CommitBuilder
-        self.commit_builder = CommitBuilder(config=None) # Pass config if available/needed
-        print("PhasePlanner: CommitBuilder instance initialized.")
+        self.commit_builder = CommitBuilder(app_config=self.app_config)
+        if self.verbose: print("PhasePlanner: CommitBuilder instance initialized.")
 
         self.plan_cache: Dict[str, List[Phase]] = {}
         # self.phi2_scorer_cache: Dict[str, float] = {} # Optional cache
@@ -584,6 +590,9 @@ Score:"""
 if __name__ == '__main__':
     # No MagicMock needed now as we are using more concrete (though still mock) classes
     # from unittest.mock import MagicMock
+    from src.utils.config_loader import load_app_config # For __main__
+    from src.digester.repository_digester import RepositoryDigester # For __main__
+
     print("--- PhasePlanner Example Usage (Conceptual) ---")
 
     # Using the actual RepositoryDigester mock defined at the class level for TYPE_CHECKING
@@ -591,8 +600,8 @@ if __name__ == '__main__':
     class MockDigesterForPlannerMain(RepositoryDigester): # Inherit from the placeholder to ensure methods
         def __init__(self):
             super().__init__() # Call super if it has an init
-            self.project_call_graph = {"module.func_a": {"module.func_b"}}
-            self.project_control_dependence_graph = {}
+            self.project_call_graph = {"module.func_a": {"module.func_b"}} # type: ignore
+            self.project_control_dependence_graph = {} # type: ignore
             self.project_data_dependence_graph = {}
         # Override mock methods if more specific behavior is needed for main example
         def get_project_overview(self) -> Dict[str, Any]:
@@ -603,45 +612,40 @@ if __name__ == '__main__':
             print(f"__main__ MockDigester.get_file_content for {path} returning: '{content[:50]}...'")
             return content if path else None
 
-
-    dummy_digester_main = MockDigesterForPlannerMain()
-
-    dummy_style_path_main = Path("_temp_dummy_style_main.json")
-    with open(dummy_style_path_main, "w") as f:
-        json.dump({"line_length": 99, "preferred_quotes": "double", "indent": 4}, f)
-
-    dummy_scorer_config_main = {"model_path": "path/to/phi2/model_placeholder", "enabled": True}
-
-    dummy_naming_db_path_main = Path("_temp_dummy_naming_db.json")
-    if not dummy_naming_db_path_main.exists():
-        with open(dummy_naming_db_path_main, "w") as f:
-            json.dump({"function_name_style": "snake_case"}, f)
-
     dummy_project_root_main = Path("_temp_mock_project_root")
     dummy_project_root_main.mkdir(parents=True, exist_ok=True)
 
-    # Mock LLM model path for agent-based repair (can be a non-existent path for this test as LLM loading is mocked/guarded)
-    mock_llm_repair_model_path = "_temp_mock_repair_model.gguf"
-    # For success memory logging in __main__
-    temp_data_dir_for_main = Path("_temp_agent_data_main")
+    # Create dummy style_fingerprint.json and naming_conventions.db for the test
+    with open(dummy_project_root_main / "style_fingerprint.json", "w") as f_style:
+        json.dump({"line_length": 100, "indent_style": "space", "indent_width": 4}, f_style)
+    with open(dummy_project_root_main / "naming_conventions.db", "w") as f_naming:
+        # In a real scenario, this would be a SQLite DB or similar. For mock, content doesn't matter.
+        f_naming.write("mock_naming_db_content")
 
+    app_cfg_main = load_app_config() # Load default or from existing config.yaml
+    app_cfg_main["general"]["verbose"] = True # Override for testing
+    # Ensure data_dir is within our temp project root for cleanup
+    app_cfg_main["general"]["data_dir"] = str(dummy_project_root_main / ".agent_data_main_test")
+
+    # Mock model paths in app_config if they don't exist, to prevent download attempts
+    # but allow PhasePlanner to initialize its scorer_model_config path.
+    # These paths won't actually be used in this conceptual __main__ unless scoring is deeply tested.
+    app_cfg_main.setdefault("models", {})
+    app_cfg_main["models"]["planner_scorer_gguf"] = str(dummy_project_root_main / "mock_scorer.gguf") # Non-existent, will warn
+    app_cfg_main["models"]["agent_llm_gguf"] = str(dummy_project_root_main / "mock_agent_llm.gguf") # Non-existent
+    app_cfg_main["models"]["divot5_infill_model_dir"] = str(dummy_project_root_main / "mock_divot5_infill") # Non-existent
+
+    # Instantiate RepositoryDigester with app_cfg_main for its verbose setting
+    # In a real scenario, digester would also take app_config if its __init__ was updated.
+    # For this test, MockDigesterForPlannerMain doesn't use app_config.
+    mock_digester_main = MockDigesterForPlannerMain()
 
     try:
-        # Ensure Spec and Phase are imported or defined
-        # from .spec_model import Spec # (already imported at top)
-        # from .phase_model import Phase # (already imported at top)
-        temp_data_dir_for_main.mkdir(parents=True, exist_ok=True) # Create temp data dir for test
-
         planner = PhasePlanner(
-            style_fingerprint_path=dummy_style_path_main,
-            digester=dummy_digester_main,
-            scorer_model_config=dummy_scorer_config_main,
-            naming_conventions_db_path=dummy_naming_db_path_main,
             project_root_path=dummy_project_root_main,
-            llm_model_path=mock_llm_repair_model_path,
-            beam_width=2,
-            verbose=True, # Enable verbose for __main__ test
-            data_dir_path=temp_data_dir_for_main # Pass data_dir for success memory
+            app_config=app_cfg_main,
+            digester=mock_digester_main
+            # refactor_op_map and beam_width can be passed to override config for testing
         )
 
         # Example Spec using the imported spec_model.Spec structure
@@ -684,25 +688,12 @@ if __name__ == '__main__':
         import traceback
         traceback.print_exc()
     finally:
-        if dummy_style_path_main.exists():
-            dummy_style_path_main.unlink()
-        if dummy_naming_db_path_main.exists():
-            dummy_naming_db_path_main.unlink()
-
-        # Cleanup for temp_data_dir_for_main
-        if temp_data_dir_for_main.exists():
-            import shutil # Ensure shutil is imported for rmtree
-            try:
-                shutil.rmtree(temp_data_dir_for_main)
-                print(f"Cleaned up temporary data directory: {temp_data_dir_for_main}")
-            except OSError as e_ose_data:
-                print(f"Error removing temporary data directory {temp_data_dir_for_main}: {e_ose_data}")
-
         if dummy_project_root_main.exists():
             import shutil # Import shutil here for cleanup
             try:
                 shutil.rmtree(dummy_project_root_main)
-                print(f"Cleaned up dummy project root: {dummy_project_root_main}")
+                if app_cfg_main["general"]["verbose"]: print(f"Cleaned up dummy project root: {dummy_project_root_main}")
             except OSError as e_ose:
                 print(f"Error removing directory {dummy_project_root_main}: {e_ose}")
+
     print("\n--- PhasePlanner Example Done ---")

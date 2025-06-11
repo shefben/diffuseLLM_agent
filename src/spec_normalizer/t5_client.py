@@ -13,21 +13,30 @@ except ImportError:
     print("Warning: PyTorch or Hugging Face Transformers not found. T5Client will not function with real models.")
 
 class T5Client:
-    def __init__(self, model_path_or_name: str, verbose: bool = False):
+    def __init__(self, app_config: Dict[str, Any]):
         """
         Initializes the T5Client.
 
         Args:
-            model_path_or_name: Path to a local T5 model directory or a Hugging Face model identifier.
-            verbose: If True, enables detailed logging during model operations.
+            app_config: Application configuration dictionary.
+                        Expected keys:
+                        - general.verbose (bool, optional)
+                        - models.t5_spec_normalizer_dir (str, required)
         """
-        self.model_path_or_name = model_path_or_name
-        self.verbose = verbose
+        self.app_config = app_config
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
+
+        models_config = self.app_config.get("models", {})
+        self.model_path_or_name = models_config.get("t5_spec_normalizer_dir")
+
+        if self.model_path_or_name is None:
+            print("T5Client Critical Error: 'models.t5_spec_normalizer_dir' not found in app_config!")
+            self.model_path_or_name = "./models/ERROR_PATH_NOT_IN_CONFIG" # Ensure _load_model fails gracefully
+
         self.model: Optional[T5ForConditionalGeneration] = None
         self.tokenizer: Optional[T5TokenizerFast] = None
         self.device: Optional[str] = None
         self.is_ready: bool = False
-
         self._load_model()
 
     def _load_model(self) -> None:
@@ -131,18 +140,23 @@ class T5Client:
             return None
 
 if __name__ == '__main__':
+    from src.utils.config_loader import load_app_config, DEFAULT_APP_CONFIG # For __main__
+
     print("--- T5Client Example Usage ---")
 
-    # Define a placeholder model path.
-    # For this to work with a real model, replace with a valid T5 model name (e.g., "t5-small")
-    # or a path to a local model directory.
-    # The default logic in _load_model will try "./models/placeholder_t5_spec_normalizer/" if this is a placeholder name.
-    placeholder_model = "./models/placeholder_t5_spec_normalizer/"
-    # To test with a downloadable HF model if the placeholder isn't found:
-    # placeholder_model = "t5-small"
+    app_cfg_main = load_app_config() # Load defaults or from a test file
+    app_cfg_main["general"]["verbose"] = True # Example override
 
-    print(f"\nAttempting to initialize T5Client with model: {placeholder_model}")
-    t5_client = T5Client(model_path_or_name=placeholder_model, verbose=True)
+    # Ensure the relevant model path is set in app_cfg for testing.
+    # If you have a local placeholder or want to test with "t5-small":
+    # Option 1: Use the default from DEFAULT_APP_CONFIG if suitable
+    # app_cfg_main["models"]["t5_spec_normalizer_dir"] = DEFAULT_APP_CONFIG["models"]["t5_spec_normalizer_dir"]
+    # Option 2: Explicitly set for testing (e.g., if default placeholder doesn't exist and you want to use t5-small)
+    if not Path(DEFAULT_APP_CONFIG["models"]["t5_spec_normalizer_dir"]).exists():
+         app_cfg_main["models"]["t5_spec_normalizer_dir"] = "t5-small" # Fallback to HF download for test
+
+    print(f"\nAttempting to initialize T5Client with app_config (model: {app_cfg_main['models']['t5_spec_normalizer_dir']})")
+    t5_client = T5Client(app_config=app_cfg_main)
 
     if t5_client.is_ready:
         print("\nT5Client ready. Requesting spec...")

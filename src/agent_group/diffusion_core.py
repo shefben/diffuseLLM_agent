@@ -1,35 +1,37 @@
 from typing import Any, Dict, List, Optional
 import re
 
-# Attempt to import get_llm_code_infill, handle if not available
+# Attempt to import get_llm_code_infill and get_divot5_code_infill, handle if not available
 try:
-    from src.profiler.llm_interfacer import get_llm_code_infill
+    from src.profiler.llm_interfacer import get_llm_code_infill, get_divot5_code_infill
+    from src.utils.config_loader import DEFAULT_APP_CONFIG
 except ImportError:
     get_llm_code_infill = None
-    print("DiffusionCore Warning: Failed to import get_llm_code_infill from src.profiler.llm_interfacer. LLM-based infilling will be disabled.")
+    get_divot5_code_infill = None
+    DEFAULT_APP_CONFIG = { # Basic fallback for model paths if main import fails
+        "models": {
+            "agent_llm_gguf": "./models/placeholder_llm_agent.gguf",
+            "divot5_infill_model_dir": "./models/placeholder_divot5_infill/"
+        },
+        "llm_params": {}, "divot5_fim_params": {} # Empty dicts for params
+    }
+    print("DiffusionCore Warning: Failed to import LLM interfacer functions or DEFAULT_APP_CONFIG. LLM-based infilling will be disabled or use basic fallbacks.")
 
 
 class DiffusionCore:
-    def __init__(self, style_profile: Dict[str, Any], config: Optional[Dict[str, Any]] = None):
+    def __init__(self, app_config: Dict[str, Any], style_profile: Dict[str, Any]):
         """
         Initializes the DiffusionCore.
         Args:
+            app_config: The main application configuration dictionary.
             style_profile: Dictionary containing style profile information.
-            config: Optional dictionary for Diffusion core specific configurations.
-                    Expected keys for expand_scaffold:
-                    - "infill_model_path" (Optional[str]): Path to GGUF model for infilling.
-                    - "llm_model_path" (Optional[str]): Fallback path if infill_model_path is not set.
-                    - "verbose" (bool): LLM verbosity.
-                    - "n_gpu_layers" (int): GPU layers for LLM.
-                    - "n_ctx" (int): Context size for LLM.
-                    - "max_tokens_for_infill" (int): Max tokens for generated infill.
-                    - "temperature" (float): Sampling temperature for LLM.
-                    - "stop_sequences_for_infill" (Optional[List[str]]): Stop sequences for infill.
         """
-        self.style_profile = style_profile
-        self.config = config if config else {}
-        self.verbose = self.config.get("verbose", False) # Initialize self.verbose
-        print(f"DiffusionCore initialized with style_profile, config: {self.config}, verbose: {self.verbose}")
+        self.app_config = app_config
+        self.style_profile = style_profile # Store style_profile if needed by other methods
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
+        if self.verbose:
+            print(f"DiffusionCore initialized. Verbose: {self.verbose}")
+            print(f"  Style profile keys: {list(self.style_profile.keys())}")
 
     def expand_scaffold(self, scaffold_patch_script: Optional[str], edit_summary_str: Optional[str], context_data: Dict[str, Any]) -> Optional[str]:
         """
@@ -44,18 +46,39 @@ class DiffusionCore:
         print(f"DiffusionCore.expand_scaffold called. Context keys: {list(context_data.keys())}. Edit summary: '{edit_summary_str}'")
 
         if not scaffold_patch_script:
-            print("DiffusionCore Warning: Received None or empty scaffold_patch_script. Returning as is.")
+            if self.verbose: print("DiffusionCore Warning: Received None or empty scaffold_patch_script. Returning as is.")
             return scaffold_patch_script
 
-        print(f"  Initial scaffold script (first 200 chars): '{scaffold_patch_script[:200]}...'")
+        if self.verbose: print(f"  Initial scaffold script (first 200 chars): '{scaffold_patch_script[:200]}...'")
 
-        llm_infill_available = get_llm_code_infill is not None
-        infill_model_path = self.config.get("infill_model_path", self.config.get("llm_model_path"))
+        agent_infill_config = self.app_config.get("agent_infill", {})
+        infill_type = agent_infill_config.get("type", "gguf").lower()
+        llm_params = self.app_config.get("llm_params", {})
+        divot5_params = self.app_config.get("divot5_fim_params", {})
+        llm_interfacer_verbose = self.app_config.get("general", {}).get("verbose_llm_calls", self.verbose)
 
-        if not llm_infill_available:
-            print("DiffusionCore Warning: get_llm_code_infill function is not available (likely missing LlamaCPP in llm_interfacer). Real LLM infill will be skipped.")
-        if not infill_model_path:
-            print("DiffusionCore Warning: No model path configured for infilling ('infill_model_path' or 'llm_model_path' in config). Real LLM infill will be skipped.")
+        infill_model_path: Optional[str] = None
+        can_infill = False
+
+        if infill_type == "gguf":
+            infill_model_path = self.app_config.get("models", {}).get("infill_llm_gguf",
+                                                                    self.app_config.get("models", {}).get("agent_llm_gguf",
+                                                                                                          DEFAULT_APP_CONFIG["models"]["agent_llm_gguf"]))
+            can_infill = get_llm_code_infill is not None and bool(infill_model_path)
+            if not can_infill and self.verbose:
+                if get_llm_code_infill is None: print("DiffusionCore Info: get_llm_code_infill (for GGUF) not available.")
+                if not infill_model_path: print("DiffusionCore Info: GGUF infill model path not configured.")
+        elif infill_type == "divot5":
+            infill_model_path = self.app_config.get("models", {}).get("divot5_infill_model_dir", DEFAULT_APP_CONFIG["models"]["divot5_infill_model_dir"])
+            can_infill = get_divot5_code_infill is not None and bool(infill_model_path)
+            if not can_infill and self.verbose:
+                if get_divot5_code_infill is None: print("DiffusionCore Info: get_divot5_code_infill not available.")
+                if not infill_model_path: print("DiffusionCore Info: DivoT5 infill model path not configured.")
+        else:
+            print(f"DiffusionCore Warning: Unknown infill type '{infill_type}' configured. Skipping real infill.")
+
+        if not can_infill and self.verbose:
+            print("DiffusionCore Info: Real LLM infill will be skipped due to missing function or model path.")
 
         current_script_variant = scaffold_patch_script
 
@@ -78,12 +101,12 @@ class DiffusionCore:
             # Attempt to find relevant part of edit_summary for this specific hole
             # This is a heuristic; more advanced context mapping might be needed.
             summary_context_for_hole = f"Context for {hole_marker}: The overall goal is described by the summary: '{edit_summary_str}'. This specific hole, {hole_marker}, needs to be filled with Python code that logically completes the surrounding script."
-            # Example: if edit_summary_str is a list of strings, one per hole:
-            # try:
-            #    summary_context_for_hole = edit_summary_list[int(hole_number_str)]
-            # except (IndexError, ValueError, TypeError): # Handle cases where summary is not a list or index is bad
-            #    pass # Stick with default summary_context_for_hole
 
+            # Construct the prompt based on infill_type. For now, assume a generic FIM-like prompt structure.
+            # DivoT5 might use specific tokens like <PREFIX>, <SUFFIX>, <MIDDLE>.
+            # GGUF FIM models might expect a specific format too (e.g., CodeLlama FIM).
+            # This part needs careful alignment with the chosen models.
+            # For now, a simple text prompt:
             prompt = f"""You are an expert Python code completion assistant.
 Your task is to fill in the placeholder `{hole_marker}` in the provided Python (LibCST) script.
 The script is intended to perform a refactoring operation.
@@ -111,27 +134,48 @@ Provide only the code snippet to replace `{hole_marker}`:"""
             infilled_code_snippet = None
             llm_call_succeeded = False
 
-            if llm_infill_available and infill_model_path:
-                # Get LLM parameters from config with defaults
-                llm_verbose = self.config.get("verbose", False)
-                n_gpu_layers = self.config.get("n_gpu_layers", -1) # Default to -1 (all layers if possible)
-                n_ctx = self.config.get("n_ctx", 4096) # Default context size
-                max_tokens = self.config.get("max_tokens_for_infill", 512)
-                temperature = self.config.get("temperature", 0.4)
-                stop_sequences = self.config.get("stop_sequences_for_infill", ["\n```", "\n# End of infill"]) # Example stop sequences
+            if can_infill and infill_model_path:
+                if infill_type == "gguf":
+                    gguf_n_gpu_layers = llm_params.get("n_gpu_layers_default", DEFAULT_APP_CONFIG["llm_params"]["n_gpu_layers_default"])
+                    gguf_n_ctx = llm_params.get("n_ctx_default", DEFAULT_APP_CONFIG["llm_params"]["n_ctx_default"])
+                    gguf_max_tokens = llm_params.get("agent_infill_gguf_max_tokens", DEFAULT_APP_CONFIG["llm_params"]["agent_infill_gguf_max_tokens"])
+                    gguf_temp = llm_params.get("agent_infill_gguf_temp", DEFAULT_APP_CONFIG["llm_params"]["temperature_default"])
+                    # stop_sequences might need to be configured in llm_params too
+                    stop_sequences = llm_params.get("agent_infill_gguf_stop_sequences", ["\n```", "\n# End of infill"])
 
-                if get_llm_code_infill: # Final check on the function pointer
-                    infilled_code_snippet = get_llm_code_infill(
-                        model_path=infill_model_path,
-                        prompt=prompt,
-                        verbose=llm_verbose,
-                        n_gpu_layers=n_gpu_layers,
-                        n_ctx=n_ctx,
-                        max_tokens_for_infill=max_tokens,
-                        temperature=temperature,
-                        stop=stop_sequences
-                    )
-                    llm_call_succeeded = infilled_code_snippet is not None # True if LLM returned something (even empty string)
+                    if get_llm_code_infill:
+                        infilled_code_snippet = get_llm_code_infill(
+                            model_path=infill_model_path,
+                            prompt=prompt, # This prompt might need adjustment for GGUF FIM models
+                            verbose=llm_interfacer_verbose,
+                            n_gpu_layers=gguf_n_gpu_layers,
+                            n_ctx=gguf_n_ctx,
+                            max_tokens_for_infill=gguf_max_tokens,
+                            temperature=gguf_temp,
+                            stop=stop_sequences
+                        )
+                        llm_call_succeeded = infilled_code_snippet is not None
+
+                elif infill_type == "divot5":
+                    # DivoT5 prompt might need to be structured with <PREFIX>, <SUFFIX>, <MIDDLE>
+                    # For now, using the same generic prompt; this will likely need refinement.
+                    # Example DivoT5 prompt structure: f"<PREFIX>{code_before_hole[-500:]}<SUFFIX>{code_after_hole[:500]}<MIDDLE>"
+                    divot5_prompt = f"<PREFIX>{code_before_hole[-500:]}<SUFFIX>{code_after_hole[:500]}<MIDDLE>" # Example specific prompt
+
+                    divot5_max_length = divot5_params.get("infill_max_length", DEFAULT_APP_CONFIG["divot5_fim_params"]["infill_max_length"])
+                    divot5_num_beams = divot5_params.get("infill_num_beams", DEFAULT_APP_CONFIG["divot5_fim_params"]["infill_num_beams"])
+                    divot5_temp = divot5_params.get("infill_temperature", DEFAULT_APP_CONFIG["divot5_fim_params"]["infill_temperature"])
+
+                    if get_divot5_code_infill:
+                        infilled_code_snippet = get_divot5_code_infill(
+                            model_dir_path=infill_model_path, # DivoT5 usually loaded from a directory
+                            prompt=divot5_prompt, # Use the DivoT5 specific prompt
+                            max_length=divot5_max_length,
+                            num_beams=divot5_num_beams,
+                            temperature=divot5_temp,
+                            verbose=llm_interfacer_verbose
+                        )
+                        llm_call_succeeded = infilled_code_snippet is not None
 
             if llm_call_succeeded and isinstance(infilled_code_snippet, str) and infilled_code_snippet.strip():
                 # TODO: Add intelligent indentation adjustment for infilled_code_snippet.

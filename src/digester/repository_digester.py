@@ -978,11 +978,20 @@ class CallGraphVisitor(cst.CSTVisitor):
 class RepositoryDigester:
     def __init__(self,
                  repo_path: Union[str, Path],
-                 embedding_model_name: str = 'all-MiniLM-L6-v2',
-                 verbose: bool = False # Add verbose for digester operations
+                 app_config: Dict[str, Any]
                 ):
+        """
+        Initializes the RepositoryDigester.
+
+        Args:
+            repo_path: The path to the repository to be digested.
+            app_config: Application configuration dictionary. Settings like 'verbose'
+                        and 'embedding_model_name_or_path' are derived from this.
+        """
         self.repo_path = Path(repo_path).resolve()
-        self.verbose = verbose # Store verbose flag
+        self.app_config = app_config # Store app_config
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
+
         if not self.repo_path.is_dir():
             raise ValueError(f"Repository path {self.repo_path} is not a valid directory.")
 
@@ -1021,42 +1030,47 @@ class RepositoryDigester:
         self.embedding_model: Optional[SentenceTransformer] = None
         self.embedding_dimension: Optional[int] = None
 
-        if SentenceTransformer and embedding_model_name:
+        embedding_model_name_or_path = self.app_config.get("models", {}).get("sentence_transformer_model", "all-MiniLM-L6-v2")
+        if self.verbose:
+            print(f"RepositoryDigester Info: Using embedding model: {embedding_model_name_or_path} (from app_config)")
+
+        if SentenceTransformer and embedding_model_name_or_path:
             model_load_path: Optional[Union[str, Path]] = None
             default_local_st_model_path = Path("./models/sentence_transformer_model/")
 
-            # 1. Check if embedding_model_name is a direct path to an existing model directory
-            potential_path = Path(embedding_model_name)
+            # 1. Check if embedding_model_name_or_path is a direct path to an existing model directory
+            potential_path = Path(embedding_model_name_or_path)
             if potential_path.is_dir():
                 model_load_path = potential_path
-                print(f"RepositoryDigester Info: Attempting to load SentenceTransformer model from provided path: {model_load_path}")
-            # 2. Else, if it's a known HF name (e.g., 'all-MiniLM-L6-v2') AND default local path exists, use local
-            elif embedding_model_name == 'all-MiniLM-L6-v2' and default_local_st_model_path.is_dir():
+                if self.verbose: print(f"RepositoryDigester Info: Attempting to load SentenceTransformer model from provided path: {model_load_path}")
+            # 2. Else, if it's the default HF name AND default local path exists, use local
+            elif embedding_model_name_or_path == 'all-MiniLM-L6-v2' and default_local_st_model_path.is_dir():
                 model_load_path = default_local_st_model_path
-                print(f"RepositoryDigester Info: Found default local SentenceTransformer model at: {model_load_path}. Prioritizing this.")
-            # 3. Else, treat embedding_model_name as a Hugging Face model name (for download or cache)
+                if self.verbose: print(f"RepositoryDigester Info: Found default local SentenceTransformer model at: {model_load_path}. Prioritizing this.")
+            # 3. Else, treat embedding_model_name_or_path as a Hugging Face model name (for download or cache)
             else:
-                model_load_path = embedding_model_name
-                if is_placeholder_path := embedding_model_name.endswith("sentence_transformer_model/"): # Check if it's the default placeholder
-                    print(f"RepositoryDigester Warning: Provided model path '{embedding_model_name}' seems to be a placeholder or does not exist. Will attempt to load from Hugging Face if it's a valid model name.")
-                else:
-                    print(f"RepositoryDigester Info: Attempting to load SentenceTransformer model from Hugging Face Hub: '{embedding_model_name}'")
+                model_load_path = embedding_model_name_or_path
+                if self.verbose:
+                    if is_placeholder_path := embedding_model_name_or_path.endswith("sentence_transformer_model/"): # Check if it's the default placeholder
+                        print(f"RepositoryDigester Warning: Provided model path '{embedding_model_name_or_path}' seems to be a placeholder or does not exist. Will attempt to load from Hugging Face if it's a valid model name.")
+                    else:
+                        print(f"RepositoryDigester Info: Attempting to load SentenceTransformer model from Hugging Face Hub: '{embedding_model_name_or_path}'")
 
             if model_load_path:
                 try:
                     self.embedding_model = SentenceTransformer(str(model_load_path))
                     if self.embedding_model:
                         self.embedding_dimension = self.embedding_model.get_sentence_embedding_dimension()
-                    print(f"RepositoryDigester Info: SentenceTransformer model '{model_load_path}' loaded successfully. Dimension: {self.embedding_dimension}.")
+                    if self.verbose: print(f"RepositoryDigester Info: SentenceTransformer model '{model_load_path}' loaded successfully. Dimension: {self.embedding_dimension}.")
                 except Exception as e:
                     print(f"RepositoryDigester Error: Failed to load SentenceTransformer model from '{model_load_path}': {e}")
                     self.embedding_model = None
             else: # Should not happen if logic above is correct
-                 print("RepositoryDigester Warning: No valid model path or name determined for SentenceTransformer.")
+                 if self.verbose: print("RepositoryDigester Warning: No valid model path or name determined for SentenceTransformer.")
 
         elif not SentenceTransformer:
             print("RepositoryDigester Warning: sentence-transformers library not available. Embedding generation disabled.")
-        elif not embedding_model_name:
+        elif not embedding_model_name_or_path:
             print("RepositoryDigester Warning: No embedding_model_name provided. Embedding generation disabled.")
 
 
@@ -1065,9 +1079,9 @@ class RepositoryDigester:
         self.faiss_id_to_metadata: List[Dict[str, Any]] = []
         if faiss and self.embedding_model and self.embedding_dimension:
             try:
-                print(f"RepositoryDigester Info: Initializing FAISS IndexFlatL2 with dimension {self.embedding_dimension}...")
+                if self.verbose: print(f"RepositoryDigester Info: Initializing FAISS IndexFlatL2 with dimension {self.embedding_dimension}...")
                 self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension) # type: ignore
-                print("RepositoryDigester Info: FAISS Index initialized.")
+                if self.verbose: print("RepositoryDigester Info: FAISS Index initialized.")
             except Exception as e:
                 print(f"RepositoryDigester Error: Error initializing FAISS index: {e}")
                 self.faiss_index = None
@@ -1778,6 +1792,8 @@ class RepositoryDigester:
 
 
 if __name__ == '__main__':
+    from src.utils.config_loader import load_app_config # Import for __main__
+
     current_script_dir = Path(__file__).parent
     dummy_repo = current_script_dir / "_temp_dummy_repo_for_digester_"
     dummy_repo.mkdir(exist_ok=True)
@@ -1792,7 +1808,13 @@ if __name__ == '__main__':
     if str(dummy_repo.resolve()) not in sys.path:
         sys.path.insert(0, str(dummy_repo.resolve()))
 
-    digester = RepositoryDigester(str(dummy_repo))
+    # Load or create a mock app_config for the __main__ block
+    # Using load_app_config will attempt to load from default locations or use defaults.
+    mock_app_config_main = load_app_config()
+    # Example: Override verbose for testing __main__
+    mock_app_config_main.setdefault("general", {})["verbose"] = True
+
+    digester = RepositoryDigester(str(dummy_repo), app_config=mock_app_config_main)
     digester.digest_repository()
 
     print("\nDigested file results (summary):")

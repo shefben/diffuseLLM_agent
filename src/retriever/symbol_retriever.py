@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from src.digester.repository_digester import RepositoryDigester
 
 class SymbolRetriever:
-    def __init__(self, digester: 'RepositoryDigester', data_dir_path: Optional[Path] = None, verbose: bool = False):
+    def __init__(self, digester: 'RepositoryDigester', app_config: Dict[str, Any]):
         """
         Initializes the SymbolRetriever.
 
@@ -24,29 +24,48 @@ class SymbolRetriever:
             digester: An instance of RepositoryDigester that has already processed
                       a repository and contains the embedding model, FAISS index,
                       and metadata.
-            verbose: If True, enables detailed logging.
+            app_config: Application configuration dictionary.
+                        Expected keys:
+                        - general.verbose (bool, optional)
+                        - general.data_dir (str, optional)
+                        - general.project_root (str, optional, used if data_dir is relative)
         """
-        if digester.embedding_model is None: # Check this first as it's a primary dependency for retrieval
-            print("SymbolRetriever Warning: RepositoryDigester's embedding_model is not initialized. Retrieval will be limited.")
-            # Depending on strictness, could raise ValueError here. For now, allow init but retrieval will be impaired.
-
-        # FAISS index is also crucial for embedding-based retrieval
-        if digester.faiss_index is None:
-            print("SymbolRetriever Warning: RepositoryDigester's faiss_index is not initialized. Embedding-based retrieval will be impaired.")
-
-        if np is None: # Global numpy check for SymbolRetriever's own operations
-            # This might be redundant if all np ops are on digester.np_module, but good as a safeguard
-            print("SymbolRetriever Warning: Numpy not found globally. Some operations might fail if not using digester.np_module.")
-
         self.digester = digester
-        self.embedding_model = digester.embedding_model
-        self.faiss_index = digester.faiss_index
-        self.faiss_id_to_metadata = digester.faiss_id_to_metadata
+        self.app_config = app_config
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
+
+        if digester.embedding_model is None: # Check this first as it's a primary dependency for retrieval
+            if self.verbose: print("SymbolRetriever Warning: RepositoryDigester's embedding_model is not initialized. Retrieval will be limited.")
+        if digester.faiss_index is None:
+            if self.verbose: print("SymbolRetriever Warning: RepositoryDigester's faiss_index is not initialized. Embedding-based retrieval will be impaired.")
+        if np is None:
+            if self.verbose: print("SymbolRetriever Warning: Numpy not found globally. Some operations might fail.")
+
+        self.embedding_model = self.digester.embedding_model
+        self.faiss_index = self.digester.faiss_index
+        self.faiss_id_to_metadata = self.digester.faiss_id_to_metadata
         self.np_module = np
-        self.data_dir_path = data_dir_path # Store data_dir_path
-        self.verbose = verbose
+
+        # Determine self.data_dir_path from app_config
+        self.data_dir_path: Optional[Path] = None
+        data_dir_setting = self.app_config.get("general", {}).get("data_dir")
+        project_root_setting = self.app_config.get("general", {}).get("project_root")
+
+        if data_dir_setting:
+            data_dir_p = Path(data_dir_setting)
+            if data_dir_p.is_absolute():
+                self.data_dir_path = data_dir_p
+            elif project_root_setting: # data_dir is relative and project_root is known
+                self.data_dir_path = Path(project_root_setting) / data_dir_p
+            else: # data_dir is relative but no project_root known, treat as relative to CWD
+                self.data_dir_path = Path.cwd() / data_dir_p
+                if self.verbose: print(f"SymbolRetriever Warning: data_dir '{data_dir_setting}' is relative and project_root not in app_config. Resolving relative to CWD: {self.data_dir_path}")
+        elif self.verbose: # data_dir_setting is None or empty
+            print("SymbolRetriever Warning: 'general.data_dir' not found in app_config. Success memory features may be disabled.")
+
         if self.verbose:
-            print(f"SymbolRetriever initialized. Embedding model: {bool(self.embedding_model)}, FAISS: {bool(self.faiss_index)}, DataDir: {self.data_dir_path}")
+            resolved_data_dir = self.data_dir_path.resolve() if self.data_dir_path else 'Not configured'
+            print(f"SymbolRetriever initialized. Embedding model: {bool(self.embedding_model)}, FAISS: {bool(self.faiss_index)}, DataDir: {resolved_data_dir}")
 
     def _l2_normalize_vector(self, vector: np.ndarray) -> np.ndarray:
         """L2 normalizes a vector."""
@@ -247,6 +266,9 @@ class SymbolRetriever:
 # Example Usage (conceptual, as it needs a populated RepositoryDigester)
 if __name__ == '__main__':
     from unittest.mock import MagicMock # Import MagicMock for the faiss part if faiss is None
+    from src.utils.config_loader import load_app_config # For __main__
+    # Assuming RepositoryDigester might be needed for type checking or basic structure
+    # from src.digester.repository_digester import RepositoryDigester
     print("SymbolRetriever example usage requires a populated RepositoryDigester.")
 
     if np: # Check if numpy is available for the mock example
@@ -289,16 +311,24 @@ if __name__ == '__main__':
                 ]
                 self.np_module = np # Provide numpy reference
 
-        mock_digester_instance = MockDigester()
+        app_cfg_main = load_app_config()
+        app_cfg_main["general"]["verbose"] = True
+        # Ensure project_root is set for data_dir resolution if data_dir is relative in config
+        if not app_cfg_main["general"].get("project_root"):
+            app_cfg_main["general"]["project_root"] = str(Path.cwd())
+        # Example: explicitly set data_dir for testing if needed, or let it use default from config
+        # app_cfg_main["general"]["data_dir"] = str(Path.cwd() / ".agent_data_symbol_retriever_test")
+
+        mock_digester_instance = MockDigester(verbose_retriever=app_cfg_main["general"]["verbose"])
 
         # Ensure the mock digester has a FAISS index for the test to proceed
-        if mock_digester_instance.faiss_index is None and mock_digester_instance.embedding_dimension:
+        if mock_digester_instance.faiss_index is None and hasattr(mock_digester_instance, 'embedding_dimension') and mock_digester_instance.embedding_dimension:
             print("Manually setting MockFaissIndex for example as global faiss might be real.")
             mock_digester_instance.faiss_index = MockFaissIndex(mock_digester_instance.embedding_dimension)
 
 
         if mock_digester_instance.embedding_model and mock_digester_instance.faiss_index:
-            retriever = SymbolRetriever(mock_digester_instance) # type: ignore
+            retriever = SymbolRetriever(digester=mock_digester_instance, app_config=app_cfg_main) # type: ignore
 
             raw_request_example = "How to use function A?"
             # With L2 distances of sqrt(0.25)=0.5 and sqrt(1.0)=1.0
