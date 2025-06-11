@@ -1,0 +1,38 @@
+general:
+  verbose: false
+  project_root: null
+  data_dir: .agent_data
+  patches_output_dir: .autopatches
+models:
+  deepseek_style_draft_gguf: ./models/placeholder_deepseek.gguf
+  divot5_style_refiner_dir: ./models/placeholder_divot5_refiner/
+  deepseek_style_polish_gguf: ./models/placeholder_deepseek.gguf
+  divot5_style_unifier_dir: ./models/placeholder_divot5_unifier/
+  t5_spec_normalizer_dir: ./models/placeholder_t5_spec_normalizer/
+  planner_scorer_gguf: ./models/placeholder_scorer.gguf
+  agent_llm_gguf: ./models/placeholder_llm_agent.gguf
+  repair_llm_gguf: ./models/placeholder_repair_model.gguf
+  infill_llm_gguf: ./models/placeholder_llm_agent.gguf
+  sentence_transformer_model: all-MiniLM-L6-v2
+  core_predictor_model: ./models/core_predictor.joblib
+tools:
+  ruff_path: ruff
+  black_path: black
+  pyright_path: pyright
+  pytest_path: pytest
+  default_pytest_target_dir: tests
+llm_params:
+  n_gpu_layers: -1
+  n_ctx: 4096
+  temperature_default: 0.3
+  max_tokens_default: 2048
+  scorer_temp: 0.1
+  scorer_max_tokens: 16
+  agent_scaffold_temp: 0.3
+  agent_scaffold_max_tokens: 2048
+  agent_infill_gguf_temp: 0.4
+  agent_infill_gguf_max_tokens: 512
+  agent_polish_temp: 0.2
+  agent_polish_max_tokens: 2048
+  agent_repair_temp: 0.3
+  agent_repair_max_tokens: 2048

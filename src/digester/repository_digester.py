@@ -157,7 +157,91 @@ class SymbolAndSignatureExtractorVisitor(ast.NodeVisitor): # Renamed
              print(f"  Constructed FQN part for key: '{fully_qualified_name_part}'")
              print(f"  Attempted lookup key: '{key_to_lookup}'")
              print(f"  Resolved type: '{resolved_type}'")
-        return resolved_type
+
+        if resolved_type:
+            canonical_type_str = resolved_type
+            original_for_log = resolved_type # For logging if changed
+
+            # Normalize typing.Optional[X] to typing.Union[X, None] and sort members
+            # Pyanalyze's dump_value usually produces 'X | None' or 'Optional[X]'
+            # This aims to standardize to 'typing.Union[X, None]' with sorted members (None last)
+            # or just 'X' if Union[X, None] simplifies to X (e.g. if X is Any)
+            # or just 'None' if Union[None, None]
+
+            # Step 1: Replace " | None" with a temporary structure for Union processing
+            # and "Optional[X]" with "Union[X, None]" equivalent
+            if canonical_type_str.endswith(" | None"):
+                # Convert "X | None" to "typing.Union[X, None]" for consistent processing
+                inner_type = canonical_type_str[:-7].strip()
+                canonical_type_str = f"typing.Union[{inner_type}, None]"
+            elif canonical_type_str.startswith("typing.Optional[") and canonical_type_str.endswith("]"):
+                inner_type = canonical_type_str[len("typing.Optional["):-1].strip()
+                canonical_type_str = f"typing.Union[{inner_type}, None]"
+            elif canonical_type_str == "NoneType": # Pyanalyze might output this
+                canonical_type_str = "None"
+
+
+            # Step 2: Normalize Union members (sort, unique, consistent None)
+            # This regex is basic and will NOT correctly parse complex nested generics like Union[List[A], Dict[B, C]].
+            # It's intended for simpler cases like Union[str, int], Union[str, int, None].
+            # A full parser for type strings is out of scope here.
+            match_union = re.match(r"^(typing\.)?Union\[(.*)\]$", canonical_type_str)
+            if match_union:
+                members_str = match_union.group(2)
+                # Basic split by comma. This is fragile for nested types.
+                # E.g., "Union[list[int], dict[str, str]]" would split incorrectly.
+                # This assumes members are simple or already well-formed by Pyanalyze.
+                raw_members = [m.strip() for m in members_str.split(',')]
+
+                has_none = False
+                processed_members = set() # Use set for uniqueness
+
+                for member in raw_members:
+                    if member == "None" or member == "NoneType":
+                        has_none = True
+                    else:
+                        # Further simplify basic generics here if needed, e.g. list, dict
+                        member = member.replace("typing.List[", "list[")
+                        member = member.replace("typing.Dict[", "dict[")
+                        member = member.replace("typing.Set[", "set[")
+                        member = member.replace("typing.Tuple[", "tuple[")
+                        member = member.replace("typing.Any", "Any")
+                        processed_members.add(member)
+
+                sorted_members = sorted(list(filter(None, processed_members))) # Filter out empty strings if any
+
+                if has_none:
+                    if not sorted_members: # Only None was in the Union
+                        canonical_type_str = "None"
+                    else:
+                        # Consistent order: sorted types, then None
+                        canonical_type_str = f"typing.Union[{', '.join(sorted_members)}, None]"
+                elif len(sorted_members) == 1:
+                    canonical_type_str = sorted_members[0] # Simplify Union[X] to X
+                elif len(sorted_members) > 1:
+                    canonical_type_str = f"typing.Union[{', '.join(sorted_members)}]"
+                elif not sorted_members and not has_none: # Empty Union e.g. Union[] - should not happen
+                    pass # Keep original or mark as error/Any
+
+            # Step 3: Final pass for simple typing.X to X replacements if not part of a Union already handled
+            # This needs to be careful not to break already canonicalized Union strings.
+            # The Union processing above already handles this for members.
+            # This is for non-Union types primarily.
+            if not canonical_type_str.startswith("typing.Union["):
+                canonical_type_str = canonical_type_str.replace("typing.List[", "list[")
+                canonical_type_str = canonical_type_str.replace("typing.Dict[", "dict[")
+                canonical_type_str = canonical_type_str.replace("typing.Set[", "set[")
+                canonical_type_str = canonical_type_str.replace("typing.Tuple[", "tuple[")
+                canonical_type_str = canonical_type_str.replace("typing.Any", "Any")
+                if canonical_type_str == "NoneType": # Final check
+                    canonical_type_str = "None"
+
+
+            if verbose_resolver and canonical_type_str != original_for_log:
+                 print(f"Resolver: Canonicalized type '{original_for_log}' to '{canonical_type_str}' for key '{key_to_lookup}'")
+            return canonical_type_str
+
+        return resolved_type # Returns None if not found, or original if no canonicalization applied
 
 
     def _get_node_source(self, node: ast.AST) -> str: # As before
@@ -182,10 +266,17 @@ class SymbolAndSignatureExtractorVisitor(ast.NodeVisitor): # Renamed
         fqn = ".".join(filter(None, base_fqn_parts))
 
         code_content = self._get_node_source(node)
+        signature_string = generate_function_signature_string(
+            node,
+            self._local_type_resolver,
+            class_fqn_prefix_for_method_name=self.current_class_name.split('.')[-1] if self.current_class_name and item_type_prefix == "method" else None
+        )
+        # Add signature_str to the main symbol dictionary
         self.symbols_for_embedding.append({
             "fqn": fqn, "item_type": f"{item_type_prefix}_code", "content": code_content,
             "file_path": self.file_path_str, "start_line": node.lineno,
-            "end_line": node.end_lineno if hasattr(node, 'end_lineno') and node.end_lineno is not None else node.lineno
+            "end_line": node.end_lineno if hasattr(node, 'end_lineno') and node.end_lineno is not None else node.lineno,
+            "signature_str": signature_string # Store the signature string
         })
         docstring = ast.get_docstring(node, clean=False)
         if docstring:
@@ -200,9 +291,10 @@ class SymbolAndSignatureExtractorVisitor(ast.NodeVisitor): # Renamed
             self.symbols_for_embedding.append({
                 "fqn": fqn, "item_type": f"docstring_for_{item_type_prefix}", "content": docstring,
                 "file_path": self.file_path_str, "start_line": doc_node_start, "end_line": doc_node_end
+                # Not adding signature_str to docstring symbols, only to the code symbol.
             })
 
-        signature_string = generate_function_signature_string(node, self._local_type_resolver)
+        # signature_string was already calculated above and used.
         self.signature_trie_ref.insert(signature_string, fqn)
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
@@ -887,8 +979,10 @@ class RepositoryDigester:
     def __init__(self,
                  repo_path: Union[str, Path],
                  embedding_model_name: str = 'all-MiniLM-L6-v2',
+                 verbose: bool = False # Add verbose for digester operations
                 ):
         self.repo_path = Path(repo_path).resolve()
+        self.verbose = verbose # Store verbose flag
         if not self.repo_path.is_dir():
             raise ValueError(f"Repository path {self.repo_path} is not a valid directory.")
 
@@ -898,7 +992,9 @@ class RepositoryDigester:
         self.project_call_graph: CallGraph = {}
         self.project_control_dependence_graph: ControlDependenceGraph = {}
         self.project_data_dependence_graph: DataDependenceGraph = defaultdict(set)
-        self.signature_trie = SignatureTrie() # NEW: Initialize SignatureTrie
+        self.signature_trie = SignatureTrie()
+
+        self._faiss_dirty_flag: bool = False # Initialize FAISS dirty flag
 
         self.ts_parser: Optional[Parser] = None
         if Parser and get_language:
@@ -1362,20 +1458,30 @@ class RepositoryDigester:
         print(f"  Files with some type info extracted: {files_with_type_info}")
         print(f"  Total symbols/docstrings with embeddings: {num_embedded_items}")
         if self.faiss_index:
-        if self.faiss_index:
             print(f"  Total items in FAISS index: {self.faiss_index.ntotal}")
+
+        self._faiss_dirty_flag = False # Mark as clean after initial full digest and build
+        if self.verbose: print("RepositoryDigester: Initial FAISS index built, dirty flag set to False.")
 
     # --- New Incremental Update Interface and Internal Methods ---
 
     def _rebuild_full_faiss_index(self) -> None:
         """Clears and rebuilds the FAISS index from all current digested_files embeddings."""
-        if not faiss or not self.embedding_model or not self.embedding_dimension or not np:
-            print("RepositoryDigester: FAISS or dependencies not available, skipping FAISS rebuild.")
-            self.faiss_index = None
-            self.faiss_id_to_metadata = []
+        if not self.embedding_model or not self.embedding_dimension or not faiss or not np:
+            print("RepositoryDigester Error: Cannot rebuild FAISS index. Missing embedding model, FAISS, or NumPy.")
+            if hasattr(self, 'faiss_index') and self.faiss_index is not None and self.embedding_dimension and faiss: # Check faiss here too
+                try:
+                    self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension) # Reset to empty
+                    self.faiss_id_to_metadata = []
+                    if self.verbose: print("RepositoryDigester Info: FAISS index reset to empty due to missing dependencies for full rebuild.")
+                except Exception as e_reset:
+                    print(f"RepositoryDigester Warning: Could not reset FAISS index during failed rebuild attempt: {e_reset}")
+            else: # If faiss is None, can't even reset with faiss.IndexFlatL2
+                 self.faiss_index = None
+                 self.faiss_id_to_metadata = []
             return
 
-        print("RepositoryDigester: Rebuilding full FAISS index...")
+        if self.verbose: print("RepositoryDigester: Rebuilding full FAISS index...")
         # Reset FAISS index and metadata
         try:
             self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension)
@@ -1426,13 +1532,28 @@ class RepositoryDigester:
         print(f"RepositoryDigester: Clearing data for file: {file_id_str_to_match}")
 
         old_parsed_result = self.digested_files.get(file_path)
-        if old_parsed_result and old_parsed_result.extracted_symbols and hasattr(self, 'signature_trie'):
-            # This part remains complex: requires knowing old signatures to delete from trie.
-            print(f"  SignatureTrie: Placeholder - Robust signature removal for {file_id_str_to_match} is complex and deferred.")
-            # Example logic:
-            # for symbol in old_parsed_result.extracted_symbols:
-            #     if symbol_is_function_like(symbol) and "signature_str" in symbol: # Assuming signature was stored
-            #         self.signature_trie.delete(symbol["signature_str"], symbol["fqn"])
+        if old_parsed_result and hasattr(old_parsed_result, 'extracted_symbols') and old_parsed_result.extracted_symbols and hasattr(self, 'signature_trie'):
+            if self.verbose: print(f"  Digester: Clearing signatures from trie for file: {file_id_str_to_match}")
+            for symbol_info in old_parsed_result.extracted_symbols:
+                signature_to_delete = symbol_info.get("signature_str")
+                fqn_of_symbol = symbol_info.get("fqn")
+                item_type = symbol_info.get("item_type", "")
+
+                # Only attempt to delete signatures for items that are function/method code entries
+                if item_type.endswith("_code") and ("function_code" in item_type or "method_code" in item_type):
+                    if signature_to_delete and fqn_of_symbol:
+                        deleted = self.signature_trie.delete(signature_to_delete, fqn_of_symbol)
+                        if self.verbose:
+                            if deleted:
+                                print(f"    Digester: Deleted signature '{signature_to_delete}' for FQN '{fqn_of_symbol}' from trie.")
+                            else:
+                                # This can be normal if a signature was shared and another FQN still uses it,
+                                # or if it was already pruned due to another FQN removal.
+                                print(f"    Digester Info: Signature '{signature_to_delete}' for FQN '{fqn_of_symbol}' not found for direct removal or already pruned.")
+                    elif self.verbose:
+                        print(f"    Digester Info: Symbol {fqn_of_symbol} of type {item_type} missing signature_str for trie deletion.")
+        elif self.verbose:
+            print(f"  Digester: No symbols or signature trie found for {file_id_str_to_match}, skipping signature cleanup.")
 
 
         graphs_to_clean = [
@@ -1481,27 +1602,68 @@ class RepositoryDigester:
 
         # Embeddings are generated during parse_file via _extract_symbols_and_docstrings_from_ast.
         # Signature Trie is also populated during parse_file.
-        # FAISS index will be rebuilt after all file operations in a batch (e.g., by handle_file_event or a higher-level coordinator).
-        # For a single update, we trigger it here.
-        self._rebuild_full_faiss_index()
+        self._faiss_dirty_flag = True # Mark FAISS as dirty, actual rebuild by commit_faiss_index_changes
+        if self.verbose: print(f"RepositoryDigester: Marked FAISS index as dirty after updating/adding {file_path.name}.")
+        # Removed direct call to self._rebuild_full_faiss_index()
 
-        print(f"RepositoryDigester: Finished updating/adding {file_path.name}")
+        print(f"RepositoryDigester: Finished processing update/add for {file_path.name}")
 
 
     def _remove_file_data(self, file_path: Path) -> None:
-        print(f"RepositoryDigester: Removing data for deleted file: {file_path.name}")
-        self._clear_data_for_file(file_path)
+        if self.verbose: print(f"RepositoryDigester: Removing data for deleted file: {file_path.name}")
+        self._clear_data_for_file(file_path) # This clears symbols, graphs, and trie entries
 
         if file_path in self._all_py_files:
             try: self._all_py_files.remove(file_path)
             except ValueError: pass
 
-        self._rebuild_full_faiss_index() # Rebuild FAISS after removal
-        print(f"RepositoryDigester: Finished removing data for {file_path.name}")
+        self._faiss_dirty_flag = True # Mark FAISS as dirty
+        if self.verbose: print(f"RepositoryDigester: Marked FAISS index as dirty after removing data for {file_path.name}.")
+        # Removed direct call to self._rebuild_full_faiss_index()
+        print(f"RepositoryDigester: Finished processing removal for {file_path.name}")
 
+    def commit_faiss_index_changes(self) -> bool:
+        """
+        Rebuilds the FAISS index if changes have been made to files since the last rebuild
+        or initial digestion. This method should be called by an external orchestrator
+        (e.g., after a batch of file events or before querying symbols).
+        Returns:
+            bool: True if a rebuild was performed or no rebuild was needed (index was clean),
+                  False if rebuild was attempted but failed.
+        """
+        if not self.embedding_model:
+            if self.verbose: print("RepositoryDigester Info: Embedding model not available. FAISS commit skipped, flag cleared.")
+            self._faiss_dirty_flag = False
+            return True # Considered success as no action was needed due to setup
+
+        if not self.faiss_index:
+            if self.verbose: print("RepositoryDigester Info: FAISS native library or index not available. FAISS commit skipped, flag cleared.")
+            self._faiss_dirty_flag = False
+            return True # Considered success as no action was needed due to setup
+
+        if self._faiss_dirty_flag:
+            if self.verbose: print("RepositoryDigester Info: FAISS index is dirty. Committing changes by rebuilding...")
+            try:
+                self._rebuild_full_faiss_index() # This method handles its own errors internally
+                self._faiss_dirty_flag = False # Cleared only on successful rebuild
+                if self.verbose: print("RepositoryDigester Info: FAISS index rebuild complete.")
+                return True
+            except Exception as e_rebuild:
+                print(f"RepositoryDigester Error: Unexpected error during _rebuild_full_faiss_index via commit: {e_rebuild}")
+                # Keep dirty flag true as rebuild failed
+                return False
+        else:
+            if self.verbose: print("RepositoryDigester Info: FAISS index is not dirty. No rebuild needed.")
+            return True # No action needed, considered success
 
     def handle_file_event(self, event_type: str, src_path: Path, dest_path: Optional[Path] = None) -> None:
-        print(f"RepositoryDigester: Received event: {event_type} on {src_path}" + (f" -> {dest_path}" if dest_path else ""))
+        """
+        Handles file system events (created, modified, deleted, moved) to keep the
+        repository digest up-to-date.
+        Note: After one or more calls to `handle_file_event`, `commit_faiss_index_changes()`
+        should be called to update the searchable FAISS index.
+        """
+        if self.verbose: print(f"RepositoryDigester: Received event: {event_type} on {src_path}" + (f" -> {dest_path}" if dest_path else ""))
 
         abs_src_path = src_path.resolve()
         abs_dest_path = dest_path.resolve() if dest_path else None

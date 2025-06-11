@@ -79,24 +79,72 @@ class SignatureTrie:
             node = node.children[char]
         return True # Prefix exists
 
-    def delete(self, signature_str: str, function_fqn: str) -> bool:
+    def delete(self, signature: str, function_fqn_to_remove: str) -> bool:
         """
-        Deletes a specific function_fqn from the set associated with a signature_str.
-        Does not prune trie nodes even if function_fqns becomes empty.
-        """
-        node = self.root
-        for char in signature_str:
-            if char not in node.children:
-                return False # Signature string not found
-            node = node.children[char]
+        Deletes a specific function_fqn from the set associated with a signature.
+        If the set becomes empty after removal, it prunes unnecessary trie nodes.
 
-        if function_fqn in node.function_fqns:
-            node.function_fqns.remove(function_fqn)
+        Args:
+            signature: The canonical signature string to delete.
+            function_fqn_to_remove: The specific FQN to remove for that signature.
+
+        Returns:
+            True if the FQN was found and removed, False otherwise.
+        """
+        current_node = self.root
+        # Store (parent_node, char_to_child, child_node) for pruning
+        path_trace: List[Tuple[TrieNode, str, TrieNode]] = []
+
+        for char_idx, char_code in enumerate(signature):
+            if char_code not in current_node.children:
+                return False  # Signature not found
+
+            if char_idx > 0: # Add to path_trace starting from the first child of root
+                 # parent is current_node *before* moving to child
+                 # char_code is the char that leads to child
+                 # child is current_node.children[char_code]
+                 # This logic seems slightly off, let's adjust path_trace storage:
+                 # path_trace should store (node, char_that_led_to_it_from_parent)
+                 # No, simpler: path_nodes = [self.root] then append current_node in loop.
+                 pass # Will reconstruct path_nodes as in the plan
+
+            current_node = current_node.children[char_code]
+
+        # Rebuild path_nodes as per plan for simpler indexing
+        path_nodes = [self.root]
+        temp_node = self.root
+        for char_code in signature:
+            temp_node = temp_node.children[char_code] # Already checked existence
+            path_nodes.append(temp_node)
+        # current_node is path_nodes[-1]
+
+        if function_fqn_to_remove in current_node.function_fqns:
+            current_node.function_fqns.remove(function_fqn_to_remove)
+
+            # Pruning logic:
+            # Iterate backwards from the node representing the end of the signature
+            # up to (but not including) the root.
+            # path_nodes has root at index 0, end_node at index len(signature)
+            for i in range(len(signature), 0, -1): # Correctly iterates from end node up to child of root
+                child_node = path_nodes[i]
+                parent_node = path_nodes[i-1]
+                char_leading_to_child = signature[i-1] # Character from parent to child
+
+                if not child_node.function_fqns and not child_node.children:
+                    # Node is now a leaf and no longer marks the end of any signature.
+                    # Delete the reference from its parent.
+                    del parent_node.children[char_leading_to_child]
+                else:
+                    # Node is still useful (either marks another FQN for this signature,
+                    # or is a prefix for other signatures), so stop pruning.
+                    break
             return True
-        return False # FQN not found for that signature
+        else:
+            return False # FQN not found for this signature
+
 
 def generate_function_signature_string(
-    func_node: ast.FunctionDef, # Corrected type hint from ast.FunctionDef to Union[ast.FunctionDef, ast.AsyncFunctionDef] is implicitly handled by Python's dynamic typing, but for strictness could be Union. ast.FunctionDef is base for AsyncFunctionDef in terms of args structure.
+    func_node: ast.FunctionDef,
     type_resolver: Callable[[ast.AST, str], Optional[str]],
     class_fqn_prefix_for_method_name: Optional[str] = None,
 ) -> str:
