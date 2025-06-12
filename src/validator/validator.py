@@ -12,19 +12,19 @@ if TYPE_CHECKING:
     # from src.planner.phase_model import Phase # If phase_ctx were needed by validation tools
 
 class Validator:
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, app_config: Optional[Dict[str, Any]] = None):
         """
         Initializes the Validator.
         Args:
-            config: Optional dictionary for validator configurations (e.g., tool paths).
+            app_config: Optional dictionary for validator configurations (e.g., tool paths).
         """
-        self.config = config if config else {}
-        self.verbose = self.config.get("verbose", False)
-        self.ruff_path = self.config.get("ruff_path", "ruff")
-        self.black_path = self.config.get("black_path", "black")
-        self.pyright_path = self.config.get("pyright_path", "pyright")
-        self.pytest_path = self.config.get("pytest_path", "pytest")
-        self.default_pytest_target_dir = self.config.get("default_pytest_target_dir", "tests")
+        self.app_config = app_config if app_config else {}
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
+        self.ruff_path = self.app_config.get("tools", {}).get("ruff_path", "ruff")
+        self.black_path = self.app_config.get("tools", {}).get("black_path", "black")
+        self.pyright_path = self.app_config.get("tools", {}).get("pyright_path", "pyright")
+        self.pytest_path = self.app_config.get("tools", {}).get("pytest_path", "pytest")
+        self.default_pytest_target_dir = self.app_config.get("tools", {}).get("default_pytest_target_dir", "tests")
 
 
         self.common_stdlib_modules = [
@@ -34,6 +34,15 @@ class Validator:
             "glob", "io", "pickle", "base64", "hashlib", "hmac", "uuid", "functools", "itertools",
             "operator", "typing", "dataclasses", "enum", "inspect", "gc", "weakref"
         ]
+        # Updated print statement to reflect new config structure if verbose is true.
+        # Note: The original print statement directly used self.verbose, self.ruff_path etc.
+        # These attributes are now initialized using self.app_config.
+        # The print statement itself doesn't need to change how it ACCESSES these attributes,
+        # as they are already set on self by the lines above.
+        # What might change is the SOURCE of these values if the new config structure means
+        # they are derived differently and we want to explicitly show that in the log.
+        # However, the task is to update accessors during __init__, which has been done.
+        # The print statement will correctly reflect the values derived from app_config.
         print(f"Validator initialized. Ruff: '{self.ruff_path}', Black: '{self.black_path}', Pyright: '{self.pyright_path}', Pytest: '{self.pytest_path}', Default Pytest Dir: '{self.default_pytest_target_dir}', Verbose: {self.verbose}. Known stdlib: {len(self.common_stdlib_modules)}")
 
     def attempt_heuristic_fixes(

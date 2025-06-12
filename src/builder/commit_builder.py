@@ -16,19 +16,20 @@ class CommitBuilder:
         """
         Initializes the CommitBuilder.
         Args:
-            config: Optional dictionary for configurations.
+            app_config: Optional dictionary for configurations.
                     Expected keys: "verbose" (bool), "black_path" (str), "ruff_path" (str).
         """
-        self.config = config if config else {}
-        self.verbose = self.config.get("verbose", False)
-        self.black_path = self.config.get("black_path", "black")
-        self.ruff_path = self.config.get("ruff_path", "ruff")
-        self.config = config if config else {}
-        self.verbose = self.config.get("verbose", False)
-        self.black_path = self.config.get("black_path", "black")
-        self.ruff_path = self.config.get("ruff_path", "ruff")
-        self.output_base_dir_config = self.config.get("output_base_dir") # Store for later use
-        print(f"CommitBuilder initialized. Black: '{self.black_path}', Ruff: '{self.ruff_path}', Verbose: {self.verbose}. Output Base Dir from config: {self.output_base_dir_config}. Config: {self.config}")
+        self.app_config = app_config if app_config else {}
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
+        self.black_path = self.app_config.get("tools", {}).get("black_path", "black")
+        self.ruff_path = self.app_config.get("tools", {}).get("ruff_path", "ruff")
+        self.output_base_dir_config = self.app_config.get("general", {}).get("patches_output_dir") # Store for later use
+        # self.output_base_dir is initialized in process_and_submit_patch or can be set here if always needed
+        # For now, keeping its logic tied to where it's used or assuming it might be passed explicitly.
+        # If it MUST be initialized in __init__, it would be:
+        # self.output_base_dir = Path(self.output_base_dir_config) if self.output_base_dir_config else Path.home() / ".autopatch/patches"
+
+        print(f"CommitBuilder initialized. Black: '{self.black_path}', Ruff: '{self.ruff_path}', Verbose: {self.verbose}. Output Base Dir from config: {self.output_base_dir_config}. AppConfig: {self.app_config}")
 
     def reformat_patch(
         self,

@@ -60,49 +60,10 @@ class CollaborativeAgentGroup:
         if self.verbose:
             print(f"CollaborativeAgentGroup initialized. Max repair attempts: {self.max_repair_attempts}")
 
-import ast # For parsing modified code in duplicate guard
-from src.digester.signature_trie import generate_function_signature_string # For duplicate guard
-from src.transformer import apply_libcst_codemod_script, PatchApplicationError # For applying script in run
-
-class CollaborativeAgentGroup:
-    def __init__(self,
-                 app_config: Dict[str, Any],
-                 digester: 'RepositoryDigester', # Added digester
-                 style_profile: Dict[str, Any],
-                 naming_conventions_db_path: Path,
-                 validator_instance: 'Validator'
-                 ):
-        """
-        Initializes the CollaborativeAgentGroup.
-        Args:
-            app_config: The main application configuration dictionary.
-            digester: An instance of RepositoryDigester.
-            style_profile: Dictionary containing style profile information.
-            naming_conventions_db_path: Path to the naming conventions database.
-            validator_instance: An instance of the Validator class.
-        """
-        self.app_config = app_config
-        self.digester = digester # Store digester instance, will also be passed in run()
-        self.style_profile = style_profile
-        self.naming_conventions_db_path = naming_conventions_db_path
-        self.validator = validator_instance
-        self.max_repair_attempts = self.app_config.get("agent_group", {}).get("max_repair_attempts", 3)
-        self.verbose = self.app_config.get("general", {}).get("verbose", False)
-
-        # Initialize Core Agents using app_config
-        self.llm_agent = LLMCore(
-            app_config=self.app_config,
-            style_profile=self.style_profile,
-            naming_conventions_db_path=self.naming_conventions_db_path
-        )
-        # Assuming DiffusionCore will also be refactored to take app_config
-        # For now, its existing signature might be config and style_profile.
-        # We'll pass app_config as its 'config' for now.
-        self.diffusion_agent = DiffusionCore(
-            # app_config=self.app_config, # If DiffusionCore is updated
-            config=self.app_config, # Passing app_config as the 'config' dict
+            app_config=self.app_config, # If DiffusionCore is updated
             style_profile=self.style_profile
         )
+        self.style_validator_agent = StyleValidatorCore(app_config=self.app_config, style_profile=self.style_profile)
 
         self.current_patch_candidate: Optional[Any] = None
         self.patch_history: list = [] # To store (script, validation_result, score, error) tuples
