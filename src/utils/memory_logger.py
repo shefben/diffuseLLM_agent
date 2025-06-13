@@ -53,9 +53,9 @@ def log_successful_patch(
         "spec_issue_description": getattr(spec, 'issue_description', "N/A"),
         "spec_target_files": getattr(spec, 'target_files', []),
         "spec_operations_summary": spec_ops_summary,
-        "successful_diff_summary_snippet": diff_summary[:1000] + ("..." if len(diff_summary) > 1000 else ""), # Store a snippet
-        "successful_script_hash": hex(hash(successful_script_str)), # Avoid storing very large scripts directly for now
-        # Consider storing full script if required, or a path to it if saved by CommitBuilder
+        "successful_diff_summary": diff_summary, # Storing full diff summary
+        "successful_script": successful_script_str,   # Storing full script string
+        # Storing full script and diff. Consider external storage for extremely large entries in future.
         "patch_source": patch_source if patch_source else "Unknown"
     }
 

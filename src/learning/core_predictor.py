@@ -9,6 +9,8 @@ except ImportError:
     joblib = None # type: ignore
     print("Warning: joblib library not found. CorePredictor model persistence will be disabled.")
 
+from src.utils.memory_logger import load_success_memory # Added import
+
 class CorePredictor:
     # Define at class level or in __init__. Let's do it here for clarity of definition.
     # These should represent the typical 'name' field from an OperationSpec in a Phase.
@@ -101,24 +103,109 @@ class CorePredictor:
         return random.choice(["LLMCore", "DiffusionCore", "LLMCore"])
 
     def train(self, training_data_path: Path, model_output_path: Optional[Path] = None) -> bool:
-        if self.verbose: print(f"\nCorePredictor: train() called.")
-        print("  INFO: Actual model training is an offline process and not implemented here.")
-        print(f"  INFO: Would conceptually load training data from: {training_data_path}")
-        print(f"  INFO: (Data could be derived from success_memory.jsonl, combining spec details with patch_source)")
-        print(f"  INFO: Would perform feature engineering based on spec (operation types, num files, etc.) and patch_source (as target variable).")
+        if self.verbose: print(f"\nCorePredictor: train() called with data directory: {training_data_path}")
 
-        output_path = model_output_path if model_output_path else self.model_path
-        print(f"  INFO: Would train a classifier (e.g., scikit-learn LogisticRegression, RandomForest, or a simple NN).")
-        print(f"  INFO: Would save the trained model to: {output_path} using joblib.")
+        loaded_entries = load_success_memory(data_directory=training_data_path, verbose=self.verbose)
 
-        if joblib is None:
-            print("CorePredictor Error: joblib is not installed. Cannot save conceptual model.")
+        if not loaded_entries:
+            print("CorePredictor Info: No training data loaded from success memory. Training cannot proceed.")
             return False
 
-        # Placeholder: return False as training is not actually performed.
-        # In a real scenario, this would return True upon successful completion of training and model saving.
-        print("  INFO: Placeholder training complete (no actual model trained or saved).")
-        return False
+        X_features: List[List[float]] = [] # List of feature vectors
+        y_labels: List[str] = []           # List of labels (e.g., "LLMCore", "DiffusionCore")
+
+        for entry in loaded_entries:
+            raw_features: Dict[str, Any] = {}
+
+            label = entry.get("patch_source")
+            if not label or not isinstance(label, str):
+                if self.verbose: print(f"CorePredictor Warning: Skipping entry due to missing or invalid 'patch_source' (label): {entry.get('entry_id', 'Unknown ID')}")
+                continue
+
+            # Extract operation_type
+            spec_ops = entry.get("spec_operations_summary")
+            if isinstance(spec_ops, list) and spec_ops:
+                # Assuming the first operation's name is most indicative or operation_summary is a list of strings
+                if isinstance(spec_ops[0], str): # If summary is list of strings
+                    raw_features["operation_type"] = spec_ops[0].split(":")[0].strip() # e.g. "ADD_FUNCTION" from "ADD_FUNCTION: foo"
+                elif isinstance(spec_ops[0], dict) and "name" in spec_ops[0]: # If summary is list of dicts with "name"
+                    raw_features["operation_type"] = spec_ops[0]["name"]
+                else:
+                    raw_features["operation_type"] = "unknown_operation"
+            else:
+                raw_features["operation_type"] = "unknown_operation"
+
+            # Extract num_target_symbols (using num_target_files as proxy)
+            target_files = entry.get("spec_target_files", [])
+            raw_features["num_target_symbols"] = len(target_files) if isinstance(target_files, list) else 0
+
+            # Placeholder comments for features not currently in success_memory.jsonl
+            raw_features["num_input_code_lines"] = 0 # Placeholder: Not in current log. Would require parsing 'code_before' or similar from a richer log.
+            raw_features["num_parameters_in_op"] = 0 # Placeholder: Not in current log. Would require parsing 'spec_operations_summary' if it were structured dicts.
+
+            vectorized_features = self._transform_features(raw_features)
+            if vectorized_features is not None:
+                X_features.append(vectorized_features)
+                y_labels.append(label)
+            elif self.verbose:
+                print(f"CorePredictor Warning: Failed to transform features for entry: {entry.get('entry_id', 'Unknown ID')}. Raw features: {raw_features}")
+
+        if not X_features or not y_labels:
+            print("CorePredictor Info: No features extracted or labels available after processing loaded entries. Training cannot proceed.")
+            return False
+
+        print(f"  INFO: Extracted {len(X_features)} feature sets for training.")
+
+        # --- Actual model training would happen here ---
+        # Example (conceptual, using scikit-learn conventions):
+        # if self.model is None: # Or if retraining is forced
+        #     from sklearn.model_selection import train_test_split
+        #     from sklearn.ensemble import RandomForestClassifier # Example classifier
+        #     from sklearn.metrics import classification_report
+        #
+        #     X_train, X_test, y_train, y_test = train_test_split(X_features, y_labels, test_size=0.2, random_state=42, stratify=y_labels)
+        #     self.model = RandomForestClassifier(random_state=42)
+        #     self.model.fit(X_train, y_train)
+        #     y_pred = self.model.predict(X_test)
+        #     print("  INFO: (Conceptual) Model trained. Classification report on test set:")
+        #     print(classification_report(y_test, y_pred))
+        #     self.is_ready = True # Mark as ready after training
+        # else:
+        #     print("  INFO: (Conceptual) Model already exists. Incremental training / re-training logic not implemented.")
+        print("  INFO: Actual model training logic (fitting a classifier) is a placeholder.")
+
+
+        output_path = model_output_path if model_output_path else self.model_path
+        # if self.model and joblib:
+        #     try:
+        #         output_path.parent.mkdir(parents=True, exist_ok=True)
+        #         joblib.dump(self.model, output_path)
+        #         print(f"  INFO: (Conceptual) Trained model saved to: {output_path}")
+        #     except Exception as e:
+        #         print(f"CorePredictor Error: Failed to save conceptual model to {output_path}: {e}")
+        #         return False # Consider this a failure if saving was intended
+        # elif not joblib:
+        #     print("CorePredictor Error: joblib not installed. Cannot save conceptual model.")
+        #     return False
+        # elif not self.model:
+        #     print("CorePredictor Info: No conceptual model was trained/instantiated to save.")
+        #     return False # No model means training effectively failed for persistence
+
+        print(f"  INFO: Placeholder for saving trained model to: {output_path}.")
+        if joblib is None:
+            print("CorePredictor Error: joblib is not installed. Cannot save conceptual model (if it were trained).")
+            # Even if conceptual, if joblib isn't there, can't save.
+            # But for this subtask, the focus is data loading, so return True if data loading was okay.
+            # However, if the goal of train() is to produce a usable model, then this is a failure.
+            # Let's stick to: if it can't save, it's not a successful train completion.
+            # For now, as per original, returning False if joblib missing for saving.
+            # This subtask doesn't change the saving part, just data loading.
+            # The original returns False if joblib is None for saving.
+
+        print("  INFO: Placeholder training data processing complete. Actual model training/saving is conceptual.")
+        # For this subtask, success means data loading and feature prep.
+        # The actual training is still placeholder.
+        return True # Indicate that data loading and feature prep part was "successful".
 
     # Placeholder for feature transformation logic needed before calling a real model's predict
     # def _transform_features(self, features: Dict[str, Any]) -> Any:

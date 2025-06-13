@@ -16,7 +16,8 @@ except ImportError:
 
 # Imports for actual classes
 from src.planner.spec_model import Spec # Assuming this is the correct path
-from .t5_client import T5Client
+from .t5_client import T5Client # Keep for __main__ and type hint if not replacing everywhere
+from .spec_normalizer_interface import SpecNormalizerModelInterface # New import
 
 if TYPE_CHECKING:
     from src.retriever.symbol_retriever import SymbolRetriever # For type hinting
@@ -33,29 +34,30 @@ else: # Runtime: try to import, or define a placeholder if it fails, for __main_
 class SpecFusion:
     # TODO: Phase 3 original plan specifies a LoRA-compressed diffusion model for spec normalization,
     # potentially trained/retrainable on "raw issue -> cleaned YAML spec" pairs.
-    # Current implementation uses a general T5 model via T5Client for direct YAML generation from text.
-    # The LoRA/diffusion adaptation and training capabilities are not yet implemented.
+    # Current implementation uses a model compliant with SpecNormalizerModelInterface (e.g., T5Client)
+    # for direct YAML generation. The LoRA/diffusion adaptation and specific training
+    # capabilities for such advanced models are not yet implemented. This interface is the integration point.
     def __init__(
         self,
-        t5_client: T5Client,
+        spec_model_interface: SpecNormalizerModelInterface, # Changed parameter
         symbol_retriever: 'SymbolRetriever',
         app_config: Dict[str, Any]
     ):
         """
         Initializes the SpecFusion component.
         Args:
-            t5_client: An instance of T5Client.
+            spec_model_interface: An instance conforming to SpecNormalizerModelInterface.
             symbol_retriever: An instance of SymbolRetriever.
             app_config: Application configuration dictionary.
                         Expected keys:
                         - general.verbose (bool, optional)
         """
-        self.t5_client = t5_client
+        self.spec_model = spec_model_interface # Changed attribute
         self.symbol_retriever = symbol_retriever
         self.app_config = app_config
         self.verbose = self.app_config.get("general", {}).get("verbose", False)
         if self.verbose:
-            print(f"SpecFusion initialized. T5Client ready: {self.t5_client.is_ready}, SymbolRetriever type: {type(self.symbol_retriever)}")
+            print(f"SpecFusion initialized. Spec Model Interface ready: {self.spec_model.is_ready}, SymbolRetriever type: {type(self.symbol_retriever)}")
 
     def normalise_request(self, raw_issue_text: str) -> Optional[Spec]:
         """
@@ -114,12 +116,16 @@ class SpecFusion:
         elif self.verbose:
             print("SpecFusion: SymbolRetriever not available. Proceeding without enriched context.")
 
-        # 2. Call T5Client
-        if self.verbose: print("SpecFusion: Requesting YAML spec from T5Client...")
-        yaml_spec_str = self.t5_client.request_spec_from_text(raw_issue_text, context_symbols_string) # Pass the enriched context
+        # 2. Call Spec Normalizer Model
+        if not self.spec_model.is_ready:
+            print("SpecFusion Error: SpecNormalizerModelInterface (e.g., T5Client) not ready. Cannot process request.")
+            return None
+
+        if self.verbose: print("SpecFusion: Requesting YAML spec from SpecNormalizerModelInterface...")
+        yaml_spec_str = self.spec_model.generate_spec_yaml(raw_issue_text, context_symbols_string)
 
         if yaml_spec_str is None:
-            print("SpecFusion Error: T5Client failed to generate YAML spec string (returned None).")
+            print("SpecFusion Error: SpecNormalizerModelInterface failed to generate YAML spec string (returned None).")
             return None
 
         if self.verbose:

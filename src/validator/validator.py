@@ -296,90 +296,116 @@ class Validator:
             return f"An unexpected error occurred while running Black on '{file_path.name}': {e}"
         finally:
             if tmp_file_path_str and Path(tmp_file_path_str).exists():
-                os.remove(tmp_file_path_str)
+                os.remove(tmp_file_path_str) # Corrected variable name here
 
-    def _run_pytest(self, target_file_path: Path, project_root: Path, digester: 'RepositoryDigester', modified_content_for_target_file: str) -> Optional[str]:
+    def _run_pytest(self, target_file_path: Path, project_root: Path, modified_content_for_target_file: str) -> Optional[str]:
         """
-        Runs Pytest. This is a simplified version that runs tests either on the
-        modified file if it's a test file, or on a default test directory.
-        A full implementation would require setting up a temporary project copy with the
-        modified file to ensure tests run against the exact changes in full project context.
+        Runs Pytest in a temporary copy of the project with the modified file.
+        Args:
+            target_file_path: Absolute path to the file being modified in the original project.
+            project_root: Absolute path to the root of the original project.
+            modified_content_for_target_file: The new content for the target file.
+        Returns:
+            A string containing Pytest error messages, or None if tests passed or no tests were found.
         """
-        if self.verbose:
-            print(f"Validator: Preparing to run Pytest for target file '{target_file_path}' within project '{project_root}'.")
-            print(f"Validator: Modified content length for target file: {len(modified_content_for_target_file)}.")
-
-        tmp_target_file_pytest_path_str: Optional[str] = None
+        pytest_errors_str: Optional[str] = None
+        # Ensure shutil is imported at the top of the file
+        import shutil
 
         try:
-            # Write the modified content to a temporary file.
-            # This file will be the one pytest potentially runs against if target_file_path is a test file.
-            # We create it outside project_root to avoid polluting the original project.
-            with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False, encoding='utf-8') as tmp_target_file_for_pytest:
-                tmp_target_file_for_pytest.write(modified_content_for_target_file)
-                tmp_target_file_pytest_path_str = tmp_target_file_for_pytest.name
+            with tempfile.TemporaryDirectory(prefix="pytest_validation_") as temp_dir_name:
+                temp_project_path = Path(temp_dir_name)
 
-            pytest_target_str: str
-            # Check if the original target_file_path (relative to project_root) indicates a test file.
-            # target_file_path is already absolute here. We need its path relative to project_root for this check.
-            relative_target_path_str = str(target_file_path.relative_to(project_root))
-
-            if relative_target_path_str.startswith(self.default_pytest_target_dir) or \
-               "test" in target_file_path.name.lower():
-                # If the modified file itself is a test file, run pytest on the temporary version of this modified file.
-                pytest_target_str = tmp_target_file_pytest_path_str
-                if self.verbose: print(f"Validator: Pytest target is the modified test file (as temp file): {pytest_target_str}")
-            else:
-                # Otherwise, run tests in the default test directory within the original project.
-                # This won't directly test the 'modified_content_for_target_file' unless tests are designed
-                # to pick up changes from the original file location which this temporary file doesn't update.
-                # This is a key simplification.
-                default_test_dir_abs = project_root / self.default_pytest_target_dir
-                if default_test_dir_abs.exists() and default_test_dir_abs.is_dir():
-                    pytest_target_str = str(default_test_dir_abs)
-                else: # Fallback to project root if default test dir doesn't exist
-                    pytest_target_str = str(project_root)
                 if self.verbose:
-                    print(f"Validator: Pytest target is default test location: {pytest_target_str}.")
-                    print(f"Validator: Note - This Pytest run may not directly cover the unapplied changes in the temporary file '{tmp_target_file_pytest_path_str}' unless '{target_file_path.name}' was already part of the test suite.")
+                    print(f"Validator: Creating temporary project copy at {temp_project_path}")
 
-            command = [self.pytest_path, pytest_target_str, "-qq", "--disable-warnings"]
-            if self.verbose: print(f"Validator: Running Pytest: {' '.join(command)} from CWD: {project_root}")
+                # 1. Copy project to temp directory
+                shutil.copytree(
+                    project_root,
+                    temp_project_path,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns('.git', '.venv', 'venv', '__pycache__', '*.pyc', '.*', 'node_modules')
+                )
 
-            result = subprocess.run(command, capture_output=True, text=True, check=False, cwd=project_root)
+                # 2. Apply modification in the temporary copy
+                relative_target_path = target_file_path.relative_to(project_root)
+                copied_target_file_path = temp_project_path / relative_target_path
+                copied_target_file_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(copied_target_file_path, "w", encoding='utf-8') as f:
+                    f.write(modified_content_for_target_file)
 
-            if result.returncode != 0 and result.returncode != 5: # 0=all pass, 5=no tests collected
-                error_message = f"Pytest failed for target '{pytest_target_str}' (exit code {result.returncode}):\n"
-                # Basic parsing for failure summary. JUnitXML would be more robust.
-                failure_summary = []
-                in_failures_section = False
-                for line in result.stdout.splitlines():
-                    if "=== FAILURES ===" in line:
-                        in_failures_section = True
-                    if in_failures_section:
-                        if line.startswith("_") or line.startswith("E ") or line.startswith(" "): # Typical lines in pytest failure block
-                            failure_summary.append(line)
+                if self.verbose:
+                    print(f"Validator: Applied modified content to {copied_target_file_path}")
+
+                # 3. Determine Pytest target(s)
+                pytest_run_location = temp_project_path # CWD for pytest
+                specific_test_targets: List[str] = []
+
+                # Check if the original target_file_path is within the project's default test directory structure
+                # or if its name suggests it's a test file.
+                # project_root / self.default_pytest_target_dir gives the absolute path to the default test dir.
+                is_target_in_test_dir = str(target_file_path).startswith(str(project_root / self.default_pytest_target_dir))
+                is_target_a_test_file_by_name = "test" in target_file_path.name.lower()
+
+                if is_target_in_test_dir or is_target_a_test_file_by_name:
+                    # If the modified file is a test file, test it directly (using its relative path within the temp project)
+                    specific_test_targets.append(str(relative_target_path))
+                    if self.verbose: print(f"Validator: Pytest will target the modified test file: {relative_target_path}")
+                else:
+                    # If modified file is not a test file, run tests in the default test directory within the temp copy.
+                    default_test_dir_in_temp_rel_path = self.default_pytest_target_dir
+                    if (temp_project_path / default_test_dir_in_temp_rel_path).is_dir():
+                        specific_test_targets.append(default_test_dir_in_temp_rel_path)
+                        if self.verbose: print(f"Validator: Pytest will target default test directory: {default_test_dir_in_temp_rel_path}")
+                    else:
+                        specific_test_targets.append(".") # Fallback to run all tests in temp project root
+                        if self.verbose: print(f"Validator: Default test directory not found in temp copy. Pytest will target temp project root '.'")
+
+                # 4. Execute Pytest
+                command = [self.pytest_path] + specific_test_targets + ["-qq", "--disable-warnings", "--cache-clear"]
+                if self.verbose: print(f"Validator: Running Pytest: {' '.join(command)} in CWD: {pytest_run_location}")
+
+                result = subprocess.run(command, capture_output=True, text=True, check=False, cwd=pytest_run_location)
+
+                # 5. Process results
+                if result.returncode != 0 and result.returncode != 5: # 0=all pass, 5=no tests collected
+                    error_message = f"Pytest failed (exit code {result.returncode}) for targets '{' '.join(specific_test_targets)}' in temp project '{temp_project_path}'.\n"
+                    failure_summary = []
+                    in_failures_section = False
+                    # Pytest failures usually go to stdout. Stderr might have pytest operational issues.
+                    output_to_parse = result.stdout
+                    if not result.stdout.strip() and result.stderr.strip(): # If stdout is empty but stderr has content
+                        output_to_parse = result.stderr
+
+                    for line in output_to_parse.splitlines():
+                        if "=== FAILURES ===" in line: in_failures_section = True
+                        # Heuristic: include lines that seem part of failure reports or summaries
+                        if in_failures_section or line.startswith("E ") or " error " in line.lower() or " failed " in line.lower():
+                            if line.strip(): failure_summary.append(line)
                         elif failure_summary and not line.strip(): # Blank line might end a specific failure detail block
-                             pass # Keep collecting until end of output or new section
-                if failure_summary:
-                    error_message += "\n".join(failure_summary)
-                else: # Fallback if parsing fails
-                    error_message += result.stdout.strip() if result.stdout.strip() else result.stderr.strip()
-                return error_message
+                             pass
 
-            if result.returncode == 5:
-                if self.verbose: print(f"Validator: Pytest: No tests collected for target '{pytest_target_str}'.")
-                # Consider if "no tests collected" should be an error. For now, treating as non-failure.
+                    if failure_summary:
+                        error_message += "\n".join(failure_summary)
+                    elif result.stdout.strip(): # Fallback if parsing found nothing but there's stdout
+                        error_message += result.stdout.strip()
+                    elif result.stderr.strip(): # Fallback to stderr if stdout also empty
+                        error_message += result.stderr.strip()
+                    else: # Should not happen if returncode is non-zero
+                        error_message += "No detailed output found in stdout/stderr."
+                    pytest_errors_str = error_message
 
-            return None # Tests passed or no tests found/collected.
+                elif result.returncode == 5:
+                    if self.verbose: print(f"Validator: Pytest: No tests collected for targets '{' '.join(specific_test_targets)}' in temp project.")
 
-        except FileNotFoundError:
-            return f"Pytest executable not found at '{self.pytest_path}'. Please configure 'pytest_path' or ensure Pytest is in PATH."
+                # No errors if result.returncode == 0 (tests passed)
+
+        except FileNotFoundError: # This specifically catches if self.pytest_path is not found
+            pytest_errors_str = f"Pytest executable not found at '{self.pytest_path}'. Please ensure Pytest is installed and 'pytest_path' is correctly configured or in PATH."
         except Exception as e:
-            return f"An unexpected error occurred while running Pytest on '{target_file_path.name}': {e}"
-        finally:
-            if tmp_target_file_pytest_path_str and Path(tmp_target_file_pytest_path_str).exists():
-                os.remove(tmp_target_file_pytest_path_str)
+            pytest_errors_str = f"An unexpected error occurred during Pytest execution: {type(e).__name__} - {e}"
+
+        return pytest_errors_str
 
     def validate_patch(
         self,
@@ -427,8 +453,8 @@ class Validator:
 
         # Pytest runs on the project state. The modified_code_content_str represents the change
         # to one file. A real pytest would run against the filesystem.
-        # The mock _run_pytest uses digester to potentially access other content if needed.
-        pytest_errors = self._run_pytest(target_file_path, project_root, digester, modified_code_content_str) # Pass modified content
+        # Removed digester from _run_pytest call as it's no longer needed with full project copy.
+        pytest_errors = self._run_pytest(target_file_path, project_root, modified_code_content_str)
         if pytest_errors: all_errors.append(pytest_errors)
 
         if not all_errors:

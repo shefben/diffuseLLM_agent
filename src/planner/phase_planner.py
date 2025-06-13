@@ -142,7 +142,7 @@ class PhasePlanner:
         # Instantiate Child Components (Passing app_config or derived configs)
         self.t5_client = T5Client(app_config=self.app_config)
         self.symbol_retriever = SymbolRetriever(digester=self.digester, app_config=self.app_config)
-        self.spec_normalizer = SpecFusion(t5_client=self.t5_client, symbol_retriever=self.symbol_retriever, app_config=self.app_config)
+        self.spec_normalizer = SpecFusion(spec_model_interface=self.t5_client, symbol_retriever=self.symbol_retriever, app_config=self.app_config)
         self.validator = Validator(app_config=self.app_config)
         if self.verbose: print("PhasePlanner: Validator instance initialized.")
 

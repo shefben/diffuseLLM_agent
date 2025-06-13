@@ -170,78 +170,134 @@ class CommitBuilder:
         full_commit_message: str, # Combined commit message
         formatted_content_map: Dict[Path, str], # file_path -> new_content
         project_root: Path
-    ) -> None:
+    ) -> bool:
         """
-        Mocks the process of submitting changes via Git.
-        Prints the git commands that would be run.
+        Submits changes via Git by checking out a new branch, adding files,
+        committing, and optionally pushing.
+        Returns:
+            True if all Git operations were successful, False otherwise.
         """
-        print(f"\nCommitBuilder: Attempting (mock) Git submission for branch '{branch_name}' in project '{project_root}'...")
+        if self.verbose:
+            print(f"\nCommitBuilder: Attempting Git submission for branch '{branch_name}' in project '{project_root}'...")
 
         # 1. Checkout new branch
-        # In a real scenario, we'd need to check if branch exists, handle errors, etc.
-        # Also, ensure we are in the correct directory (project_root).
-        git_command_checkout = ["git", "checkout", "-b", branch_name]
-        print(f"  1. Would change CWD to: {project_root}")
-        print(f"  2. Would run: {' '.join(git_command_checkout)}")
+        if self.verbose: print(f"  1. Checking out new branch '{branch_name}'...")
+        checkout_command = ["git", "checkout", "-b", branch_name]
+        if not self._run_git_command(checkout_command, project_root):
+            # Attempt to checkout existing branch if -b fails (e.g. branch already exists from a previous run)
+            if self.verbose: print(f"  Branch creation failed, attempting to checkout existing branch '{branch_name}'...")
+            checkout_existing_command = ["git", "checkout", branch_name]
+            if not self._run_git_command(checkout_existing_command, project_root):
+                print(f"CommitBuilder Error: Failed to checkout new or existing branch '{branch_name}'.")
+                return False
 
-        # 2. Write files
-        print(f"  3. Would write/overwrite {len(formatted_content_map)} files:")
+        # 2. Write files (This part is not a git command, but file system operations)
+        if self.verbose: print(f"  2. Writing/overwriting {len(formatted_content_map)} files to working directory...")
         paths_to_add_relative: List[str] = []
         if not project_root.exists() or not project_root.is_dir():
-            print(f"     ERROR: Project root {project_root} does not exist or is not a directory. Skipping file writes.")
-        else:
-            for file_abs_path, content in formatted_content_map.items():
-                # Ensure file_abs_path is within project_root for safety before trying to get relative path
-                try:
-                    # If file_abs_path is already relative (e.g. from validated_patch_content_map keys),
-                    # it needs to be made absolute first for writing, then relative for git add.
-                    # Assuming keys in formatted_content_map are absolute or resolvable against project_root.
-                    if not file_abs_path.is_absolute():
-                        actual_abs_path = (project_root / file_abs_path).resolve()
-                    else:
-                        actual_abs_path = file_abs_path.resolve()
+            print(f"CommitBuilder Error: Project root {project_root} does not exist or is not a directory. Skipping file writes.")
+            return False # Cannot proceed without project root
 
-                    # Ensure the path is truly within the project_root after resolving
-                    # This is a basic safety check.
-                    actual_abs_path.relative_to(project_root) # This will raise ValueError if not under project_root
+        for file_rel_path_obj, content in formatted_content_map.items(): # Assuming keys are Path objects relative to project_root
+            try:
+                actual_abs_path = (project_root / file_rel_path_obj).resolve()
+                # Security check: Ensure path is within project_root
+                actual_abs_path.relative_to(project_root)
 
-                    file_rel_path_for_git = actual_abs_path.relative_to(project_root)
-                    paths_to_add_relative.append(str(file_rel_path_for_git))
-                    print(f"    - Writing to file: {actual_abs_path} ({len(content)} bytes)")
-                    # Mock actual write:
-                    # actual_abs_path.parent.mkdir(parents=True, exist_ok=True) # Ensure parent dir exists
-                    # with open(actual_abs_path, 'w', encoding='utf-8') as f:
-                    #     f.write(content)
-                except ValueError:
-                    print(f"     ERROR: File path {file_abs_path} is not within project root {project_root}. Skipping.")
-                except Exception as e:
-                    print(f"     ERROR: Could not process file {file_abs_path}: {e}. Skipping.")
-
+                actual_abs_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(actual_abs_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                if self.verbose: print(f"    - Wrote to file: {actual_abs_path}")
+                paths_to_add_relative.append(str(file_rel_path_obj)) # Add relative path for 'git add'
+            except ValueError: # Path outside project_root
+                print(f"CommitBuilder Error: File path {file_rel_path_obj} resolved outside project root {project_root}. Skipping.")
+                return False # Security risk or misconfiguration
+            except Exception as e:
+                print(f"CommitBuilder Error: Could not write file {file_rel_path_obj}: {e}")
+                return False
 
         # 3. Stage changes
-        if paths_to_add_relative:
-            git_command_add_files = ["git", "add"] + paths_to_add_relative
-            print(f"  4. Would run: {' '.join(git_command_add_files)}")
+        if not paths_to_add_relative:
+            if self.verbose: print("  3. No files specified to stage for Git. This might be okay if the commit is for other reasons (e.g. merge).")
         else:
-            print("  4. No files to stage (or errors occurred).")
-
+            if self.verbose: print(f"  3. Staging {len(paths_to_add_relative)} files...")
+            add_command = ["git", "add"] + paths_to_add_relative
+            if not self._run_git_command(add_command, project_root):
+                print(f"CommitBuilder Error: Failed to stage files: {paths_to_add_relative}")
+                return False
 
         # 4. Commit
-        # For subprocess, commit message might need to be passed via temp file or stdin if too long.
-        # Using -F <file> or piping to stdin is safer for complex messages.
-        # For mock, just show a snippet.
-        git_command_commit = ["git", "commit", "-m", full_commit_message] # This is unsafe for real use if message is complex
-        print(f"  5. Would run: git commit -m \"{full_commit_message[:100].replace(chr(10), ' ')}...\" (message length: {len(full_commit_message)})")
-        # Real example might be: subprocess.run(['git', 'commit', '-F', '-'], input=full_commit_message.encode('utf-8'), ...)
+        if self.verbose: print(f"  4. Committing changes (message length: {len(full_commit_message)})...")
+        # Using -F - to pass commit message via stdin for safety with complex messages
+        commit_command = ["git", "commit", "-F", "-"]
+        if not self._run_git_command(commit_command, project_root, input_data=full_commit_message):
+            # Note: 'git commit' can fail if there's nothing to commit (e.g., if 'git add' didn't actually stage changes)
+            # or if pre-commit hooks fail. The _run_git_command helper will print stderr.
+            print(f"CommitBuilder Error: Failed to commit changes.")
+            # Check if it failed because there was nothing to commit (can happen if files were written but resulted in no diff)
+            # This requires inspecting stderr, which _run_git_command already prints.
+            # For now, any commit failure is treated as an error for the submission process.
+            return False
 
-        # 5. Push branch (Optional for mock)
-        git_command_push = ["git", "push", "-u", "origin", branch_name]
-        print(f"  6. (Optional) Would run: {' '.join(git_command_push)}")
+        # 5. Push branch (Conditional)
+        auto_push_config = self.app_config.get("git_submission", {}).get("auto_push", False)
+        if auto_push_config:
+            if self.verbose: print(f"  5. Auto-push enabled. Pushing branch '{branch_name}' to origin...")
+            push_command = ["git", "push", "-u", "origin", branch_name]
+            if not self._run_git_command(push_command, project_root):
+                print(f"CommitBuilder Error: Failed to push branch '{branch_name}'.")
+                return False # Push failure means overall submission failure if auto-push is on
+        else:
+            if self.verbose: print("  5. Auto-push disabled. Skipping 'git push'.")
 
-        # 6. Open Pull Request (Conceptual)
-        print(f"  7. (Conceptual) Would open a pull request for branch '{branch_name}' against the main branch (e.g., via GitHub CLI or API).")
+        # 6. Open Pull Request (Conceptual - not implemented via subprocess here)
+        if self.verbose:
+             print(f"  6. (Conceptual) Next step would be to open a pull request for branch '{branch_name}' against the main branch.")
 
-        print("CommitBuilder: (Mock) Git submission process outlined.") # This line belongs to the old submit_via_git
+        print("CommitBuilder: Git submission process completed.")
+        return True # Assuming all steps including conditional push were successful
+        return True # Assuming all steps including conditional push were successful
+
+    def _run_git_command(self, command: List[str], project_root: Path, input_data: Optional[str] = None) -> bool:
+        """
+        Runs a Git command using subprocess.
+        Args:
+            command: The Git command and its arguments as a list of strings.
+            project_root: The Path to the root of the Git repository (used as cwd).
+            input_data: Optional string data to pass to the command's stdin (e.g., for commit messages).
+        Returns:
+            True if the command was successful (exit code 0), False otherwise.
+        """
+        if self.verbose:
+            print(f"CommitBuilder: Running Git command: {' '.join(command)} in {project_root}")
+
+        try:
+            process = subprocess.run(
+                command,
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                input=input_data,
+                check=False # Handle non-zero exit codes manually
+            )
+            if process.returncode == 0:
+                if self.verbose and process.stdout:
+                    print(f"Git command stdout:\n{process.stdout}")
+                if self.verbose and process.stderr: # Some successful git commands print to stderr (e.g. 'git checkout -b')
+                    print(f"Git command stderr (info):\n{process.stderr}")
+                return True
+            else:
+                print(f"CommitBuilder Error: Git command failed with exit code {process.returncode}")
+                print(f"  Command: {' '.join(command)}")
+                if process.stdout: print(f"  Stdout:\n{process.stdout}")
+                if process.stderr: print(f"  Stderr:\n{process.stderr}")
+                return False
+        except FileNotFoundError:
+            print(f"CommitBuilder Error: Git command not found (usually 'git'). Ensure Git is installed and in PATH.")
+            return False
+        except Exception as e:
+            print(f"CommitBuilder Error: An unexpected error occurred while running Git command {' '.join(command)}: {e}")
+            return False
 
     def save_patch_to_filesystem(
         self,

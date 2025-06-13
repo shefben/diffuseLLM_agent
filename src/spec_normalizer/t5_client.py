@@ -2,6 +2,8 @@
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+from .spec_normalizer_interface import SpecNormalizerModelInterface
+
 # Guarded import for Hugging Face Transformers and PyTorch
 try:
     import torch
@@ -12,7 +14,7 @@ except ImportError:
     T5TokenizerFast = None # type: ignore
     print("Warning: PyTorch or Hugging Face Transformers not found. T5Client will not function with real models.")
 
-class T5Client:
+class T5Client(SpecNormalizerModelInterface):
     # NOTE: This T5Client uses a standard T5ForConditionalGeneration model.
     # Phase 3 of the original plan mentions a LoRA-adapted Tiny-T5 diffusion pipeline
     # for the SpecFusion component, which this client serves. The LoRA adaptation
@@ -40,8 +42,12 @@ class T5Client:
         self.model: Optional[T5ForConditionalGeneration] = None
         self.tokenizer: Optional[T5TokenizerFast] = None
         self.device: Optional[str] = None
-        self.is_ready: bool = False
+        self._is_ready: bool = False # Renamed attribute
         self._load_model()
+
+    @property
+    def is_ready(self) -> bool:
+        return self._is_ready
 
     def _load_model(self) -> None:
         """
@@ -50,7 +56,7 @@ class T5Client:
         """
         if T5ForConditionalGeneration is None or T5TokenizerFast is None or torch is None:
             print("T5Client Error: Required libraries (Transformers/PyTorch) not installed. Model loading aborted.")
-            self.is_ready = False
+            self._is_ready = False # Use renamed attribute
             return
 
         actual_model_path: str
@@ -86,17 +92,18 @@ class T5Client:
             self.model = T5ForConditionalGeneration.from_pretrained(actual_model_path).to(self.device) # type: ignore
             self.model.eval() # type: ignore
 
-            self.is_ready = True
+            self._is_ready = True # Use renamed attribute
             print(f"T5Client Info: Model '{actual_model_path}' loaded successfully on {self.device}.")
         except Exception as e:
             print(f"T5Client Error: Failed to load model/tokenizer from '{actual_model_path}': {e}")
-            self.is_ready = False
+            self._is_ready = False # Use renamed attribute
             self.model = None
             self.tokenizer = None
 
-    def request_spec_from_text(self, raw_issue_text: str, context_symbols_string: Optional[str] = None) -> Optional[str]:
+    def generate_spec_yaml(self, raw_issue_text: str, context_symbols_string: Optional[str] = None) -> Optional[str]:
         """
-        Requests a structured YAML specification from the T5 model based on raw issue text.
+        Generates a YAML specification string from raw issue text and context.
+        Returns None if generation fails.
 
         Args:
             raw_issue_text: The raw text description of the issue.
@@ -105,7 +112,7 @@ class T5Client:
         Returns:
             A string containing the YAML specification, or None if an error occurs or model is not ready.
         """
-        if not self.is_ready or self.model is None or self.tokenizer is None:
+        if not self.is_ready or self.model is None or self.tokenizer is None: # Property is_ready used here
             print("T5Client Error: Model not ready or not loaded. Cannot process request.")
             return None
 
