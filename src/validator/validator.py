@@ -91,6 +91,27 @@ class Validator:
                 print("Validator: Heuristic fix applied - added trailing newline to the script content.")
                 return modified_script # Return after first successful fix
 
+        # Heuristic 3: Remove trailing commas before closing delimiters
+        # This is a common syntax error if an LLM adds a comma in a place it's not allowed,
+        # e.g. func_call(arg1, arg2,) or def func(p1, p2,):
+        # Note: Black often allows trailing commas in lists/dicts, but this handles invalid ones.
+        # This specifically targets commas immediately followed by optional whitespace and then a closer.
+
+        # Regex patterns:
+        # 1. Comma before closing parenthesis:  ,\s*\)
+        # 2. Comma before closing square bracket: ,\s*\]
+        # 3. Comma before closing curly brace:   ,\s*\}
+
+        original_script_for_comma_check = modified_script # Keep a copy to see if changes were made
+
+        modified_script = re.sub(r",\s*\)", ")", modified_script)
+        modified_script = re.sub(r",\s*\]", "]", modified_script)
+        modified_script = re.sub(r",\s*\}", "}", modified_script)
+
+        if modified_script != original_script_for_comma_check:
+            print("Validator: Heuristic fix applied - removed trailing comma(s) before closing parenthesis/bracket/brace.")
+            return modified_script
+
         # If no heuristics were applied, or if a heuristic made a change but didn't return early
         if modified_script == original_patch_script_str:
             print(f"Validator: No applicable heuristic fixes successfully applied for target '{target_file_path_str}'.")

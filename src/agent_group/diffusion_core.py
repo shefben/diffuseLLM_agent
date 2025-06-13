@@ -219,12 +219,9 @@ Provide only the code snippet to replace `{hole_marker}`:"""
                          proposed_fix_script: Optional[str],
                          context_data: Dict[str, Any]
                          ) -> Optional[str]:
-        # TODO: This method is currently a passthrough for the proposed_fix_script.
-        # Phase 5 Spec: "DiffusionCore re-denoises only the affected spans to maintain global coherence."
-        # Implementing actual span-based re-denoising with a diffusion model is a complex
-        # future enhancement. Current behavior does not perform any denoising or intelligent merging.
         """
-        Currently, this method passes through the proposed_fix_script from LLMCore.
+        Currently, this method passes through the proposed_fix_script from LLMCore,
+        with a specific check for full script replacement markers.
         Future enhancements could involve more sophisticated merging or diffusion-based refinement.
 
         Args:
@@ -243,23 +240,32 @@ Provide only the code snippet to replace `{hole_marker}`:"""
         else:
             print(f"DiffusionCore.re_denoise_spans called.")
 
-        # This method acts as a pass-through for the script proposed by LLMCore.
-        # The primary role of LLMCore.propose_repair_diff is to provide a complete, revised script.
-        # DiffusionCore here confirms that proposal and passes it on.
-        # Future enhancements for more complex merging/denoising are out of scope for this refinement.
+        if proposed_fix_script and proposed_fix_script.startswith("# Original script commented out due to DUPLICATE_DETECTED"):
+            if self.verbose:
+                print("DiffusionCore: Detected full script replacement proposal (e.g., for duplicate handling). Passing through.")
+            return proposed_fix_script
+
+        # TODO: This method currently passes through most 'proposed_fix_script's.
+        # Phase 5 Spec: "DiffusionCore re-denoises only the affected spans to maintain global coherence."
+        # Future enhancements for true span-based re-denoising or intelligent merging:
+        # 1. Identify affected spans: Use traceback information (from context_data if available from the validation failure)
+        #    or diff `proposed_fix_script` against `failed_patch_script` to find changed regions.
+        # 2. Contextual Merge: If the fix is small, attempt to apply it contextually to `failed_patch_script`.
+        # 3. Diffusion Model: For true re-denoising, a diffusion model would take the `failed_patch_script`,
+        #    the `proposed_fix_script` (or its summary/intent), and context to regenerate only the affected spans.
+        # Current behavior does not perform these advanced operations.
 
         if proposed_fix_script is None:
-            print("DiffusionCore: No proposed fix script received from LLMCore. Passing through None.")
+            print("DiffusionCore: No proposed fix script received from LLMCore (for targeted repair). Passing through None.")
             return None
         else:
-            # Ensure proposed_fix_script is a string, though type hints suggest it should be.
             if not isinstance(proposed_fix_script, str):
-                print(f"DiffusionCore Warning: proposed_fix_script is not a string (type: {type(proposed_fix_script)}). Attempting to cast. This is unexpected.")
+                print(f"DiffusionCore Warning: proposed_fix_script is not a string (type: {type(proposed_fix_script)}). Attempting to cast.")
                 try:
                     proposed_fix_script = str(proposed_fix_script)
                 except Exception as e_cast:
                     print(f"DiffusionCore Error: Failed to cast proposed_fix_script to string: {e_cast}. Returning None.")
                     return None
 
-            print(f"DiffusionCore: Passing through proposed fix script (length: {len(proposed_fix_script)}) from LLMCore as the 're-denoised' script.")
+            print(f"DiffusionCore: Passing through LLM-proposed targeted fix script (length: {len(proposed_fix_script)}) as is (no re-denoising).")
             return proposed_fix_script

@@ -203,34 +203,71 @@ class StyleValidatorCore:
                                  (not actual_string_part.startswith(TRIPLE_SINGLE_QUOTE_STR) and actual_string_part.startswith('"')):
                                 double_q_count += 1
                     total_quotes = single_q_count + double_q_count
+                    quote_penalty = 0.0
                     if total_quotes > 0:
-                        if preferred_quote_style == "single" and double_q_count > single_q_count:
-                            total_penalty += w_quotes * (double_q_count / total_quotes)
-                        elif preferred_quote_style == "double" and single_q_count > double_q_count:
-                            total_penalty += w_quotes * (single_q_count / total_quotes)
+                        if preferred_quote_style == "single":
+                            quote_penalty = w_quotes * (double_q_count / total_quotes)
+                        elif preferred_quote_style == "double":
+                            quote_penalty = w_quotes * (single_q_count / total_quotes)
+                    total_penalty += quote_penalty
                 except tokenize.TokenError:
-                    total_penalty += w_quotes
+                    total_penalty += w_quotes # Max penalty if tokenization fails
 
             docstring_style_from_profile = effective_style.get("docstring_style")
             if docstring_style_from_profile and docstring_style_from_profile != "none":
                 max_possible_penalty_for_performed_checks += w_docstrings
                 public_elements_total = 0
                 public_elements_missing_docstrings = 0
+                public_elements_bad_style = 0 # Initialize bad style counter
                 for node in ast.walk(tree):
                     is_public_definable = False
                     node_name = ""
+                    docstring = None # Initialize docstring here
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                         node_name = node.name
                         if not node_name.startswith("_"):
                             is_public_definable = True
                     elif isinstance(node, ast.Module):
                         is_public_definable = True
+
                     if is_public_definable:
                         public_elements_total += 1
-                        if not ast.get_docstring(node, clean=False):
+                        docstring = ast.get_docstring(node, clean=False)
+                        if not docstring:
                             public_elements_missing_docstrings += 1
+                        else:
+                            # Basic Docstring Style Conformity Check
+                            style_violation = False
+                            expected_doc_style = effective_style.get("docstring_style") # Already fetched as docstring_style_from_profile
+
+                            if expected_doc_style == "google":
+                                # Simplified check: "Args:" or "Arguments:" must be present, AND
+                                # one of "Returns:", "Yields:", or "Raises:" must be present.
+                                has_args = "Args:" in docstring or "Arguments:" in docstring
+                                has_returns_yields_raises = "Returns:" in docstring or "Yields:" in docstring or "Raises:" in docstring
+                                if not (has_args and has_returns_yields_raises):
+                                    # Allow if it's a short summary docstring (e.g. one line, no sections)
+                                    # This check is very basic. A more robust check would parse sections.
+                                    if len(docstring.splitlines()) > 2: # Arbitrary threshold for "short"
+                                        style_violation = True
+                            elif expected_doc_style == "numpy":
+                                # Simplified check: "Parameters\n" and "----------\n" (under Parameters) must be present,
+                                # AND "Returns\n" and "-------\n" (under Returns) must be present.
+                                # This assumes the clean=False docstring has raw newlines.
+                                has_params_header = "Parameters\n" in docstring and "----------" in docstring
+                                has_returns_header = "Returns\n" in docstring and "-------" in docstring # NumPy uses one less dash for Returns
+                                # More robust: check if "----------" is *after* "Parameters" and before next section
+                                if not (has_params_header and has_returns_header):
+                                     if len(docstring.splitlines()) > 3: # Arbitrary threshold
+                                        style_violation = True
+
+                            if style_violation:
+                                public_elements_bad_style += 1
+
                 if public_elements_total > 0:
-                    total_penalty += w_docstrings * (public_elements_missing_docstrings / public_elements_total)
+                    effective_docstring_violations = public_elements_missing_docstrings + (0.5 * public_elements_bad_style)
+                    docstring_penalty_factor = effective_docstring_violations / public_elements_total
+                    total_penalty += w_docstrings * docstring_penalty_factor
 
         except ast.ASTError:
             if self.verbose:
