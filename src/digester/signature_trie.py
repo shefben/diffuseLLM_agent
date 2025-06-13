@@ -54,11 +54,6 @@ class SignatureTrie:
         # For duplicate guard, we need a boolean indicating presence.
         print(f"SignatureTrie: Searching for signature: {signature_str}")
 
-        # Mock logic for testing duplicate detection flow
-        if signature_str == "new_mock_function(arg1: int) -> str":
-            print("SignatureTrie: Matched specific mock signature for duplicate testing, returning True.")
-            return True # Simulate finding this specific signature
-
         # Original logic modified to return boolean
         return bool(node.function_fqns)
 

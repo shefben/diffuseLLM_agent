@@ -158,8 +158,7 @@ def get_deepseek_draft_fingerprint(stats_block: str, model_path: str, n_gpu_laye
         else: print("LLM_Interfacer Warning: GGUF model returned an empty or unexpected response for draft fingerprint.")
     except Exception as e:
         error_msg = f"Error during GGUF model inference for draft fingerprint: {e}"; print(f"LLM_Interfacer Error: {error_msg}")
-        # Fallback to a mock response if inference fails, this was the previous behavior for some errors
-        return {"indent": 4, "quotes": "double?", "linelen": 80, "snake_pct": 0.5, "camel_pct": 0.4, "screaming_pct": 0.08, "docstyle": "numpy", "error": error_msg}
+        return {**default_error_fingerprint, "error": error_msg}
     try:
         json_match = re.search(r'\{.*\}', raw_json_output, re.DOTALL)
         if json_match: raw_json_output = json_match.group(0)

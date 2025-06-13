@@ -5,6 +5,10 @@ from pathlib import Path
 from .exceptions import PhaseFailure # New import
 from .llm_core import LLMCore
 from .diffusion_core import DiffusionCore
+from src.profiler.style_validator import StyleValidatorCore
+import ast # For parsing modified code in duplicate guard
+from src.digester.signature_trie import generate_function_signature_string # For duplicate guard
+from src.transformer import apply_libcst_codemod_script, PatchApplicationError # For applying script in run
 
 if TYPE_CHECKING:
     from src.planner.phase_model import Phase
@@ -48,28 +52,21 @@ class CollaborativeAgentGroup:
         # For now, its existing signature might be config and style_profile.
         # We'll pass app_config as its 'config' for now.
         self.diffusion_agent = DiffusionCore(
-            # app_config=self.app_config, # If DiffusionCore is updated
-            config=self.app_config, # Passing app_config as the 'config' dict
+            app_config=self.app_config, # Corrected
             style_profile=self.style_profile
         )
+        self.style_validator_agent = StyleValidatorCore(app_config=self.app_config, style_profile=self.style_profile) # Added
 
         self.current_patch_candidate: Optional[Any] = None
         self.patch_history: list = [] # To store (script, validation_result, score, error) tuples
         self._current_run_context_data: Optional[Dict[str, Any]] = None # For preview context
 
         if self.verbose:
-            print(f"CollaborativeAgentGroup initialized. Max repair attempts: {self.max_repair_attempts}")
-
-            app_config=self.app_config, # If DiffusionCore is updated
-            style_profile=self.style_profile
-        )
-        self.style_validator_agent = StyleValidatorCore(app_config=self.app_config, style_profile=self.style_profile)
-
-        self.current_patch_candidate: Optional[Any] = None
-        self.patch_history: list = [] # To store (script, validation_result, score, error) tuples
-        self._current_run_context_data: Optional[Dict[str, Any]] = None # For preview context
-
-        print("CollaborativeAgentGroup initialized with LLMCore, DiffusionCore, and max_repair_attempts.")
+            # This print statement is conditional on verbosity
+            print(f"CollaborativeAgentGroup initialized. Max repair attempts: {self.max_repair_attempts}, LLM, Diffusion, StyleValidator cores configured.")
+        else:
+            # A non-verbose, standard initialization message
+            print("CollaborativeAgentGroup initialized with LLMCore, DiffusionCore, StyleValidatorCore.")
 
     def _perform_duplicate_guard(self, modified_code_str: Optional[str], target_file_path: Path, context_data: Dict[str, Any]) -> bool:
         """
