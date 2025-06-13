@@ -31,6 +31,10 @@ else: # Runtime: try to import, or define a placeholder if it fails, for __main_
 
 
 class SpecFusion:
+    # TODO: Phase 3 original plan specifies a LoRA-compressed diffusion model for spec normalization,
+    # potentially trained/retrainable on "raw issue -> cleaned YAML spec" pairs.
+    # Current implementation uses a general T5 model via T5Client for direct YAML generation from text.
+    # The LoRA/diffusion adaptation and training capabilities are not yet implemented.
     def __init__(
         self,
         t5_client: T5Client,

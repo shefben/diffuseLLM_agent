@@ -13,6 +13,10 @@ except ImportError:
     print("Warning: PyTorch or Hugging Face Transformers not found. T5Client will not function with real models.")
 
 class T5Client:
+    # NOTE: This T5Client uses a standard T5ForConditionalGeneration model.
+    # Phase 3 of the original plan mentions a LoRA-adapted Tiny-T5 diffusion pipeline
+    # for the SpecFusion component, which this client serves. The LoRA adaptation
+    # and specific diffusion pipeline aspects are not implemented within this client itself.
     def __init__(self, app_config: Dict[str, Any]):
         """
         Initializes the T5Client.
@@ -105,13 +109,52 @@ class T5Client:
             print("T5Client Error: Model not ready or not loaded. Cannot process request.")
             return None
 
-        # Basic prompt, may need significant refinement for good YAML spec generation
-        prompt = (
-            f"Generate a structured YAML specification for the following software development issue.\n"
-            f"Context symbols from the codebase: {context_symbols_string if context_symbols_string else 'None available'}.\n"
-            f"Issue Description: {raw_issue_text}\n\n"
-            f"Output the YAML directly:"
-        )
+        # Enhanced prompt for better YAML spec generation
+        prompt = f"""Translate the following software development issue and context into a structured YAML specification.
+
+Your output must be a single YAML block. Do not include any text before or after the YAML.
+The YAML should conform to the following structure:
+issue_description: "A concise summary of the issue, derived from the input."
+target_files:
+  - "path/to/relevant/file1.py"
+  - "path/to/another/file.py"
+  # List source files that likely need changes.
+operations:
+  - name: "operation_name" # e.g., add_function, modify_class, fix_bug, refactor_method, update_docs
+    target_file: "path/to/file_for_this_operation.py" # Optional, can be same as in target_files or different if op is specific
+    # Parameters specific to the operation 'name'. Examples:
+    # For 'add_function':
+    #   function_name: "my_new_function"
+    #   parameters: {{"arg1": "int", "arg2": "Optional[str]"}} # Type hints as strings
+    #   return_type: "bool"
+    #   body: "pass # TODO: Implement actual logic" # Brief placeholder
+    # For 'modify_class':
+    #   class_name: "MyExistingClass"
+    #   changes:
+    #     - type: "add_method"
+    #       method_name: "new_utility_method"
+    #       parameters: {{"data": "List[Dict]"}}
+    #       return_type: "None"
+    #     - type: "change_attribute"
+    #       attribute_name: "some_attribute"
+    #       new_value: "new_default_value_if_applicable"
+    # For 'fix_bug':
+    #   description: "Detailed description of the fix to be applied."
+    #   target_element: "function_or_method_name_if_specific" # e.g. "validate_input"
+  # Add more operations as needed based on the issue.
+acceptance_tests:
+  - "Human-readable description of test case 1 to verify the fix."
+  - "Description of test case 2, e.g., covering edge cases."
+  # These should be understandable criteria for when the task is considered complete.
+
+Context symbols from the codebase (e.g., relevant functions, classes):
+{context_symbols_string if context_symbols_string else 'None available'}.
+
+Issue Description to process:
+{raw_issue_text}
+
+Generate the YAML:
+"""
 
         if self.verbose:
             print(f"\nT5Client: Sending prompt to T5 model (length: {len(prompt)}):\n{prompt[:500]}...")

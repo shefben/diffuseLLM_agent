@@ -57,6 +57,7 @@ except ImportError:
 # NEW: Import from graph_structures
 from .graph_structures import CallGraph, ControlDependenceGraph, DataDependenceGraph, NodeID # NodeID might be a NewType
 from .signature_trie import SignatureTrie, generate_function_signature_string # NEW import
+from src.planner.phase_model import Phase # For type hinting phase_ctx
 # LibCST metadata providers for graph building
 from libcst.metadata import ParentNodeProvider, PositionProvider, QualifiedNameProvider, ScopeProvider
 
@@ -913,39 +914,99 @@ class CallGraphVisitor(cst.CSTVisitor):
 
     def _resolve_callee_fqn(self, call_node: cst.Call) -> Optional[NodeID]:
         func_expr = call_node.func
-        # Simplified: using unparse for now. Will be refined with QualifiedNameProvider & type_info.
-        try:
-            # Attempt to create a string representation of the function/method being called
-            # This is highly heuristic and needs proper symbol resolution.
-            if isinstance(func_expr, cst.Name):
-                # Could be local func, class constructor, or imported func/class
-                # Check type_info for this name at this location for a more qualified name
-                # For now: assume it's in the current module or a globally known name
-                # This is a simplified key for lookup, actual key format from PyanalyzeTypeExtractionVisitor is different.
-                # This part needs careful alignment with how types are stored by Pyanalyze visitor.
-                # For now, assume callee_name is either module-local or already qualified if imported.
-                callee_name = func_expr.value
-                # If type_info suggests it's a class instantiation, point to __init__
-                # This requires a more structured type_info than just strings.
-                # For now, if it looks like a class name (PascalCase), assume constructor.
-                if re.match(r"^[A-Z]", callee_name): # Heuristic for class
-                    return NodeID(f"{self.module_qname}.{callee_name}.__init__")
-                return NodeID(f"{self.module_qname}.{callee_name}")
-            elif isinstance(func_expr, cst.Attribute): # obj.method()
-                # This is where type_info for 'obj' (func_expr.value) would be crucial.
-                # For now, try to unparse it.
-                obj_str = cst.Module([func_expr.value]).code.strip()
+        resolved_fqn_str: Optional[str] = None
+
+        qname_metadata = self.get_metadata(QualifiedNameProvider, func_expr)
+
+        if not qname_metadata: # No direct qualified name for the func_expr itself
+            if isinstance(func_expr, cst.Attribute): # e.g. obj.method or Class.method
+                obj_node = func_expr.value
                 method_name = func_expr.attr.value
-                if obj_str == "self":
-                    if len(self.current_fqn_stack) > 1 and self.current_fqn_stack[-1] != self.module_qname:
-                        class_fqn_from_stack_parts = [p for p in self.current_fqn_stack if p != self.module_qname]
-                        if len(class_fqn_from_stack_parts) > 1: # module.class.method -> module.class
-                             class_context = ".".join(self.current_fqn_stack[:-1])
-                             return NodeID(f"{class_context}.{method_name}")
-                # Fallback: try to use unparsed object string. This is very approximate.
-                return NodeID(f"{self.module_qname}.{obj_str}.{method_name}") # Assuming obj_str is a class in same module
-        except Exception:
-            return None # Could not resolve
+
+                obj_qnames = self.get_metadata(QualifiedNameProvider, obj_node)
+                obj_fqn_str: Optional[str] = None
+
+                if obj_qnames: # QualifiedNameProvider found something for the object part
+                    # Assuming the first one is the most relevant if multiple exist (e.g. complex import)
+                    obj_name_candidate = obj_qnames[0].name
+                    if '.' not in obj_name_candidate and self.module_qname: # Simple name, needs module prefix
+                        obj_fqn_str = f"{self.module_qname}.{obj_name_candidate}"
+                    else: # Already qualified or global
+                        obj_fqn_str = obj_name_candidate
+
+                if obj_fqn_str:
+                    resolved_fqn_str = f"{obj_fqn_str}.{method_name}"
+                elif isinstance(obj_node, cst.Name) and obj_node.value == "self":
+                     # Call is self.method_name
+                     # current_fqn_stack is like [module_qname, ClassName, current_method_name]
+                     # We want module_qname.ClassName.method_name
+                    if len(self.current_fqn_stack) > 1: # Should be at least [module, class/func]
+                        # If current_fqn_stack[-1] is a method, its parent is the class
+                        # For now, assume current_fqn_stack[-1] is the class if not module.
+                        # This needs to align with how current_fqn_stack is managed.
+                        # Let's assume the stack is [module, class, method] or [module, class] if in __init__ or class body
+                        # The caller_fqn from _get_current_caller_fqn() is module.class.method or module.func
+                        # So, if it's a method, its parent is the class.
+                        caller_fqn = self._get_current_caller_fqn()
+                        if caller_fqn:
+                            caller_parts = str(caller_fqn).split('.')
+                            if len(caller_parts) > 1: # module.class.method or module.func
+                                # If caller is module.class.method, then class_fqn is module.class
+                                # If caller is module.func, this 'self' case shouldn't apply unless func defines classes with self.
+                                # Heuristic: if current stack implies a class context.
+                                # current_fqn_stack could be [module, class] or [module, class, method]
+                                class_name_from_stack = None
+                                for i in range(len(self.current_fqn_stack) -1, 0, -1): # Find innermost class from stack
+                                    # This is still heuristic. A proper scope provider might be better.
+                                    # For now, if second to last is not module, assume it's class context for self.
+                                    if self.current_fqn_stack[i] != self.module_qname:
+                                        # Need to construct FQN up to this class part from the stack
+                                        class_name_from_stack = ".".join(self.current_fqn_stack[:i+1])
+                                        break
+                                if class_name_from_stack:
+                                     resolved_fqn_str = f"{class_name_from_stack}.{method_name}"
+                                # else: self call in module scope? Unlikely / error.
+
+                # If obj_node is cst.Call (get_obj().method()), this path won't resolve it well yet.
+                # Deferring complex dynamic resolution.
+
+            elif isinstance(func_expr, cst.Name): # Direct call e.g. my_func() or MyClass()
+                # QualifiedNameProvider on func_expr itself might have failed if it's truly local
+                # and not imported or qualified.
+                # This was the original intent of the qname_metadata check.
+                # If qname_metadata was None here, it implies it's a name not resolved by QNP.
+                # This means it's likely a local definition or needs module prefix.
+                resolved_fqn_str = f"{self.module_qname}.{func_expr.value}"
+                # Heuristic for constructors: if it looks like PascalCase, append .__init__
+                if re.match(r"^[A-Z]", func_expr.value) and not resolved_fqn_str.endswith(".__init__"):
+                    resolved_fqn_str += ".__init__"
+
+
+        else: # qname_metadata is not None, meaning QualifiedNameProvider resolved func_expr directly
+            # This handles imported functions/classes or fully qualified calls directly on func_expr
+            resolved_fqn_str = qname_metadata[0].name # Take the first one if multiple
+            # Heuristic for constructors if QNP gave FQN of class
+            if isinstance(func_expr, cst.Name) and re.match(r"^[A-Z]", func_expr.value) and not resolved_fqn_str.endswith(".__init__"):
+                # Check if the resolved FQN points to a class (might need type_info or symbol table)
+                # For now, apply heuristic: if original call was PascalCase name, assume constructor.
+                # This needs to be careful not to append __init__ to an already fully resolved method.
+                # QNP might resolve 'MyClass' to 'module.MyClass'.
+                # If a type system indicated 'module.MyClass' is a class type, then append __init__.
+                # This is where type_info would be helpful. For now, retain heuristic.
+                # Check if the resolved FQN doesn't already look like a method path within a class
+                # (e.g. if QNP resolved an alias directly to a method)
+                if '.' not in func_expr.value: # Only apply to simple names like MyClass()
+                     resolved_fqn_str += ".__init__"
+
+
+        if resolved_fqn_str:
+            return NodeID(resolved_fqn_str)
+
+        # Fallback if no FQN could be resolved
+        # This might log or return a more generic placeholder if needed
+        if self.module_qname: # Check if verbose is available via self.module_qname to avoid error
+            if hasattr(self, 'verbose') and self.verbose:
+                 print(f"CallGraphVisitor: Could not resolve FQN for call: {cst.Module([call_node.func]).code.strip()} in {self.module_qname}")
         return None
 
 
@@ -1709,39 +1770,92 @@ class RepositoryDigester:
             print(f"Warning: Unknown event type '{event_type}' for path {abs_src_path}.")
 
     # --- Methods for Phase 5 Context Broadcast ---
-    def get_code_snippets_for_phase(self, phase_ctx: Any) -> Dict[str, str]:
+    def get_code_snippets_for_phase(self, phase_ctx: Phase) -> Dict[str, str]:
         """
-        Mock: Retrieves code snippets relevant to the phase.
-        For now, returns the content of the target file if available, else a mock snippet.
+        Retrieves specific code snippets relevant to the phase, such as the source
+        of a target function or class.
         """
-        # phase_ctx is 'Phase' from src.planner.phase_model, but using Any to avoid direct import if problematic
-        print(f"RepositoryDigester.get_code_snippets_for_phase: Mock for phase: {getattr(phase_ctx, 'operation_name', 'UnknownOp')}")
-        target_file_path_str = getattr(phase_ctx, 'target_file', None)
-        if target_file_path_str:
-            target_file_path = Path(target_file_path_str)
-            # Ensure we use the same path format as in self.digested_files (absolute or relative to repo_path)
-            # Assuming self.digested_files uses absolute paths or paths relative to self.repo_path
-            # For simplicity, let's try to match based on the name or relative path if target_file_path_str is not absolute.
+        snippets: Dict[str, str] = {}
+        target_file_str = phase_ctx.target_file
+        parameters = phase_ctx.parameters if phase_ctx.parameters else {}
 
-            # Attempt to find the file in digested_files
-            # This logic might need to be more robust depending on how target_file_path is stored/passed
-            found_parsed_result = None
-            for abs_path_key, parsed_file_res in self.digested_files.items():
-                if str(abs_path_key).endswith(target_file_path_str): # Simple endswith match
-                    found_parsed_result = parsed_file_res
-                    break
+        if not target_file_str:
+            if self.verbose:
+                print("RepositoryDigester.get_code_snippets_for_phase: Warning - No target file specified in phase_ctx.")
+            return {"error": "No target file specified in phase_ctx"}
 
-            if found_parsed_result and found_parsed_result.source_code:
-                print(f"  Returning source code for: {target_file_path_str}")
-                return {str(target_file_path_str): found_parsed_result.source_code}
-            else:
-                print(f"  Target file {target_file_path_str} not found in digested files or no source. Returning mock snippet.")
-                return {str(target_file_path_str) if target_file_path_str else "mock_target.py": "def mock_function_from_get_code_snippets():\n    pass # Target not found"}
-        else:
-            print("  No target file in phase_ctx. Returning generic mock snippet.")
-            return {"mock_file.py": "def foo():\n    pass # No target file specified"}
+        # Construct absolute path, assuming target_file_str is relative to repo_path
+        target_file_path = self.repo_path / target_file_str
+        if not target_file_path.is_absolute(): # Should already be absolute if repo_path is.
+             target_file_path = target_file_path.resolve()
 
-    def get_pdg_slice_for_phase(self, phase_ctx: Any) -> Dict[str, Any]:
+
+        parsed_result = self.digested_files.get(target_file_path)
+        if not parsed_result or not parsed_result.source_code:
+            return {"error": f"Source code not found or empty for {target_file_path}"}
+
+        try:
+            ast_tree = ast.parse(parsed_result.source_code, filename=str(target_file_path))
+        except SyntaxError as e:
+            return {"error": f"Syntax error in target file {target_file_path}: {e}"}
+
+        target_function_name = parameters.get("target_function_name")
+        target_class_name = parameters.get("target_class_name")
+        snippet_found = False
+
+        module_qname_for_key = self._get_module_qname_from_path(target_file_path, self.repo_path)
+
+        if target_function_name:
+            search_nodes = ast_tree.body
+            current_class_node_for_search: Optional[ast.ClassDef] = None
+            if target_class_name:
+                for node in ast_tree.body:
+                    if isinstance(node, ast.ClassDef) and node.name == target_class_name:
+                        current_class_node_for_search = node
+                        search_nodes = node.body # Search within the class
+                        break
+                if not current_class_node_for_search:
+                    snippets["error"] = f"Class '{target_class_name}' not found in {target_file_path}"
+                    return snippets
+
+            for node in search_nodes:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == target_function_name:
+                    segment = ast.get_source_segment(parsed_result.source_code, node)
+                    if segment:
+                        key = f"{module_qname_for_key}{'.' + target_class_name if target_class_name else ''}.{target_function_name}"
+                        snippets[key] = segment
+                        snippet_found = True
+                        break
+            if not snippet_found and not snippets.get("error"):
+                snippets["error"] = f"Function '{target_function_name}' (in class '{target_class_name}' if specified) not found."
+
+        elif target_class_name: # Only class name specified
+            for node in ast_tree.body:
+                if isinstance(node, ast.ClassDef) and node.name == target_class_name:
+                    segment = ast.get_source_segment(parsed_result.source_code, node)
+                    if segment:
+                        key = f"{module_qname_for_key}.{target_class_name}"
+                        snippets[key] = segment
+                        snippet_found = True
+                        break
+            if not snippet_found:
+                snippets["error"] = f"Class '{target_class_name}' not found."
+
+        # If no specific snippet target was identified by parameters, or if found, this dict is returned.
+        # If a target was specified but not found, the error is already in snippets.
+        # If no target params, snippets remains empty.
+        if not snippets and not target_function_name and not target_class_name:
+            if self.verbose:
+                print(f"RepositoryDigester.get_code_snippets_for_phase: No specific function/class target in phase_ctx for {target_file_str}. Consider returning full file or targeted lines if applicable for operation '{phase_ctx.operation_name}'.")
+            # Fallback to full file content if no specific element is requested and it's a common operation type
+            # For now, returning empty as per instruction "return an empty dict if more targeted snippets are always expected"
+            # or if the specific element was not found. If an error occurred, it's already set.
+            pass
+
+
+        return snippets
+
+    def get_pdg_slice_for_phase(self, phase_ctx: Phase) -> Dict[str, Any]: # Changed Any to Phase
         """
         Mock: Retrieves a program dependence graph (PDG) slice relevant to the phase.
         """
@@ -1749,16 +1863,184 @@ class RepositoryDigester:
         print(f"RepositoryDigester.get_pdg_slice_for_phase: Mock for phase: {getattr(phase_ctx, 'operation_name', 'UnknownOp')}")
         # In a real implementation, this would query self.project_control_dependence_graph and self.project_data_dependence_graph
         # based on the phase_ctx (e.g., target file, specific functions/lines from phase_ctx.parameters)
+
+        slice_nodes: List[Dict[str, Any]] = []
+        slice_edges: List[Dict[str, Any]] = []
+        info_parts: List[str] = [f"PDG Slice for phase: {phase_ctx.operation_name} on {phase_ctx.target_file or 'N/A'}."]
+
+        target_file_str = phase_ctx.target_file
+        parameters = phase_ctx.parameters if phase_ctx.parameters else {}
+
+        if not target_file_str:
+            info_parts.append("Error: No target file specified.")
+            return {"nodes": [], "edges": [], "info": " ".join(info_parts)}
+
+        try:
+            target_file_rel_path = str(Path(target_file_str).relative_to(self.repo_path))
+        except ValueError: # Not under repo_path, or target_file_str is absolute
+            # Try to use target_file_str as is if it's a key in digested_files or can be matched
+            # This part might need more robust path handling depending on how target_file_str is formatted.
+            # For now, assume it's a relative path from repo root as intended.
+            target_file_rel_path = target_file_str
+
+
+        target_func_name = parameters.get("target_function_name")
+        # target_class_name = parameters.get("target_class_name") # For future enhancement
+
+        if target_func_name:
+            info_parts.append(f"Targeting function: {target_func_name}.")
+            # NodeID category suffix for func defs in DataDependenceVisitor is "def"
+            # and in SymbolAndSignatureExtractorVisitor it's "function_code" or "method_code"
+            # _create_ast_node_id uses `type(node).__name__` which would be "FunctionDef"
+            # Let's assume node IDs for function definitions might include ":FunctionDef:func_name:def"
+            # Need to be consistent with how _create_ast_node_id forms these.
+            # For DataDependenceGraph, defs are like "file.py:line:col:Name:var_name:def"
+            # For function definitions, it's "file.py:line:col:FunctionDef:func_name:def"
+
+            # Simplified: search for NodeIDs that contain the file and function name.
+            # This is a basic search and might need refinement based on exact NodeID format.
+
+            # We need a way to get the primary NodeID of the function definition itself.
+            # This might require looking up the symbol in self.digested_files[target_file_path].extracted_symbols
+            # then creating a NodeID from its file/line/col.
+            # For now, let's assume _find_node_ids_in_graphs can find it with a "def" category.
+
+            # The category suffix for function definition node itself (e.g. in control graph or as a target of calls)
+            # might just be its FQN, or an ID derived from its AST node type 'FunctionDef'.
+            # Let's use a placeholder category that implies definition.
+            func_def_node_ids = self._find_node_ids_in_graphs(
+                target_file_rel_path, target_func_name, "FunctionDef:def" # Heuristic category
+            )
+
+            if not func_def_node_ids:
+                 func_def_node_ids = self._find_node_ids_in_graphs(
+                    target_file_rel_path, target_func_name, "def" # More generic def
+                )
+
+
+            added_node_ids = set()
+
+            for func_node_id_str in func_def_node_ids:
+                if func_node_id_str not in added_node_ids:
+                    slice_nodes.append({"id": func_node_id_str, "label": f"FunctionDef: {target_func_name}"})
+                    added_node_ids.add(func_node_id_str)
+
+                # Control dependencies: nodes controlled by this function's internal constructs
+                # This requires iterating controllers *within* the function.
+                # For simplicity, let's find nodes *controlled by* the function itself if it acts as a scope controller,
+                # or nodes that are part of the function's definition.
+                # A simple approach: add all nodes from the same file that mention the function name.
+                # This is very heuristic. A better way is to traverse the graph.
+
+                # Outgoing Control Dependencies (nodes this function's parts control)
+                # This is complex. A function node itself isn't usually a controller in CDG.
+                # Its internal If/For/While nodes are.
+                # For now, we won't traverse deep into the function's internal control flow for PDG slice.
+
+                # Incoming Data Dependencies (data flowing into the function or its params)
+                # Search for data dependencies where a node *uses* something defined by func_node_id
+                # This is backwards. We want what func_node_id USES.
+                # So, func_node_id (or parts of it) will be a 'use_node_id' in DDG.
+                for use_node, def_nodes in self.project_data_dependence_graph.items():
+                    if target_func_name in str(use_node) and target_file_rel_path in str(use_node): # Heuristic: use_node is part of our target function
+                        for def_node in def_nodes:
+                            if def_node not in added_node_ids:
+                                slice_nodes.append({"id": str(def_node), "label": str(def_node)}) # Basic label
+                                added_node_ids.add(str(def_node))
+                            slice_edges.append({"from": str(def_node), "to": str(use_node), "type": "data"})
+
+                # Outgoing Data Dependencies (data flowing out from definitions within the function)
+                # Search for data dependencies where a node *defines* something used by func_node_id
+                # This means func_node_id (or parts of it) is a 'def_node_id' in DDG.
+                for use_node_key, def_nodes_set in self.project_data_dependence_graph.items():
+                    for def_node_val in def_nodes_set:
+                        if target_func_name in str(def_node_val) and target_file_rel_path in str(def_node_val): # Heuristic: def_node is part of our target function
+                             if use_node_key not in added_node_ids:
+                                slice_nodes.append({"id": str(use_node_key), "label": str(use_node_key)})
+                                added_node_ids.add(str(use_node_key))
+                             slice_edges.append({"from": str(def_node_val), "to": str(use_node_key), "type": "data"})
+
+            info_parts.append(f"Found {len(func_def_node_ids)} main definition node(s) for function '{target_func_name}'.")
+            info_parts.append(f"Slice includes {len(slice_nodes)} nodes and {len(slice_edges)} edges (simplified depth-1 data dependencies).")
+
+        else:
+            info_parts.append("No specific function target. PDG slicing for classes or other elements not yet fully implemented.")
+            # Fallback to returning some context if possible, e.g. all nodes from the target file.
+            # For now, returns empty if no function target.
+
         return {
-            "nodes": [
-                {"id": "node1", "label": "var x = 1", "file": getattr(phase_ctx, 'target_file', 'unknown.py')},
-                {"id": "node2", "label": "print(x)", "file": getattr(phase_ctx, 'target_file', 'unknown.py')}
-            ],
-            "edges": [
-                {"from": "node1", "to": "node2", "type": "data_dependency"}
-            ],
-            "info": "Mock PDG slice relevant to the phase context."
+            "nodes": slice_nodes,
+            "edges": slice_edges,
+            "info": " ".join(info_parts)
         }
+
+    def _find_node_ids_in_graphs(self, target_file_rel_path: str, target_name: str, target_category_suffix_in_node_id: str) -> List[NodeID]:
+        """
+        Helper to find NodeIDs in stored graphs based on file, name, and category.
+        NodeID format assumed: "file_rel_path:lineno:col:NodeType:name:category_suffix"
+                           or "file_rel_path:lineno:col:NodeType::category_suffix" (if no name in node like If condition)
+                           or "file_rel_path:lineno:col:NodeType:name" (if no category suffix used in creation)
+        """
+        matching_node_ids: List[NodeID] = []
+
+        # Create a flexible regex pattern for matching node IDs
+        # Example: "file.py:10:4:FunctionDef:my_func:def"
+        # target_file_rel_path needs to be regex escaped if it contains special chars.
+        # For now, assume it's simple.
+        # Pattern: file_path_str + :line:col:node_type:(name_part):category_suffix
+        # name_part could be target_name or empty if not applicable for the node type
+
+        # Search in Control Dependence Graph keys (controllers) and values (dependents)
+        # Search in Data Dependence Graph keys (users) and values (definers)
+
+        all_nodes_to_check = set(self.project_control_dependence_graph.keys())
+        for dependents_set in self.project_control_dependence_graph.values():
+            all_nodes_to_check.update(dependents_set)
+        all_nodes_to_check.update(self.project_data_dependence_graph.keys())
+        for definers_set in self.project_data_dependence_graph.values():
+            all_nodes_to_check.update(definers_set)
+
+        for node_id_str_obj in all_nodes_to_check:
+            node_id_str = str(node_id_str_obj) # Ensure it's a string
+            parts = node_id_str.split(':')
+            if len(parts) < 4: continue # Minimal: file:line:col:NodeType
+
+            node_file_path = parts[0]
+            node_type = parts[3]
+            node_name_part = parts[4] if len(parts) > 4 else "" # Name might be empty for some nodes
+            node_category_suffix = parts[5] if len(parts) > 5 else ""
+
+            # Match file path
+            if node_file_path != target_file_rel_path:
+                continue
+
+            # Match name (if target_name is provided)
+            if target_name and node_name_part != target_name:
+                continue
+
+            # Match category suffix
+            # Handle cases where node_id might not have a category_suffix part, or it's combined with name.
+            # The _create_ast_node_id function adds category_suffix if provided.
+            # If target_category_suffix_in_node_id has multiple parts, e.g. "NodeType:def"
+            # we need to match both.
+
+            type_and_cat_parts = target_category_suffix_in_node_id.split(':', 1)
+            expected_node_type = type_and_cat_parts[0]
+            expected_suffix = type_and_cat_parts[1] if len(type_and_cat_parts) > 1 else ""
+
+            if node_type != expected_node_type:
+                continue
+
+            if expected_suffix and node_category_suffix != expected_suffix:
+                continue
+            elif not expected_suffix and node_category_suffix: # If we want no suffix, but node has one
+                pass # Allow if target_category_suffix_in_node_id was just NodeType
+
+            matching_node_ids.append(NodeID(node_id_str))
+
+        if self.verbose:
+            print(f"RepositoryDigester._find_node_ids_in_graphs: Found {len(matching_node_ids)} for {target_file_rel_path}, {target_name}, {target_category_suffix_in_node_id}")
+        return matching_node_ids
 
     def get_file_content(self, file_path: Path) -> Optional[str]:
         """
