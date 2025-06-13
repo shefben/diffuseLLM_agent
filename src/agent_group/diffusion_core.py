@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional
 import re
+import textwrap # Added for intelligent indentation
 
 # Attempt to import get_llm_code_infill and get_divot5_code_infill, handle if not available
 try:
@@ -178,43 +179,27 @@ Provide only the code snippet to replace `{hole_marker}`:"""
                         llm_call_succeeded = infilled_code_snippet is not None
 
             if llm_call_succeeded and isinstance(infilled_code_snippet, str) and infilled_code_snippet.strip():
-                # TODO: Add intelligent indentation adjustment for infilled_code_snippet.
-                #       This might involve:
-                #       1. Determining the indentation of the line containing the hole_marker.
-                #       2. Ensuring the first line of infilled_code_snippet matches this.
-                #       3. Adjusting subsequent lines of infilled_code_snippet relative to its first line.
-                #       For now, we rely on the LLM to provide reasonably indented code or manual post-processing.
-                # A simple heuristic:
-                lines_before = code_before_hole.splitlines()
-                original_indent_str = ""
-                if lines_before:
-                    last_line_before = lines_before[-1]
-                    match_indent = re.match(r"^(\s*)", last_line_before)
-                    if match_indent:
-                        # If the hole is on a new line, this indent is likely correct.
-                        # If the hole is mid-line, this needs more sophistication.
-                        # Assuming hole is usually on its own indented line for now.
-                        original_indent_str = match_indent.group(1)
+                # Start of new indentation logic
+                hole_start_col = match.start()
+                # Find the start of the line containing the hole
+                line_start_pos = current_script_variant.rfind('\n', 0, hole_start_col) + 1
+                hole_indent_level = hole_start_col - line_start_pos
+                hole_indent_str = " " * hole_indent_level
 
-                # Prepend indent to each line of the snippet if not already indented similarly
-                adjusted_snippet_lines = []
-                for i, line in enumerate(infilled_code_snippet.splitlines()):
-                    if i == 0 and not line.startswith(original_indent_str) and line.strip(): # First line, ensure it has the base indent
-                         adjusted_snippet_lines.append(original_indent_str + line)
-                    elif i > 0 and line.strip(): # Subsequent lines, ensure they also have at least base indent if they are not empty
-                         adjusted_snippet_lines.append(original_indent_str + line) # This simple version might over-indent if snippet is already multi-line indented
+                cleaned_snippet = infilled_code_snippet.strip() # Remove leading/trailing whitespace/newlines
+                if not cleaned_snippet:
+                    final_infilled_code = ""
+                else:
+                    dedented_snippet = textwrap.dedent(cleaned_snippet)
+                    if not dedented_snippet.strip():
+                         final_infilled_code = hole_indent_str
                     else:
-                         adjusted_snippet_lines.append(line) # Keep empty lines as they are
+                         indented_snippet_lines = [hole_indent_str + line for line in dedented_snippet.splitlines()]
+                         final_infilled_code = "\n".join(indented_snippet_lines)
 
-                # This indentation logic is very basic. A more robust solution would parse the snippet
-                # and adjust its internal relative indentation to match the insertion point's base indent.
-                # For now, we'll use this simplified approach. A better approach might be to pass indentation
-                # instructions to the LLM or use a code formatter after infilling.
-                # For now, let's just join what we have, it's better than nothing.
-                # The hole normally implies the LLM should provide content starting at that indent level.
-
-                current_script_variant = code_before_hole + infilled_code_snippet + code_after_hole
-                print(f"DiffusionCore: Successfully filled {hole_marker} with LLM output (length {len(infilled_code_snippet)}).")
+                current_script_variant = code_before_hole + final_infilled_code + code_after_hole
+                print(f"DiffusionCore: Successfully filled {hole_marker} with LLM output (length {len(final_infilled_code)}), applied indentation.")
+                # End of new indentation logic
             else:
                 failure_reason = "LLM returned no content"
                 if not llm_infill_available: failure_reason = "LLM infill function not available"
@@ -234,6 +219,10 @@ Provide only the code snippet to replace `{hole_marker}`:"""
                          proposed_fix_script: Optional[str],
                          context_data: Dict[str, Any]
                          ) -> Optional[str]:
+        # TODO: This method is currently a passthrough for the proposed_fix_script.
+        # Phase 5 Spec: "DiffusionCore re-denoises only the affected spans to maintain global coherence."
+        # Implementing actual span-based re-denoising with a diffusion model is a complex
+        # future enhancement. Current behavior does not perform any denoising or intelligent merging.
         """
         Currently, this method passes through the proposed_fix_script from LLMCore.
         Future enhancements could involve more sophisticated merging or diffusion-based refinement.

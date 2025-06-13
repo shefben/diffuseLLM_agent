@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List # Added List
 import json # Add json import for dumping dicts in prompt
-
+import sqlite3 # Added for polish_patch naming conventions
 import ast # For validating polished script syntax
 import re # For parsing LLM scaffold output (already present)
 
@@ -246,6 +246,26 @@ Quote Style: {style_profile.get('quote_style', DEFAULT_APP_CONFIG.get('style_pro
         style_profile = context_data.get("style_profile", self.style_profile) # Use instance style_profile as fallback
         naming_conventions_db_path = context_data.get("naming_conventions_db_path", self.naming_conventions_db_path) # Use instance path as fallback
 
+        active_naming_conventions_str = "Naming conventions database not available or no active rules found."
+        if naming_conventions_db_path and naming_conventions_db_path.exists():
+            try:
+                conn = sqlite3.connect(str(naming_conventions_db_path))
+                cursor = conn.cursor()
+                cursor.execute("SELECT identifier_type, convention_name FROM naming_rules WHERE is_active = TRUE")
+                rules = cursor.fetchall()
+                conn.close()
+                if rules:
+                    formatted_rules = [f"  - {identifier_type.capitalize()}: {convention_name}" for identifier_type, convention_name in rules]
+                    active_naming_conventions_str = "Active Naming Conventions (guideline for script's own identifiers):\n" + "\n".join(formatted_rules)
+                    active_naming_conventions_str += "\n(If specific conventions are not listed, use standard Python best practices.)"
+                else:
+                    active_naming_conventions_str = "No active naming conventions found in the database. Use standard Python best practices."
+            except sqlite3.Error as e_sqlite:
+                active_naming_conventions_str = f"Error accessing naming conventions DB: {e_sqlite}. Use standard Python best practices."
+        elif naming_conventions_db_path: # Path provided but does not exist
+             active_naming_conventions_str = f"Naming conventions DB not found at {naming_conventions_db_path}. Use standard Python best practices."
+
+
         prompt = f"""[LLM TASK: Polish LibCST Python Edit Script]
 
 Objective:
@@ -320,9 +340,8 @@ Your goal is to refine the provided LibCST script for clarity, correctness, and 
     ```json
     {json.dumps(style_profile, indent=2)}
     ```
-2.  **Naming Conventions Database Path (general guidance for identifier naming within the script):**
-    {str(naming_conventions_db_path) if naming_conventions_db_path else "Not provided. Use standard Python conventions."}
-    (Note: You do not have direct access to this database. Use this information as a general guideline for naming consistency.)
+2.  **Naming Conventions (guidance for identifier naming within the LibCST script itself):**
+    {active_naming_conventions_str}
 
 3.  **Target File for the Original Codemod Operation:** {context_data.get("phase_target_file", "N/A")}
 4.  **Phase Parameters for the Original Codemod Operation:**
@@ -388,25 +407,56 @@ Your goal is to refine the provided LibCST script for clarity, correctness, and 
         llm_interfacer_verbose = self.app_config.get("general", {}).get("verbose_llm_calls", self.verbose)
 
         if "DUPLICATE_DETECTED: REUSE_EXISTING_HELPER" in traceback_str:
-            if self.verbose: print("LLMCore: Received DUPLICATE_DETECTED. Attempting to generate a patch that reuses existing helper.")
-            target_file = context_data.get("phase_target_file", "unknown_target.py")
-            original_planned_func_name = context_data.get("phase_parameters", {}).get("function_name", "original_planned_function")
+            if self.verbose: print("LLMCore: Received DUPLICATE_DETECTED. Generating LibCST script to comment out previous attempt.")
 
-            mock_reuse_script = f'''# Mock repair for DUPLICATE_DETECTED from LLMCore.
-# Original intent might have been to create: {original_planned_func_name} in {target_file}
-# This script should ideally modify the call site to use 'existing_helper_function_abc'
-# For now, it's just a placeholder script.
+            entity_name_str = context_data.get("phase_parameters", {}).get("function_name") or \
+                              context_data.get("phase_parameters", {}).get("class_name") or \
+                              "unknown_entity"
+            current_failed_script_content = str(context_data.get('current_patch_candidate', '# Original script could not be retrieved from context.'))
+
+            header_comment_text = f"Original script commented out due to DUPLICATE_DETECTED for entity: {entity_name_str}.\nPlease refactor the original logic to use the existing helper or rename the entity."
+
+            script_lines_to_embed = current_failed_script_content.splitlines()
+
+            empty_line_calls_str_list = []
+            for line_content in header_comment_text.split('\n'):
+                # Escape for embedding inside an f-string within another f-string, then inside cst.Comment
+                escaped_line = line_content.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
+                empty_line_calls_str_list.append(f'cst.EmptyLine(comment=cst.Comment(f"# {escaped_line}"))')
+
+            empty_line_calls_str_list.append('cst.EmptyLine()') # Blank line for separation
+
+            for line_content in script_lines_to_embed:
+                escaped_line = line_content.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
+                # The line itself is already a comment line if we are commenting out a script
+                # but if current_failed_script_content is not a script but some other text, prefixing is safer.
+                # The previous logic prefixed with "# ". Here, we are generating a CST node.
+                # The cst.Comment will handle the "#".
+                empty_line_calls_str_list.append(f'cst.EmptyLine(comment=cst.Comment(f"# {escaped_line}"))')
+
+            new_body_elements_initializer_str = "[\n            " + ",\n            ".join(empty_line_calls_str_list) + "\n        ]"
+
+            generated_repair_script = f"""
 import libcst as cst
-class ReuseHelperInsteadCommand(cst.VisitorBasedCodemodCommand):
-    DESCRIPTION = "Replaces a new function call with a call to an existing helper."
-    def __init__(self, context): super().__init__(context) # Simplified init
-    def leave_Module(self, original_node, updated_node):
-        comment = cst.Comment("# LLMCore: Code modified to use existing_helper_function_abc() instead of new {original_planned_func_name}().")
-        new_body = list(updated_node.body) + [cst.EmptyLine(comment=comment)]
-        return updated_node.with_changes(body=new_body)
-# Instantiation: ReuseHelperInsteadCommand(CodemodContext())
-'''
-            return mock_reuse_script
+from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand
+
+class ReplaceContentWithCommentedOutScriptCommand(VisitorBasedCodemodCommand):
+    DESCRIPTION = "Replaces the module's content with a pre-defined commented-out script and header due to a duplicate entity error."
+
+    # No __init__ needed if content is embedded directly or not parameterized further
+
+    def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
+        # This list of cst.EmptyLine objects will form the new body of the module.
+        # Each string passed to cst.Comment() will be prefixed with a '#' by LibCST.
+        new_body_elements = {new_body_elements_initializer_str}
+
+        return updated_node.with_changes(body=new_body_elements, header=[], footer=[])
+
+# To ensure the Patcher can find this class by a known name if needed.
+COMMAND_CLASS_NAME = "ReplaceContentWithCommentedOutScriptCommand"
+"""
+            if self.verbose: print(f"LLMCore: Generated repair LibCST script for DUPLICATE_DETECTED (length: {len(generated_repair_script)}).")
+            return generated_repair_script.strip()
 
         # Generic error handling using LLM if model path is configured
         # Use the specific repair_llm_gguf if defined, else fallback to agent_llm_gguf

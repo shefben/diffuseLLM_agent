@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING, Any, Dict, Tuple, Callable, Optional, List # Added List
 from pathlib import Path
+import difflib # Added for diff generation
 
 # Local imports
 from .exceptions import PhaseFailure # New import
@@ -528,31 +529,75 @@ class CollaborativeAgentGroup:
 
 
     def generate_patch_preview(self) -> str:
-        """Generates a mock preview of the current patch candidate (LibCST script)."""
-        target_file_name = "N/A"
-        if self._current_run_context_data:
-            target_file_name = self._current_run_context_data.get("phase_target_file", "N/A")
+        """
+        Generates a preview of the current patch candidate, including a diff
+        against the original file content.
+        """
+        if not self._current_run_context_data or not self.current_patch_candidate:
+            return "Preview not available: No active run context or patch candidate."
 
-        script_content_preview = "No patch candidate available."
-        if self.current_patch_candidate and isinstance(self.current_patch_candidate, str):
-            script_content_preview = self.current_patch_candidate[:1000] + ("..." if len(self.current_patch_candidate) > 1000 else "")
-        elif self.current_patch_candidate:
-            script_content_preview = f"Patch candidate is not a string (type: {type(self.current_patch_candidate)}). Preview unavailable."
+        target_file_str = self._current_run_context_data.get("phase_target_file")
+        digester = self._current_run_context_data.get("repository_digester")
+
+        if not target_file_str:
+            return "Preview not available: Target file not specified in run context."
+        if not digester:
+            return "Preview not available: RepositoryDigester not available in run context."
+
+        # Ensure target_file_str is treated as relative to the project root for digester.
+        # This depends on how target_file_str is stored (abs vs rel).
+        # Assuming target_file_str is relative to project_root for digester.get_file_content.
+        # If target_file_str could be absolute, digester.get_file_content should handle it,
+        # or we need to make it relative here.
+        # For diff display, the name part is usually sufficient.
+        target_file_display_name = Path(target_file_str).name
 
 
-        preview = f"""
-Patch Preview (Mock):
----------------------
-Target File: {target_file_name}
-Patch Type: LibCST Script (Python code to perform an edit)
+        original_content = digester.get_file_content(Path(target_file_str))
+        original_content_for_diff = original_content if original_content is not None else ""
 
-Script Content (first 1000 chars):
-{script_content_preview}
+        diff_text: str
+        modified_content: Optional[str] = None
 
-(Note: This is a mock preview of the LibCST script.
- A full preview would show a diff of the target file after applying this script.)
-"""
-        return preview.strip()
+        if not isinstance(self.current_patch_candidate, str):
+            diff_text = f"Error: Patch candidate is not a string (type: {type(self.current_patch_candidate)}). Cannot generate diff."
+        else:
+            try:
+                modified_content = apply_libcst_codemod_script(
+                    original_content_for_diff,
+                    self.current_patch_candidate
+                )
+
+                diff_lines = list(difflib.unified_diff(
+                    original_content_for_diff.splitlines(keepends=True),
+                    modified_content.splitlines(keepends=True),
+                    fromfile=f"a/{target_file_display_name}",
+                    tofile=f"b/{target_file_display_name}"
+                ))
+                if diff_lines:
+                    diff_text = "".join(diff_lines)
+                else:
+                    diff_text = "No textual changes produced by the patch script."
+
+            except PatchApplicationError as pae:
+                diff_text = f"Error applying patch script for diff generation: {pae}"
+            except Exception as e: # Catch any other unexpected errors during diff generation
+                diff_text = f"Unexpected error during diff generation: {e}"
+
+        script_snippet = self.current_patch_candidate[:1000] if isinstance(self.current_patch_candidate, str) else str(self.current_patch_candidate)[:1000]
+        script_ellipsis = '...' if isinstance(self.current_patch_candidate, str) and len(self.current_patch_candidate) > 1000 else ''
+
+        preview_parts = [
+            "Patch Preview:",
+            "---------------------",
+            f"Target File: {target_file_str}",
+            "\nApplied LibCST Script (first 1000 chars):",
+            f"{script_snippet}{script_ellipsis}",
+            "\nGenerated Diff:",
+            "---------------------",
+            diff_text
+        ]
+        return "\n".join(preview_parts)
 
     def abort_and_rollback(self) -> None:
         """Placeholder: Aborts the current operation and conceptually rolls back changes."""

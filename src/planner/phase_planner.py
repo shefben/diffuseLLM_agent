@@ -272,14 +272,21 @@ class PhasePlanner:
         except TypeError: graph_stats_str = str(graph_stats)
 
         prompt = f"""You are an expert software engineering assistant. Your task is to evaluate a proposed refactoring plan for a Python codebase.
-A higher score indicates a better plan. Consider the plan's clarity, correctness, potential risks, efficiency, and how well it seems to adhere to common best practices and the described project style.
+A higher score indicates a better plan. Please evaluate the plan based on the following criteria:
+- Clarity and Specificity: Are the phase descriptions and parameters detailed and unambiguous enough to be clearly actionable?
+- Correctness and Completeness: Does the plan seem to correctly address the underlying goal (implied by the sequence of operations)? Does it cover necessary steps?
+- Efficiency and Conciseness: Is the plan direct and to the point? Does it avoid unnecessary steps or complexity? Prefer plans with an appropriate number of impactful phases.
+- Risk Assessment: Does the plan introduce any obvious risks? Are changes localized and well-contained where possible?
+- Adherence to Conventions: While the style fingerprint provides code style, does the plan itself represent a conventional and logical approach to refactoring or feature implementation?
 
-Project Style Fingerprint:
+Consider the plan's overall clarity, correctness, potential risks, efficiency, and how well it seems to adhere to common best practices and the described project style.
+
+Project Style Fingerprint (Code Style):
 ---
 {style_fp_str}
 ---
 
-Codebase Graph Statistics (for context):
+Codebase Graph Statistics (for additional context on code structure):
 ---
 {graph_stats_str}
 ---
