@@ -60,6 +60,11 @@ DEFAULT_APP_CONFIG: Dict[str, Any] = {
         "infill_temperature": 0.5,
         "top_p": 0.9, # Example, common DivoT5 param
         # Add other relevant DivoT5 FIM parameters here
+    },
+    "planner": {
+        "beam_width": 3,
+        "max_plan_depth": 5,
+        "min_phases_for_completion_with_tests": 1
     }
 }
 

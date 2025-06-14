@@ -16,6 +16,10 @@ class Spec(BaseModel):
     )
     # Optional: Add a field for the normalized/cleaned spec text from Tiny-T5 if needed later.
     # normalized_spec_text: Optional[str] = Field(None, description="The cleaned/canonicalized spec text from the diffusion model.")
+    plan_prefix_summary: Optional[List[str]] = Field(
+        default_factory=list, # Initialize with an empty list if not provided
+        description="A summary of operations already included in the current partial plan leading up to the current state. Used by LLMs for context."
+    )
 
     class Config:
         extra = "forbid" # To prevent unexpected fields
@@ -41,7 +45,8 @@ if __name__ == "__main__":
         acceptance_tests=[
             "When process_data in utils.py is called, its entry and exit should be logged.",
             "The new decorator @log_entry_exit should be correctly imported and applied."
-        ]
+        ],
+        plan_prefix_summary=[] # Example with an empty summary
     )
     print("Example Spec:")
     try:
@@ -52,7 +57,10 @@ if __name__ == "__main__":
         print(example_spec.json(indent=2))
 
     # Example of a minimal spec
-    minimal_spec = Spec(issue_description="Fix typo in README.")
+    minimal_spec = Spec(
+        issue_description="Fix typo in README.",
+        plan_prefix_summary=["Initial consideration: Check README.md for typos."] # Example with some prefix
+    )
     print("\nMinimal Spec:")
     try:
         print(minimal_spec.model_dump_json(indent=2))

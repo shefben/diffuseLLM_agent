@@ -221,51 +221,264 @@ class PhasePlanner:
         if self.verbose:
             print(f"PhasePlanner: CorePredictor initialized. Model path: {core_predictor_model_path}, Ready: {self.core_predictor.is_ready}")
 
-    def _suggest_alternative_operations(
+    def _suggest_next_candidate_operations(
         self,
-        current_op_spec_item: Dict[str, Any],
-        spec: 'Spec'
+        remaining_spec_goals: 'Spec',
+        graph_stats_for_context: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         """
-        Suggests alternative operations for a given operation spec item.
-        Currently, this is a placeholder and returns the original operation.
-        Future enhancements could use heuristics or an LLM to propose alternatives.
+        Suggests a list of candidate operation names based on the remaining spec goals.
+        Parameters (e.g., target_file, specific arguments for the operation)
+        will be inferred in a subsequent step.
+
+        Args:
+            remaining_spec_goals: The Spec object representing the work yet to be done.
+            graph_stats_for_context: Statistics about the codebase's structure, for LLM context.
+
+        Returns:
+            A list of dictionaries, each like {"name": "operation_name"}.
         """
-        alternative_ops = [current_op_spec_item.copy()]
-        current_op_name = current_op_spec_item.get("name")
+        if self.verbose:
+            print(f"PhasePlanner._suggest_next_candidate_operations: Called with goals from spec: '{remaining_spec_goals.issue_description[:50]}...'")
 
-        if current_op_name and current_op_name != "generic_code_edit":
-            # Construct edit_description for the generic_code_edit alternative
-            original_op_params = current_op_spec_item.get("parameters", {})
-            if isinstance(original_op_params, dict):
-                original_op_params_str = ", ".join(f"{k}='{v}'" for k, v in original_op_params.items())
-            else: # Fallback if parameters is not a dict (though it should be)
-                original_op_params_str = str(original_op_params)
+        issue_desc = remaining_spec_goals.issue_description
+        acceptance_tests_str = "\n- ".join(remaining_spec_goals.acceptance_tests)
+        target_files_str = ", ".join(remaining_spec_goals.target_files)
 
-            if not original_op_params_str and original_op_params: # If params is not empty but str is (e.g. empty dict)
-                 original_op_params_str = str(original_op_params)
+        plan_prefix_summary_str = ""
+        if remaining_spec_goals.plan_prefix_summary and isinstance(remaining_spec_goals.plan_prefix_summary, list):
+            prefix_items = "\n- ".join(remaining_spec_goals.plan_prefix_summary)
+            if prefix_items: # Ensure not just an empty list leading to "Summary... \n- "
+                plan_prefix_summary_str = f"\n**Summary of Operations Already in Current Plan:**\n- {prefix_items}\n"
 
+        available_ops_desc_list = []
+        for op_name, op_instance in self.refactor_op_map.items():
+            available_ops_desc_list.append(f"- {op_name}: {op_instance.description}")
+        available_ops_str = "\n".join(available_ops_desc_list)
 
-            generic_edit_desc = (
-                f"Original operation was '{current_op_name}' with parameters: {original_op_params_str}. "
-                f"Consider if a direct code edit can achieve the intended outcome described by the original operation. "
-                f"Original spec issue: {spec.issue_description}"
-            )
+        prompt = f"""
+Given the following software development goal, codebase statistics, and available operations:
 
-            # Limit length of description
-            if len(generic_edit_desc) > 500:
-                generic_edit_desc = generic_edit_desc[:497] + "..."
+**Goal:**
+Issue Description: {issue_desc}
+Acceptance Tests:
+- {acceptance_tests_str}
+Target Files: {target_files_str}
+{plan_prefix_summary_str}
+**Codebase Statistics:**
+{json.dumps(graph_stats_for_context, indent=2)}
 
-            generic_code_edit_op_spec_item = {
-                "name": "generic_code_edit",
-                "target_file": current_op_spec_item.get("target_file"), # Inherit target_file
-                "parameters": {"edit_description": generic_edit_desc}
-            }
-            alternative_ops.append(generic_code_edit_op_spec_item)
+**Available Operations (and their descriptions):**
+{available_ops_str}
+
+Suggest up to 3 most relevant operation *names* from the 'Available Operations' list that should be considered as the *next logical step* or alternative steps in a plan to achieve these goals.
+Focus on suggesting operations that directly address the primary unmet needs described in the goal.
+Return your response as a JSON list of strings, where each string is an operation name. For example: ["add_function", "generic_code_edit"]
+Ensure the operation names are exactly as provided in the 'Available Operations' list.
+
+JSON List of Suggested Operation Names:
+"""
+        # Note: Using scorer_model_config for this call. Max_tokens might need adjustment.
+        # For now, using existing max_tokens from scorer_model_config (likely small, e.g., 16 for scores).
+        # This should be increased for generating a list of strings (e.g., to 100-150).
+        # This is a temporary measure; a dedicated config for op suggestion might be better.
+        llm_output_str_any = get_llm_score_for_text(
+            model_path=self.scorer_model_config["model_path"],
+            prompt=prompt,
+            verbose=self.scorer_model_config.get("verbose", False), # Use verbose from scorer_config
+            n_gpu_layers=self.scorer_model_config["n_gpu_layers"],
+            n_ctx=self.scorer_model_config["n_ctx"],
+            max_tokens_for_score=self.scorer_model_config.get("max_tokens_for_op_suggestion", 150), # Temp use of max_tokens or new one
+            temperature=self.scorer_model_config["temperature"]
+        )
+
+        llm_output_str = str(llm_output_str_any) if llm_output_str_any is not None else None
+
+        if llm_output_str:
+            try:
+                # Attempt to clean and parse the JSON list from the LLM output
+                # Common LLM outputs might include markdown ```json ... ``` or just the list.
+                match = re.search(r"\[.*?\]", llm_output_str, re.DOTALL)
+                if match:
+                    json_str_from_llm = match.group(0)
+                    suggested_op_names = json.loads(json_str_from_llm)
+                    if isinstance(suggested_op_names, list):
+                        valid_suggestions = []
+                        for name in suggested_op_names:
+                            if isinstance(name, str) and name in self.refactor_op_map:
+                                valid_suggestions.append({"name": name})
+
+                        if valid_suggestions:
+                            if self.verbose: print(f"PhasePlanner._suggest_next_candidate_operations: LLM suggested and validated: {[s['name'] for s in valid_suggestions]}")
+                            return valid_suggestions
+                        elif self.verbose:
+                            print(f"PhasePlanner Warning: LLM suggested ops, but none were valid: {suggested_op_names}")
+                    elif self.verbose:
+                        print(f"PhasePlanner Warning: LLM output parsed as JSON, but not a list: {suggested_op_names}")
+                elif self.verbose:
+                    print(f"PhasePlanner Warning: Could not find JSON list in LLM output: '{llm_output_str}'")
+
+            except json.JSONDecodeError as e:
+                if self.verbose: print(f"PhasePlanner Warning: Failed to parse LLM output as JSON: {e}. Output: '{llm_output_str}'")
+            except Exception as e_parse: # Catch other potential errors during parsing/processing
+                 if self.verbose: print(f"PhasePlanner Warning: Error processing LLM output: {e_parse}. Output: '{llm_output_str}'")
+        else:
+            if self.verbose: print("PhasePlanner Warning: LLM call for operation suggestion returned None or empty string.")
+
+        # Fallback logic
+        if self.verbose: print("PhasePlanner: Using fallback logic for operation suggestions.")
+        if "generic_code_edit" in self.refactor_op_map:
+            return [{"name": "generic_code_edit"}]
+        elif self.refactor_op_map:
+            return [{"name": list(self.refactor_op_map.keys())[0]}]
+        return []
+
+    def _infer_parameters_for_operation(
+        self,
+        operation_name: str,
+        spec: 'Spec',
+        graph_stats_for_context: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Infers parameters for a given operation name based on the spec and context.
+        Currently, this is a placeholder. Future versions will use an LLM.
+
+        Args:
+            operation_name: The name of the operation for which to infer parameters.
+            spec: The overall specification object, providing context.
+            graph_stats_for_context: Codebase graph statistics for context.
+
+        Returns:
+            A dictionary of inferred parameters, or None if inference fails or
+            the operation is not found.
+        """
+        if self.verbose:
+            self.logger.info(f"PhasePlanner._infer_parameters_for_operation: Called for op '{operation_name}' with spec '{spec.issue_description[:50]}...'")
+
+        operation_instance = self.refactor_op_map.get(operation_name)
+        if not operation_instance:
             if self.verbose:
-                print(f"PhasePlanner._suggest_alternative_operations: Suggested 'generic_code_edit' as an alternative for '{current_op_name}'.")
+                self.logger.warning(f"Operation '{operation_name}' not found in refactor_op_map. Cannot infer parameters.")
+            return None
 
-        return alternative_ops
+        if not operation_instance.required_parameters:
+            if self.verbose:
+                self.logger.info(f"Operation '{operation_name}' requires no parameters. Returning empty dict.")
+            return {} # No parameters to infer
+
+        issue_desc = spec.issue_description
+        acceptance_tests_str = "\n- ".join(spec.acceptance_tests)
+        target_files_str = ", ".join(spec.target_files)
+
+        plan_prefix_summary_str = ""
+        # spec here is current_remaining_spec_goals from _beam_search_for_plan
+        if spec.plan_prefix_summary and isinstance(spec.plan_prefix_summary, list):
+            prefix_items = "\n- ".join(spec.plan_prefix_summary)
+            if prefix_items:
+                plan_prefix_summary_str = f"\n**Summary of Preceding Planned Operations:**\n- {prefix_items}\n"
+
+        # Prepare a string list of required parameters and their descriptions (if available)
+        params_desc_list = []
+        for param_name in operation_instance.required_parameters:
+            # Assuming parameters might have descriptions in the future, e.g. operation_instance.parameter_descriptions[param_name]
+            params_desc_list.append(f"- {param_name}") # Placeholder for future richer descriptions
+        required_params_str = "\n".join(params_desc_list)
+
+        prompt = f"""
+Given the software development task described by the specification and an operation to be performed:
+
+**Overall Task Specification:**
+Issue Description: {issue_desc}
+Acceptance Tests:
+- {acceptance_tests_str}
+Target Files: {target_files_str}
+{plan_prefix_summary_str}
+**Current Operation to Parameterize:**
+Operation Name: {operation_name}
+Operation Description: {operation_instance.description}
+Required Parameters for this Operation:
+{required_params_str}
+
+**Codebase Context (Statistics):**
+{json.dumps(graph_stats_for_context, indent=2)}
+
+Your goal is to infer appropriate values for ONLY the 'Required Parameters for this Operation'.
+Consider the overall task, the operation's purpose, and the codebase context.
+Parameter values should be strings or simple JSON-compatible types.
+For file paths, provide relative paths from the project root if appropriate, or fully qualified names for symbols.
+If a parameter refers to a line number, it should be an integer.
+
+Return your response as a single JSON object where keys are the required parameter names and values are their inferred values.
+Example for an 'add_function' operation:
+{{
+  "target_file": "src/utils/helpers.py",
+  "function_name": "calculate_total_price",
+  "function_signature": "def calculate_total_price(items: List[Item], tax_rate: float) -> float:",
+  "function_body": "  total = sum(item.price for item in items)\\n  return total * (1 + tax_rate)"
+}}
+
+JSON Object of Inferred Parameter Values:
+"""
+        max_tokens_for_param_inference = self.app_config.get("llm_params", {}).get(
+            "max_tokens_for_param_inference",
+            DEFAULT_APP_CONFIG["llm_params"].get("max_tokens_for_param_inference", 250) # Default from defaults if not in main config
+        )
+
+        llm_output_str_any = get_llm_score_for_text( # Reusing this function, 'score' is a misnomer here
+            model_path=self.scorer_model_config["model_path"], # Consider dedicated model for this later
+            prompt=prompt,
+            verbose=self.scorer_model_config.get("verbose", False),
+            n_gpu_layers=self.scorer_model_config["n_gpu_layers"],
+            n_ctx=self.scorer_model_config["n_ctx"],
+            max_tokens_for_score=max_tokens_for_param_inference, # Using the dedicated max_tokens value
+            temperature=self.scorer_model_config.get("temperature_for_generation",
+                                                   self.scorer_model_config.get("temperature", 0.5)) # Potentially different temp
+        )
+
+        llm_output_str = str(llm_output_str_any) if llm_output_str_any is not None else None
+
+        if not llm_output_str:
+            if self.verbose:
+                self.logger.warning(f"LLM call for parameter inference for '{operation_name}' returned empty. Cannot infer parameters.")
+            return None
+
+        try:
+            # Try to find JSON object within the LLM output
+            match = re.search(r"\{.*\}", llm_output_str, re.DOTALL)
+            if not match:
+                if self.verbose:
+                    self.logger.warning(f"No JSON object found in LLM output for '{operation_name}'. Output: '{llm_output_str}'")
+                return None
+
+            json_str_from_llm = match.group(0)
+            inferred_params = json.loads(json_str_from_llm)
+
+            if not isinstance(inferred_params, dict):
+                if self.verbose:
+                    self.logger.warning(f"LLM output for '{operation_name}' parsed as JSON, but not a dictionary: {inferred_params}")
+                return None
+
+            # Validate that all required parameters are present in the inferred_params
+            missing_params = [
+                p_name for p_name in operation_instance.required_parameters if p_name not in inferred_params
+            ]
+            if missing_params:
+                if self.verbose:
+                    self.logger.warning(f"LLM output for '{operation_name}' is missing required parameters: {missing_params}. Inferred: {inferred_params}")
+                return None
+
+            if self.verbose:
+                self.logger.info(f"Successfully inferred parameters for '{operation_name}': {inferred_params}")
+            return inferred_params
+
+        except json.JSONDecodeError as e:
+            if self.verbose:
+                self.logger.error(f"Failed to parse LLM output as JSON for '{operation_name}': {e}. Output: '{llm_output_str}'")
+            return None
+        except Exception as e_gen:
+            if self.verbose:
+                self.logger.error(f"Unexpected error during parameter inference for '{operation_name}': {e_gen}. Output: '{llm_output_str}'", exc_info=True)
+            return None
 
     def generate_plan_from_spec(self, spec: Spec) -> List[Phase]:
         """
@@ -444,83 +657,279 @@ Score:"""
             print("PhasePlanner Warning: Failed to get score from LLM via get_llm_score_for_text. Falling back to default low score for this candidate.")
             return 0.1 # Default low score on failure
 
-    def _beam_search_for_plan(self, spec: Spec, graph_stats: Dict[str, Any]) -> List[Phase]:
-        # Initial beam: list of (plan_phases, score)
-        beam: List[Tuple[List[Phase], float]] = [([], 0.0)]
+    def _convert_op_spec_items_to_phases(self, op_spec_items: List[Dict[str, Any]], spec_description: str) -> List[Phase]:
+        """Converts a list of operation spec items (dictionaries) to a list of Phase objects."""
+        phases = []
+        for i, op_spec_item in enumerate(op_spec_items):
+            op_name = op_spec_item.get("name", "unknown_operation")
+            target_file = op_spec_item.get("target_file")
+            parameters = {k: v for k, v in op_spec_item.items() if k not in ["name", "target_file"]}
 
-        if not spec.operations:
-            return []
+            # Try to get description from operation instance, fallback to a generic one
+            operation_instance = self.refactor_op_map.get(op_name)
+            description = operation_instance.description if operation_instance else f"Execute {op_name}"
 
-        # Iterate through each operation defined in the input spec
-        for op_idx, op_spec_item_from_input_spec in enumerate(spec.operations): # Renamed for clarity
-            next_beam_candidates: List[Tuple[List[Phase], float]] = []
+            phases.append(Phase(
+                operation_name=op_name,
+                target_file=target_file,
+                parameters=parameters,
+                # Using a more generic description here, or could pass more context if needed
+                description=f"Phase {i+1}/{len(op_spec_items)} (Op: {op_name}): {description} for spec '{spec_description[:30]}...' on '{target_file or 'repo-level'}'"
+            ))
+        return phases
 
-            candidate_op_spec_items = self._suggest_alternative_operations(op_spec_item_from_input_spec, spec)
+    def _score_plan(self, plan_op_specs: List[Dict[str, Any]], original_spec: Spec, graph_stats: Dict[str, Any]) -> float:
+        """
+        Scores a plan represented by a list of operation spec items.
+        Converts op specs to Phase objects before calling the LLM scorer.
+        """
+        if not plan_op_specs:
+            return 0.0 # Or some other low score for an empty plan
 
-            for current_candidate_op_item in candidate_op_spec_items:
-                op_name = current_candidate_op_item.get("name")
-                if not op_name or not isinstance(op_name, str): # Ensure op_name is a string
-                    print(f"Warning: Candidate operation item (derived from input spec index {op_idx}) is missing a 'name' or 'name' is not a string: {current_candidate_op_item}. Skipping this candidate.")
-                    continue
+        # Convert List[Dict[str, Any]] to List[Phase]
+        plan_phases = self._convert_op_spec_items_to_phases(plan_op_specs, original_spec.issue_description)
 
-                operation_instance = self.refactor_op_map.get(op_name)
-                if not operation_instance:
-                    print(f"Warning: Operation '{op_name}' (from candidate derived from input spec index {op_idx}) not found in refactor grammar. Skipping this candidate.")
-                    continue
+        # Now call the existing LLM scorer that expects List[Phase]
+        return self._score_candidate_plan_with_llm(plan_phases, graph_stats)
 
-                phase_parameters = {k: v for k, v in current_candidate_op_item.items() if k not in ["name", "target_file"]}
-                target_file_for_phase = current_candidate_op_item.get("target_file")
-                if target_file_for_phase is not None and not isinstance(target_file_for_phase, str):
-                    print(f"Warning: 'target_file' for operation '{op_name}' (from candidate derived from input spec index {op_idx}) is not a string: {target_file_for_phase}. Treating as None.")
-                    target_file_for_phase = None
+    def _beam_search_for_plan(
+        self,
+        spec: Spec,
+        graph_stats: Dict[str, Any],
+        initial_plan_tuple: Optional[Tuple[List[Dict[str, Any]], float]] = None,
+        max_plan_depth_override: Optional[int] = None
+    ) -> List[Phase]: # Returns List[Phase]
+        """
+        Performs a beam search to find the best sequence of operations (plan)
+        to address the given specification. The plan is represented as a list of
+        operation spec dictionaries internally during search, and converted to
+        List[Phase] at the end.
 
-                if not operation_instance.validate_parameters(phase_parameters):
-                    print(f"Warning: Parameters for operation '{op_name}' (from candidate derived from input spec index {op_idx}, target: {target_file_for_phase or 'repo-level'}) are invalid. This candidate operation will not be added to plans.")
-                    continue
+        Args:
+            spec: The specification object for the task.
+            graph_stats: Codebase graph statistics for context.
+            initial_plan_tuple: Optional starting plan (list of op_spec_items) and its score.
+            max_plan_depth_override: Optional override for max_plan_depth for this search.
 
-                # For each current plan in the beam, try to extend it with the current candidate operation
-                for current_plan_phases, current_plan_score in beam:
-                    new_phase = Phase(
-                        operation_name=op_name, # From current_candidate_op_item
-                        target_file=target_file_for_phase, # From current_candidate_op_item
-                        parameters=phase_parameters, # From current_candidate_op_item
-                        description=f"Op (Input Spec Idx {op_idx + 1}/{len(spec.operations)} - Candidate: '{op_name}'): {operation_instance.description} on '{target_file_for_phase or 'repo-level'}'"
-                    )
+        Returns:
+            The best plan found as a list of Phase objects, or an empty list if no plan is found.
+        """
+        max_plan_depth = max_plan_depth_override if max_plan_depth_override is not None \
+            else self.app_config.get("planner", {}).get("max_plan_depth", DEFAULT_APP_CONFIG["planner"]["max_plan_depth"])
 
-                    extended_plan_phases = current_plan_phases + [new_phase]
-                extended_score = self._score_candidate_plan_with_llm(extended_plan_phases, graph_stats)
-                next_beam_candidates.append((extended_plan_phases, extended_score))
+        if self.verbose:
+            self.logger.info(f"Starting beam search for spec: '{spec.issue_description[:50]}...'. Beam width: {self.beam_width}, Max depth: {max_plan_depth}")
 
-            if not next_beam_candidates:
-                if not beam:
-                    print(f"Warning: Beam became empty while processing spec operation index {op_idx} ('{op_name}').")
-                    return []
-                # If beam was not empty, but no candidates for this op_spec_item (e.g. invalid params made us 'continue'),
-                # the current 'beam' (from previous step) will be used for the next op_spec_item.
-                # This is implicitly handled as 'beam' is only updated if next_beam_candidates is non-empty.
-                print(f"Info: No valid new phases generated for spec operation index {op_idx} ('{op_name}'). Current beam carries over.")
+        # Beam stores items as: {'plan': List[Dict[str, Any]], 'score': float, 'remaining_spec_goals': Spec, 'is_complete': bool}
+        beam: List[Dict[str, Any]] = []
+        initial_remaining_spec_goals = spec
 
-            if next_beam_candidates:
-                next_beam_candidates.sort(key=lambda x: x[1], reverse=True)
-                beam = next_beam_candidates[:self.beam_width]
+        if initial_plan_tuple:
+            # Assuming initial_plan_tuple does not yet have 'is_complete' flag, calculate it.
+            initial_plan_list = initial_plan_tuple[0] if isinstance(initial_plan_tuple[0], list) else []
+            initial_score = initial_plan_tuple[1]
+            # Convert op_specs to phases for the initial check
+            initial_phases_for_check = self._convert_op_spec_items_to_phases(initial_plan_list, initial_remaining_spec_goals.issue_description)
+            is_initial_plan_complete = self._are_goals_met(initial_phases_for_check, initial_remaining_spec_goals)
+            beam = [{'plan': initial_plan_list, 'score': initial_score, 'remaining_spec_goals': initial_remaining_spec_goals, 'is_complete': is_initial_plan_complete}]
+        else:
+            # Empty plan is not complete.
+            beam = [{'plan': [], 'score': self._score_plan([], spec, graph_stats), 'remaining_spec_goals': initial_remaining_spec_goals, 'is_complete': False}]
+
+        # Beam search main loop
+        for depth in range(max_plan_depth):
+            new_beam_candidates: List[Dict[str, Any]] = []
 
             if not beam:
-                print(f"Warning: Beam search resulted in an empty beam after processing spec operation index {op_idx} ('{op_name}').")
-                return []
+                if self.verbose: self.logger.debug(f"Beam search (depth {depth}): Beam is empty, stopping.")
+                break
 
+            if self.verbose: self.logger.debug(f"Beam search (depth {depth}): Expanding {len(beam)} current plans in beam.")
+
+            for item_idx, item in enumerate(beam):
+                current_plan_op_specs = item['plan'] # This is List[Dict[str, Any]]
+                # current_score = item['score'] # Not directly used for extension, but for selection later
+                current_remaining_spec_goals = item['remaining_spec_goals']
+
+                if len(current_plan_op_specs) >= max_plan_depth:
+                    new_beam_candidates.append(item) # Keep it as is, cannot extend
+                    if self.verbose: self.logger.debug(f"  Plan {item_idx+1} (len {len(current_plan_op_specs)}) reached max depth. Keeping.")
+                    continue
+
+                # Suggest next candidate operation *names*
+                candidate_op_names_list = self._suggest_next_candidate_operations(
+                    remaining_spec_goals=current_remaining_spec_goals, # This should evolve
+                    graph_stats_for_context=graph_stats
+                )
+                if self.verbose:
+                    self.logger.debug(f"  For plan {item_idx+1} ({self._plan_to_str(current_plan_op_specs)}), suggested ops: {[op['name'] for op in candidate_op_names_list]}")
+
+                if not candidate_op_names_list:
+                    # If no candidates suggested, this path in the beam cannot be extended.
+                    # It's kept in new_beam_candidates to be re-sorted with others.
+                    new_beam_candidates.append(item)
+                    if self.verbose:
+                        self.logger.debug(f"  No candidate operations to extend plan {self._plan_to_str(current_plan_op_specs)}. Keeping as is for now.")
+                    continue
+
+                for op_name_item in candidate_op_names_list:
+                    operation_name = op_name_item["name"]
+
+                    # Infer parameters for this operation_name
+                    inferred_params = self._infer_parameters_for_operation(
+                        operation_name=operation_name,
+                        spec=current_remaining_spec_goals, # Pass current state of spec goals
+                        graph_stats_for_context=graph_stats
+                    )
+
+                    if inferred_params is None:
+                        if self.verbose:
+                            self.logger.warning(
+                                f"  Could not infer params for op '{operation_name}' (extending {self._plan_to_str(current_plan_op_specs)}). Skipping op."
+                            )
+                        continue
+
+                    # Construct the full operation spec item (dictionary)
+                    op_spec_item = {"name": operation_name, **inferred_params}
+
+                    # Validate parameters for the operation
+                    operation_instance = self.refactor_op_map.get(operation_name)
+                    if not operation_instance: # Should not happen if _suggest_next_candidate_operations is correct
+                        self.logger.warning(f"  Suggested operation '{operation_name}' not found in refactor_op_map. Skipping.")
+                        continue
+                    try:
+                        # BaseRefactorOperation.validate_parameters is a static method
+                        type(operation_instance).validate_parameters(op_spec_item)
+                    except ValueError as e:
+                        self.logger.warning(
+                            f"  Parameter validation failed for '{operation_name}' with params {inferred_params}: {e}. Skipping."
+                        )
+                        continue
+
+                    extended_plan_op_specs = current_plan_op_specs + [op_spec_item]
+
+                    # Update remaining_spec_goals for the next step in this path of the beam
+                    if hasattr(current_remaining_spec_goals, 'model_copy'): # Pydantic v2+
+                        updated_remaining_spec_goals_after_op = current_remaining_spec_goals.model_copy(deep=True)
+                    else: # Pydantic v1 or non-Pydantic Spec model
+                        # Assuming .copy(deep=True) is available for older Pydantic or custom Spec
+                        updated_remaining_spec_goals_after_op = current_remaining_spec_goals.copy(deep=True)
+
+                    # Ensure plan_prefix_summary is initialized (it should be by default_factory=list)
+                    if updated_remaining_spec_goals_after_op.plan_prefix_summary is None:
+                        updated_remaining_spec_goals_after_op.plan_prefix_summary = []
+
+                    # Create a summary of the current op_spec_item
+                    op_params_summary = {
+                        k: v for k, v in op_spec_item.items() if k not in ['name', 'target_file']
+                    }
+                    op_summary = (
+                        f"Operation '{op_spec_item['name']}' "
+                        f"on target_file '{op_spec_item.get('target_file', 'N/A')}' "
+                        f"with params {op_params_summary} was added to the plan."
+                    )
+                    updated_remaining_spec_goals_after_op.plan_prefix_summary.append(op_summary)
+
+                    # Score the new plan (list of op_spec_items)
+                    # Use original_spec for overall context for scoring, but the updated goals are passed in beam
+                    score = self._score_plan(extended_plan_op_specs, spec, graph_stats)
+                    if self.verbose:
+                        self.logger.debug(f"    Extended plan: {self._plan_to_str(extended_plan_op_specs)}, New Score: {score:.4f}")
+
+                    # Convert extended_plan_op_specs to List[Phase] for the _are_goals_met check
+                    # Use current_remaining_spec_goals for context like issue_description for phase descriptions
+                    extended_plan_phases_for_check = self._convert_op_spec_items_to_phases(
+                        extended_plan_op_specs,
+                        current_remaining_spec_goals.issue_description
+                    )
+                    is_newly_complete = self._are_goals_met(extended_plan_phases_for_check, current_remaining_spec_goals)
+
+                    if self.verbose:
+                        self.logger.debug(f"    Plan extended to {len(extended_plan_op_specs)} ops. Is complete: {is_newly_complete}")
+
+                    new_beam_candidates.append({
+                        'plan': extended_plan_op_specs,
+                        'score': score,
+                        'remaining_spec_goals': updated_remaining_spec_goals_after_op,
+                        'is_complete': is_newly_complete
+                    })
+
+            if not new_beam_candidates: # No new candidates generated from any plan in the beam
+                if self.verbose: self.logger.debug(f"Beam search (depth {depth}): No new candidates generated in this iteration. Finalizing beam.")
+                break # The current beam is the best we have.
+
+            # Sort all candidates (both extended and non-extended previous beam items) and select top beam_width
+            new_beam_candidates.sort(key=lambda x: x['score'], reverse=True)
+            beam = new_beam_candidates[:self.beam_width]
+
+            if self.verbose and beam:
+                self.logger.debug(f"Beam after depth {depth} (best score: {beam[0]['score']:.4f if beam else 'N/A'}):")
+                for i, b_item in enumerate(beam):
+                    self.logger.debug(f"  {i+1}. Plan: {self._plan_to_str(b_item['plan'])}, Score: {b_item['score']:.4f}")
+            elif self.verbose:
+                 self.logger.debug(f"Beam is empty or no new candidates after depth {depth}.")
+
+            # Termination condition: if all plans in beam have reached max_depth
+            if not beam or all(len(p['plan']) >= max_plan_depth for p in beam):
+                if self.verbose: self.logger.debug("Beam search: All plans reached max depth or beam is empty.")
+                break
+
+        # Final selection from the beam
         if not beam:
-            print("Warning: Beam search did not find any valid plan.")
+            if self.verbose: self.logger.info("Beam search completed. Beam is empty. No plan found.")
             return []
 
-        best_plan_phases, best_score = beam[0]
-        num_phases_in_spec = len(spec.operations)
-        num_phases_in_plan = len(best_plan_phases)
+        # Prioritize complete plans
+        complete_plans_in_beam = [item for item in beam if item['is_complete']]
 
-        print(f"Beam search completed. Best plan score: {best_score:.4f}. Spec ops: {num_phases_in_spec}, Plan phases: {num_phases_in_plan}.")
-        if num_phases_in_plan < num_phases_in_spec:
-            print(f"Warning: The generated plan has fewer phases ({num_phases_in_plan}) than specified operations ({num_phases_in_spec}). This might be due to invalid spec items.")
+        selected_item: Optional[Dict[str, Any]] = None
 
-        return best_plan_phases
+        if complete_plans_in_beam:
+            # Sort complete plans by score (descending) - beam should already be sorted, but re-sort to be sure
+            complete_plans_in_beam.sort(key=lambda x: x['score'], reverse=True)
+            selected_item = complete_plans_in_beam[0]
+            if self.verbose:
+                self.logger.info(
+                    f"Beam search completed. Selected a 'heuristically complete' plan "
+                    f"(len: {len(selected_item['plan'])}) with score: {selected_item['score']:.4f}. "
+                    f"Plan: {self._plan_to_str(selected_item['plan'])}"
+                )
+        else:
+            # If no complete plans, take the best scoring (potentially partial) plan from the original beam.
+            # The beam is already sorted by score, so beam[0] is the best.
+            selected_item = beam[0]
+            if self.verbose:
+                self.logger.info(
+                    f"Beam search completed. No 'heuristically complete' plan found. "
+                    f"Selected best partial plan (len: {len(selected_item['plan'])}) with score: {selected_item['score']:.4f}. "
+                    f"Plan: {self._plan_to_str(selected_item['plan'])}"
+                )
+
+        if selected_item and selected_item['plan']: # Ensure a plan exists
+            best_plan_op_specs = selected_item['plan']
+            # Convert the best plan (List[Dict[str,Any]]) to List[Phase]
+            # Use the original spec's issue_description for consistent phase descriptions
+            final_plan_phases = self._convert_op_spec_items_to_phases(best_plan_op_specs, spec.issue_description)
+            return final_plan_phases
+        else:
+            # This case should ideally be covered by "if not beam" or if selected_item['plan'] is empty
+            if self.verbose:
+                self.logger.info("Beam search completed. No valid plan (empty or no plan ops) selected.")
+            return []
+
+    def _plan_to_str(self, plan_op_specs: List[Dict[str, Any]], max_phases_to_show: int = 5) -> str:
+        """Helper to create a string representation of a plan (list of op_spec_items) for logging."""
+        if not plan_op_specs:
+            return "[]"
+
+        names = []
+        for i, op_spec in enumerate(plan_op_specs):
+            if i < max_phases_to_show:
+                names.append(op_spec.get("name", "unknown_op"))
+            elif i == max_phases_to_show:
+                names.append("...")
+                break
+        return f"[{' -> '.join(names)} (len:{len(plan_op_specs)})]"
 
     def plan_phases(self, spec: Spec) -> List[Phase]:
         """
@@ -528,324 +937,322 @@ Score:"""
         Plan generation is handled by generate_plan_from_spec.
         This method focuses on the execution loop using CollaborativeAgentGroup.
         """
-        best_plan = self.generate_plan_from_spec(spec)
+        # generate_plan_from_spec now returns List[Phase] directly
+        # It internally calls the new _beam_search_for_plan
+        generated_plan_phases = self.generate_plan_from_spec(spec)
 
-        predicted_core = None # Default if prediction fails or not possible
-        if best_plan: # Only try to predict if a plan was generated
+        predicted_core = None
+        if generated_plan_phases: # Only try to predict if a plan was generated
             if self.core_predictor and self.core_predictor.is_ready:
-                # Prepare raw_features for CorePredictor
+                # Prepare raw_features for CorePredictor based on the *original* spec.operations,
+                # as the generated plan might differ.
+                # Or, should it be based on the *generated* plan?
+                # For now, let's use the original spec as that's what CorePredictor was trained on.
+                # This might need refinement.
+                num_ops_for_predictor = len(spec.operations) if spec.operations else len(generated_plan_phases)
+
                 raw_features_for_predictor = {
-                    "num_operations": len(spec.operations),
-                    "num_target_symbols": len(spec.target_files), # Use spec.target_files
-                    "num_input_code_lines": 0, # Placeholder
-                    "num_parameters_in_op": 0,   # Placeholder
+                    "num_operations": num_ops_for_predictor,
+                    "num_target_symbols": len(spec.target_files),
+                    "num_input_code_lines": 0,
+                    "num_parameters_in_op": 0,
                 }
                 op_counts = {op_name: 0 for op_name in self.core_predictor.KNOWN_OPERATION_TYPES}
-                for op_detail in spec.operations: # spec.operations is List[Dict[str,Any]]
-                    op_name = op_detail.get("name", "unknown_operation")
-                    if op_name in op_counts:
-                        op_counts[op_name] += 1
-                    else:
-                        op_counts["unknown_operation"] += 1
+
+                # If using original spec.operations for features:
+                if spec.operations:
+                    for op_detail in spec.operations:
+                        op_name = op_detail.get("name", "unknown_operation")
+                        if op_name in op_counts: op_counts[op_name] += 1
+                        else: op_counts["unknown_operation"] += 1
+                # Else, if using generated_plan_phases for features (less ideal for current CorePredictor training):
+                # else:
+                #     for phase_obj in generated_plan_phases:
+                #         op_name = phase_obj.operation_name
+                #         if op_name in op_counts: op_counts[op_name] += 1
+                #         else: op_counts["unknown_operation"] += 1
+
                 raw_features_for_predictor.update(op_counts)
 
                 if self.verbose:
-                    print(f"PhasePlanner: Raw features for CorePredictor: {raw_features_for_predictor}")
+                    self.logger.info(f"PhasePlanner: Raw features for CorePredictor: {raw_features_for_predictor}")
 
                 predicted_core = self.core_predictor.predict(raw_features_for_predictor)
                 if self.verbose:
-                    print(f"PhasePlanner: CorePredictor predicted preferred core: {predicted_core}")
+                    self.logger.info(f"PhasePlanner: CorePredictor predicted preferred core: {predicted_core}")
             elif self.verbose:
-                print("PhasePlanner: CorePredictor not ready or not available. Skipping core prediction.")
+                self.logger.info("PhasePlanner: CorePredictor not ready or not available. Skipping core prediction.")
 
-        if best_plan:
-            # self.plan_cache[cache_key] = best_plan # Caching is now done within generate_plan_from_spec
-            # print("PhasePlanner: Plan generated and cached.") # Logging also moved
+        if generated_plan_phases:
+            if self.verbose:
+                self.logger.info(f"\n--- Running CollaborativeAgentGroup for {len(generated_plan_phases)} phases in the generated plan ---")
+            execution_summary = []
+            for phase_obj in generated_plan_phases: # Iterate over List[Phase]
+                if self.verbose:
+                    self.logger.info(f"Executing phase: {phase_obj.operation_name} on {phase_obj.target_file or 'repo-level'}")
 
-            print("\n--- Running CollaborativeAgentGroup for each phase in the generated plan ---")
-            execution_summary = [] # To store results of agent_group.run for each phase
-            for phase_obj in best_plan: # best_plan is List[Phase]
-                print(f"Executing phase: {phase_obj.operation_name} on {phase_obj.target_file or 'repo-level'}")
                 try:
-                    # The CollaborativeAgentGroup's run method signature is:
-                    # run(self, phase_ctx: 'Phase', digester: 'RepositoryDigester',
-                    #     validator_handle: Callable, score_style_handle: Callable, predicted_core: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-                    # It uses its own initialized style_profile and naming_conventions_db_path.
                     validated_patch_script, patch_source = self.agent_group.run(
                         phase_ctx=phase_obj,
                         digester=self.digester,
                         validator_handle=self.validator_handle,
                         score_style_handle=self.score_style_handle,
-                        predicted_core=predicted_core # Pass the predicted core
+                        predicted_core=predicted_core
                     )
 
                     if validated_patch_script:
-                        print(f"Phase {phase_obj.operation_name}: Successfully generated patch script (source: {patch_source}). Preview: {str(validated_patch_script)[:100]}...")
-                        execution_summary.append({
+                        if self.verbose:
+                            self.logger.info(f"Phase {phase_obj.operation_name}: Successfully generated patch script (source: {patch_source}). Preview: {str(validated_patch_script)[:100]}...")
+                        current_phase_summary = {
                             "phase_operation": phase_obj.operation_name,
                             "target": phase_obj.target_file,
                             "status": "success",
                             "patch_preview": str(validated_patch_script)[:100],
                             "patch_source": patch_source
-                        })
-                        # --- Start: Real Patch Application & CommitBuilder Integration ---
+                        }
+                        execution_summary.append(current_phase_summary)
+
                         target_file_path_str = phase_obj.target_file
-                        # target_file_path is the relative path from project_root
                         target_file_path = Path(target_file_path_str) if target_file_path_str else None
                         modified_content: Optional[str] = None
                         diff_summary = "Diff generation skipped: No target file or patch application failed."
 
                         if not target_file_path:
-                            print(f"PhasePlanner Warning: Phase target_file is None for phase '{phase_obj.operation_name}'. Cannot apply patch or proceed with CommitBuilder.")
-                            execution_summary.append({"phase_operation": phase_obj.operation_name, "target": "None", "status": "error", "error_message": "Target file was None for CommitBuilder step", "patch_source": patch_source})
-                            continue # Skip to next phase_obj
+                            self.logger.warning(f"PhasePlanner: Phase target_file is None for phase '{phase_obj.operation_name}'. Cannot apply patch or proceed with CommitBuilder.")
+                            current_phase_summary["status"] = "error"
+                            current_phase_summary["error_message"] = "Target file was None for CommitBuilder step"
+                            continue
 
                         abs_target_file_path = self.project_root_path / target_file_path
                         original_content = self.digester.get_file_content(abs_target_file_path)
                         if original_content is None:
                             original_content = ""
-                            if self.verbose: print(f"PhasePlanner: Target file '{abs_target_file_path}' is new or content not found. Applying patch to empty content.")
+                            if self.verbose: self.logger.info(f"PhasePlanner: Target file '{abs_target_file_path}' is new or content not found. Applying patch to empty content.")
 
                         try:
-                            if self.verbose: print(f"PhasePlanner: Applying validated LibCST script to '{abs_target_file_path}' (source: {patch_source})...")
+                            if self.verbose: self.logger.info(f"PhasePlanner: Applying validated LibCST script to '{abs_target_file_path}' (source: {patch_source})...")
                             modified_content = apply_libcst_codemod_script(original_content, validated_patch_script)
-                            if self.verbose: print(f"PhasePlanner: LibCST script applied successfully to '{target_file_path}'.")
+                            if self.verbose: self.logger.info(f"PhasePlanner: LibCST script applied successfully to '{target_file_path}'.")
 
                             diff_lines = list(difflib.unified_diff(
                                 original_content.splitlines(keepends=True),
                                 modified_content.splitlines(keepends=True),
-                                fromfile=f"a/{target_file_path.name}",
-                                tofile=f"b/{target_file_path.name}"
+                                fromfile=f"a/{target_file_path.name}", tofile=f"b/{target_file_path.name}"
                             ))
-                            if diff_lines:
-                                diff_summary = "".join(diff_lines)
-                            else:
-                                diff_summary = f"No textual changes detected for '{target_file_path}' after patch application."
-                            if self.verbose: print(f"PhasePlanner: Diff summary generated for '{target_file_path}' (length {len(diff_summary)}).")
+                            diff_summary = "".join(diff_lines) if diff_lines else f"No textual changes detected for '{target_file_path}'."
+                            if self.verbose: self.logger.info(f"PhasePlanner: Diff summary generated for '{target_file_path}' (length {len(diff_summary)}).")
 
                         except PatchApplicationError as pae:
-                            print(f"PhasePlanner Error: Failed to apply validated patch script for {abs_target_file_path}: {pae}")
-                            # Update execution_summary for this specific failure point
-                            last_summary_item = execution_summary[-1]
-                            last_summary_item["status"] = "error"
-                            last_summary_item["error_message"] = f"Patch application failed: {pae}"
-                            continue # Skip CommitBuilder for this phase
+                            self.logger.error(f"PhasePlanner: Failed to apply validated patch script for {abs_target_file_path}: {pae}")
+                            current_phase_summary["status"] = "error"
+                            current_phase_summary["error_message"] = f"Patch application failed: {pae}"
+                            continue
                         except Exception as e_apply:
-                            print(f"PhasePlanner Error: Unexpected error during patch application or diff for {abs_target_file_path}: {e_apply}")
-                            last_summary_item = execution_summary[-1]
-                            last_summary_item["status"] = "error"
-                            last_summary_item["error_message"] = f"Unexpected patch application/diff error: {e_apply}"
-                            continue # Skip CommitBuilder for this phase
-
-                        if modified_content is None: # Should be caught by exceptions above, but as a safeguard
-                            print(f"PhasePlanner: Skipping CommitBuilder for phase targeting '{target_file_path}' due to no modified content.")
-                            last_summary_item = execution_summary[-1]
-                            last_summary_item["status"] = "skipped"
-                            last_summary_item["reason"] = "No modified content after application attempt"
+                            self.logger.error(f"PhasePlanner: Unexpected error during patch application or diff for {abs_target_file_path}: {e_apply}", exc_info=True)
+                            current_phase_summary["status"] = "error"
+                            current_phase_summary["error_message"] = f"Unexpected patch application/diff error: {e_apply}"
                             continue
 
-                        validated_patch_content_map = {target_file_path: modified_content} # Key is relative path
+                        if modified_content is None:
+                            self.logger.warning(f"PhasePlanner: Skipping CommitBuilder for phase targeting '{target_file_path}' due to no modified content.")
+                            current_phase_summary["status"] = "skipped"
+                            current_phase_summary["reason"] = "No modified content after application attempt"
+                            continue
 
-                        validator_results_summary = "Validation results summary not available (agent history structure might have changed or was empty)."
+                        validated_patch_content_map = {target_file_path: modified_content}
+                        validator_results_summary = "Validation results summary not available."
                         if self.agent_group.patch_history:
                             try:
                                 last_attempt_info = self.agent_group.patch_history[-1]
                                 last_error_tb_info = last_attempt_info[3] if len(last_attempt_info) > 3 else "N/A"
                                 validator_results_summary = f"Final validation in agent: Valid={last_attempt_info[1]}, Score={last_attempt_info[2]:.2f}, Last Error='{str(last_error_tb_info)[:50]}...'"
                             except Exception as e_hist:
-                                print(f"PhasePlanner: Error accessing patch_history for validator summary: {e_hist}")
+                                self.logger.warning(f"PhasePlanner: Error accessing patch_history for validator summary: {e_hist}")
 
                         branch_name_suffix = getattr(spec, 'issue_id', None) or spec.issue_description[:20].replace(' ', '-').lower()
                         branch_name = f"feature/auto-patch-{branch_name_suffix}-{random.randint(1000,9999)}"
-                        commit_title = f"Auto-apply patch for '{spec.issue_description[:40]}...' (Source: {patch_source})"
+                        commit_title = f"Auto-apply patch for '{spec.issue_description[:40]}...' (Phase: {phase_obj.operation_name}, Source: {patch_source})"
 
-                        if self.verbose: print("PhasePlanner: Calling CommitBuilder.process_and_submit_patch...")
+                        if self.verbose: self.logger.info("PhasePlanner: Calling CommitBuilder.process_and_submit_patch...")
                         saved_patch_set_path = self.commit_builder.process_and_submit_patch(
-                            validated_patch_content_map=validated_patch_content_map,
-                            spec=spec,
-                            diff_summary=diff_summary,
-                            validator_results_summary=validator_results_summary,
-                            branch_name=branch_name,
-                            commit_title=commit_title,
-                            project_root=self.project_root_path,
-                            patch_source=patch_source
+                            validated_patch_content_map=validated_patch_content_map, spec=spec, diff_summary=diff_summary,
+                            validator_results_summary=validator_results_summary, branch_name=branch_name, commit_title=commit_title,
+                            project_root=self.project_root_path, patch_source=patch_source
                         )
 
                         if saved_patch_set_path:
-                            print(f"PhasePlanner: CommitBuilder successfully saved patch set to: {saved_patch_set_path}")
-                            # --- Log to Success Memory ---
-                            if self.data_dir_path and validated_patch_script: # Ensure there's a script and path
+                            self.logger.info(f"PhasePlanner: CommitBuilder successfully saved patch set to: {saved_patch_set_path}")
+                            if self.data_dir_path and validated_patch_script:
                                 log_success = log_successful_patch(
-                                    data_directory=self.data_dir_path,
-                                    spec=spec, # The overall spec for the plan
-                                    diff_summary=diff_summary,
-                                    successful_script_str=validated_patch_script,
-                                    patch_source=patch_source,
-                                    verbose=self.verbose
+                                    data_directory=self.data_dir_path, spec=spec, diff_summary=diff_summary,
+                                    successful_script_str=validated_patch_script, patch_source=patch_source, verbose=self.verbose
                                 )
-                                if log_success:
-                                    if self.verbose: print(f"PhasePlanner: Successfully logged patch to success memory in {self.data_dir_path}.")
-                                elif self.verbose: # Only print warning if verbose, as it's non-critical
-                                    print(f"PhasePlanner Warning: Failed to log patch to success memory in {self.data_dir_path}.")
-                            elif self.verbose:
-                                print(f"PhasePlanner: Success memory logging skipped (data_dir_path not set or no script).")
-                            # --- End Log to Success Memory ---
-                            if self.verbose: print("PhasePlanner: Breaking after first successful phase patch processing for this subtask.")
-                            break # Process only the first successful phase
-                        else: # CommitBuilder failed to save
-                            print(f"PhasePlanner: CommitBuilder failed to save patch set for phase {phase_obj.operation_name}.")
-                            # Ensure last_summary_item is correctly referenced if execution_summary was just updated for success
-                            if execution_summary and execution_summary[-1]["status"] == "success":
-                                execution_summary[-1]["status"] = "error" # Update status
-                                execution_summary[-1]["error_message"] = "CommitBuilder failed to save patch set"
-                            else: # If summary was not updated for success yet, add new error entry
-                                execution_summary.append({
-                                    "phase_operation": phase_obj.operation_name,
-                                    "target": phase_obj.target_file,
-                                    "status": "error",
-                                    "error_message": "CommitBuilder failed to save patch set after successful patch generation",
-                                    "patch_source": patch_source
-                                })
-                        # --- End: Real Patch Application & CommitBuilder Integration ---
+                                if log_success and self.verbose: self.logger.info(f"PhasePlanner: Logged patch to success memory.")
+                            if self.verbose: self.logger.info("PhasePlanner: Breaking after first successful phase patch processing.")
+                            break
+                        else:
+                            self.logger.error(f"PhasePlanner: CommitBuilder failed to save patch set for phase {phase_obj.operation_name}.")
+                            current_phase_summary["status"] = "error"
+                            current_phase_summary["error_message"] = "CommitBuilder failed to save patch set"
+
                     else: # validated_patch_script is None
-                        print(f"Phase {phase_obj.operation_name}: Failed to generate a patch script (returned None). Source info: {patch_source}")
+                        self.logger.warning(f"Phase {phase_obj.operation_name}: Failed to generate a patch script. Source info: {patch_source}")
                         execution_summary.append({
-                            "phase_operation": phase_obj.operation_name,
-                            "target": phase_obj.target_file,
-                            "status": "failed_no_patch",
-                            "patch_source": patch_source
+                            "phase_operation": phase_obj.operation_name, "target": phase_obj.target_file,
+                            "status": "failed_no_patch", "patch_source": patch_source
                         })
 
                 except PhaseFailure as pf_e:
-                    print(f"PhasePlanner: CollaborativeAgentGroup reported PhaseFailure for phase {phase_obj.operation_name}: {pf_e}")
+                    self.logger.error(f"PhasePlanner: CollaborativeAgentGroup reported PhaseFailure for phase {phase_obj.operation_name}: {pf_e}")
                     execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "PhaseFailure", "error_message": str(pf_e)})
-                    print("PhasePlanner: Stopping plan execution due to PhaseFailure.")
+                    if self.verbose: self.logger.info("PhasePlanner: Stopping plan execution due to PhaseFailure.")
                     break
                 except Exception as e:
-                    print(f"Error running agent group for phase {phase_obj.operation_name}: {type(e).__name__} - {e}")
-                    import traceback
-                    traceback.print_exc()
+                    self.logger.error(f"Error running agent group for phase {phase_obj.operation_name}: {type(e).__name__} - {e}", exc_info=True)
                     execution_summary.append({"phase_operation": phase_obj.operation_name, "target": phase_obj.target_file, "status": "error", "error_message": str(e)})
 
-            print("--- CollaborativeAgentGroup execution finished for all phases (or broke early) ---")
-            print("Execution Summary (from planner):")
-            for summary_item in execution_summary:
-                print(f"  - {summary_item}")
-            # The method still returns the plan (List[Phase]).
-            # The execution_summary is for logging/observation at this stage.
+            if self.verbose:
+                self.logger.info("--- CollaborativeAgentGroup execution finished ---")
+                self.logger.info("Execution Summary (from planner):")
+                for summary_item in execution_summary:
+                    self.logger.info(f"  - {summary_item}")
         else:
-            # Message moved to generate_plan_from_spec
-            # print("PhasePlanner: Failed to generate a plan (beam search returned empty).")
-            print("PhasePlanner.plan_phases: No plan generated by generate_plan_from_spec. Nothing to execute.")
-        return best_plan # Return the list of Phase objects as per original signature
+            self.logger.info("PhasePlanner.plan_phases: No plan generated. Nothing to execute.")
+
+        return generated_plan_phases
+
+    def _are_goals_met(self, current_plan_phases: List[Phase], spec: 'Spec') -> bool:
+        """
+        Checks if the current plan plausibly meets the goals outlined in the spec.
+        This is a simplified heuristic for now.
+        """
+        if not current_plan_phases: # An empty plan cannot meet goals
+            return False
+
+        if self.verbose:
+            self.logger.info(f"PhasePlanner._are_goals_met: Checking plan with {len(current_plan_phases)} phase(s) against spec '{spec.issue_description[:50]}...'.")
+
+        # Heuristic 1: If there are acceptance tests, plan length should ideally be related.
+        # This is a very rough proxy for goal completion.
+        if spec.acceptance_tests:
+            # Simple heuristic: plan is "potentially complete" if it has at least as many phases
+            # as acceptance tests, or a configurable minimum number of phases if tests are few.
+            min_phases_if_tests = self.app_config.get("planner", {}).get("min_phases_for_completion_with_tests", 1)
+
+            is_met = len(current_plan_phases) >= min_phases_if_tests
+            if self.verbose:
+                self.logger.info(f"PhasePlanner._are_goals_met: Acceptance tests exist ({len(spec.acceptance_tests)}). Plan length {len(current_plan_phases)} >= {min_phases_if_tests} -> {is_met}")
+            return is_met
+        else:
+            # Heuristic 2: If no acceptance tests, any non-empty plan might be considered "meeting goals"
+            # for the purpose of this simple check, assuming the plan addresses the issue description.
+            # The quality/score of the plan is handled separately.
+            if self.verbose:
+                self.logger.info(f"PhasePlanner._are_goals_met: No acceptance tests. Non-empty plan considered heuristically complete.")
+            return True
 
 if __name__ == '__main__':
-    # No MagicMock needed now as we are using more concrete (though still mock) classes
-    # from unittest.mock import MagicMock
-    from src.utils.config_loader import load_app_config # For __main__
-    from src.digester.repository_digester import RepositoryDigester # For __main__
+    import logging # For __main__ example
+    from src.utils.config_loader import load_app_config
+    from src.digester.repository_digester import RepositoryDigester
 
-    print("--- PhasePlanner Example Usage (Conceptual) ---")
+    # Setup basic logging for the __main__ example
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+    main_logger = logging.getLogger(__name__)
+    main_logger.info("--- PhasePlanner Example Usage (Conceptual) ---")
 
-    # Using the actual RepositoryDigester mock defined at the class level for TYPE_CHECKING
-    # This ensures methods like get_project_overview are available if called by agent_group
-    class MockDigesterForPlannerMain(RepositoryDigester): # Inherit from the placeholder to ensure methods
-        def __init__(self):
-            super().__init__() # Call super if it has an init
-            self.project_call_graph = {"module.func_a": {"module.func_b"}} # type: ignore
-            self.project_control_dependence_graph = {} # type: ignore
+    # Using a more concrete mock for RepositoryDigester
+    class MockDigesterForPlannerMain(RepositoryDigester):
+        def __init__(self, app_config: Dict[str, Any]): # Accept app_config
+            super().__init__(project_root=".", app_config=app_config) # Pass to parent
+            self.project_call_graph = {"module.func_a": {"module.func_b"}}
+            self.project_control_dependence_graph = {}
             self.project_data_dependence_graph = {}
-        # Override mock methods if more specific behavior is needed for main example
-        def get_project_overview(self) -> Dict[str, Any]:
-            print("__main__ MockDigester.get_project_overview called")
-            return {"files_in_project": 5, "main_language": "python"}
-        def get_file_content(self, path: Path) -> Optional[str]:
-            content = f"# __main__ Mock Content for {path}\n# BAD_STYLE example\n# FAIL_VALIDATION example"
-            print(f"__main__ MockDigester.get_file_content for {path} returning: '{content[:50]}...'")
-            return content if path else None
+            self._verbose = app_config.get("general",{}).get("verbose", False) # Use verbose from app_config
+            if self._verbose: main_logger.info("MockDigesterForPlannerMain initialized.")
 
-    dummy_project_root_main = Path("_temp_mock_project_root")
+        def get_project_overview(self) -> Dict[str, Any]:
+            if self._verbose: main_logger.info("__main__ MockDigester.get_project_overview called")
+            return {"files_in_project": 5, "main_language": "python", "mock_overview": True}
+
+        def get_file_content(self, path: Path) -> Optional[str]:
+            # Ensure path is absolute for consistent behavior if project_root is "."
+            abs_path = Path(self.project_root) / path
+            content = f"# __main__ Mock Content for {abs_path}\n# BAD_STYLE example\n# FAIL_VALIDATION example"
+            if self._verbose: main_logger.info(f"__main__ MockDigester.get_file_content for {abs_path} returning: '{content[:50]}...'")
+            return content # Return content, None if path is problematic (handled by caller)
+
+    dummy_project_root_main = Path("_temp_mock_project_root_main")
     dummy_project_root_main.mkdir(parents=True, exist_ok=True)
 
-    # Create dummy style_fingerprint.json and naming_conventions.db for the test
-    with open(dummy_project_root_main / "style_fingerprint.json", "w") as f_style:
-        json.dump({"line_length": 100, "indent_style": "space", "indent_width": 4}, f_style)
-    with open(dummy_project_root_main / "naming_conventions.db", "w") as f_naming:
-        # In a real scenario, this would be a SQLite DB or similar. For mock, content doesn't matter.
-        f_naming.write("mock_naming_db_content")
-
-    app_cfg_main = load_app_config() # Load default or from existing config.yaml
-    app_cfg_main["general"]["verbose"] = True # Override for testing
-    # Ensure data_dir is within our temp project root for cleanup
-    app_cfg_main["general"]["data_dir"] = str(dummy_project_root_main / ".agent_data_main_test")
-
-    # Mock model paths in app_config if they don't exist, to prevent download attempts
-    # but allow PhasePlanner to initialize its scorer_model_config path.
-    # These paths won't actually be used in this conceptual __main__ unless scoring is deeply tested.
-    app_cfg_main.setdefault("models", {})
-    app_cfg_main["models"]["planner_scorer_gguf"] = str(dummy_project_root_main / "mock_scorer.gguf") # Non-existent, will warn
-    app_cfg_main["models"]["agent_llm_gguf"] = str(dummy_project_root_main / "mock_agent_llm.gguf") # Non-existent
-    app_cfg_main["models"]["divot5_infill_model_dir"] = str(dummy_project_root_main / "mock_divot5_infill") # Non-existent
-
-    # Instantiate RepositoryDigester with app_cfg_main for its verbose setting
-    # In a real scenario, digester would also take app_config if its __init__ was updated.
-    # For this test, MockDigesterForPlannerMain doesn't use app_config.
-    mock_digester_main = MockDigesterForPlannerMain()
-
     try:
+        with open(dummy_project_root_main / "style_fingerprint.json", "w") as f_style:
+            json.dump({"line_length": 100, "indent_style": "space", "indent_width": 4}, f_style)
+        with open(dummy_project_root_main / "naming_conventions.db", "w") as f_naming:
+            f_naming.write("mock_naming_db_content")
+
+        app_cfg_main = load_app_config()
+        app_cfg_main["general"]["verbose"] = True
+        app_cfg_main["general"]["data_dir"] = str(dummy_project_root_main / ".agent_data_main_test")
+        app_cfg_main.setdefault("models", {})
+        # Make model paths relative to a known base if needed, or ensure they are absolute
+        # For this test, we'll use placeholder names that won't be loaded.
+        app_cfg_main["models"]["planner_scorer_gguf"] = "non_existent_scorer.gguf"
+        app_cfg_main["models"]["agent_llm_gguf"] = "non_existent_agent_llm.gguf"
+        app_cfg_main["models"]["divot5_infill_model_dir"] = "non_existent_divot5_infill"
+        # Set a very small beam width and depth for faster testing in __main__
+        app_cfg_main.setdefault("planner", {})
+        app_cfg_main["planner"]["beam_width"] = 2
+        app_cfg_main["planner"]["max_plan_depth"] = 2 # Keep test runs short
+
+        # Pass app_cfg_main to MockDigester
+        mock_digester_main = MockDigesterForPlannerMain(app_config=app_cfg_main)
+
+        # Initialize PhasePlanner with the mock digester
         planner = PhasePlanner(
             project_root_path=dummy_project_root_main,
             app_config=app_cfg_main,
             digester=mock_digester_main
-            # refactor_op_map and beam_width can be passed to override config for testing
         )
+        # Inject logger into planner instance for its own logging calls
+        planner.logger = main_logger.getChild("PhasePlanner")
 
-        # Example Spec using the imported spec_model.Spec structure
+
+        # Example Spec (no operations pre-defined, let beam search create them)
         example_spec_data_main = {
-            "issue_description": "Implement new user registration flow", # Updated field name
-            "target_files": ["src/services/user_service.py", "src/db/user_queries.py"], # Updated field name
-            "operations": [ # This now matches spec_model.Spec's List[Dict[str,Any]]
-                {"name": "add_import", "target_file": "src/services/user_service.py", "import_statement": "from ..db import user_queries"},
-                {"name": "extract_method", "target_file": "src/services/user_service.py", "source_function_name": "register_user_v1", "start_line": 10, "end_line": 25, "new_method_name": "_validate_user_input"},
-                {"name": "add_decorator", "target_file": "src/services/user_service.py", "target_function_name": "register_user_v2", "decorator_name": "@transactional"}
-            ],
-            "acceptance_tests": ["test_user_registration_success", "test_user_registration_existing_user"] # Updated field name
+            "issue_description": "Refactor user authentication to use a new JWT library",
+            "target_files": ["src/auth/jwt_handler.py", "src/services/auth_service.py"],
+            "operations": [], # Start with empty operations, expect beam search to populate
+            "acceptance_tests": ["test_jwt_creation", "test_jwt_validation_success", "test_jwt_validation_failure_expired"]
         }
         spec_instance_main = Spec(**example_spec_data_main)
 
-        print(f"\nPlanning for spec: {spec_instance_main.issue_description}")
+        main_logger.info(f"\nPlanning for spec: {spec_instance_main.issue_description}")
+        # This will now use the new _beam_search_for_plan
         plan_phases_list_main = planner.plan_phases(spec_instance_main)
 
-        print("\n--- Post-execution: Generated Plan Phases (from planner return) ---")
+        main_logger.info("\n--- Post-execution: Generated Plan Phases (from planner return) ---")
         if plan_phases_list_main:
             for i, p_main in enumerate(plan_phases_list_main):
-                print(f"Details for Planned Phase {i+1}:")
+                main_logger.info(f"Details for Planned Phase {i+1}:")
                 if hasattr(p_main, 'model_dump_json'):
-                    print(p_main.model_dump_json(indent=2))
+                    main_logger.info(p_main.model_dump_json(indent=2))
                 else:
-                    # Fallback for older/non-Pydantic Phase models
-                    print(f"  Operation: {getattr(p_main, 'operation_name', 'N/A')}, Target: {getattr(p_main, 'target_file', 'N/A')}, Params: {getattr(p_main, 'parameters', {})}")
+                    main_logger.info(f"  Operation: {getattr(p_main, 'operation_name', 'N/A')}, Target: {getattr(p_main, 'target_file', 'N/A')}, Params: {getattr(p_main, 'parameters', {})}")
         else:
-            print("  No plan was generated by the planner.")
-
-        # print(f"\nRequesting plan again for the same spec (should be cached):")
-        # plan_phases_list_cached = planner.plan_phases(spec_instance_main)
-        # print(f"Cached plan request returned {len(plan_phases_list_cached) if plan_phases_list_cached else 0} phases.")
-        # Note: Agent group execution would re-run unless caching is implemented after agent execution.
+            main_logger.info("  No plan was generated by the planner.")
 
     except ImportError as e_imp:
-        print(f"ImportError in PhasePlanner __main__ example: {e_imp}. Check imports for Spec, Phase, or other dependencies.")
+        main_logger.error(f"ImportError in PhasePlanner __main__ example: {e_imp}. Check imports.", exc_info=True)
     except Exception as e_main:
-        print(f"Error in PhasePlanner __main__ example: {type(e_main).__name__}: {e_main}")
-        import traceback
-        traceback.print_exc()
+        main_logger.error(f"Error in PhasePlanner __main__ example: {type(e_main).__name__}: {e_main}", exc_info=True)
     finally:
         if dummy_project_root_main.exists():
-            import shutil # Import shutil here for cleanup
+            import shutil
             try:
                 shutil.rmtree(dummy_project_root_main)
-                if app_cfg_main["general"]["verbose"]: print(f"Cleaned up dummy project root: {dummy_project_root_main}")
+                if app_cfg_main.get("general",{}).get("verbose",False): main_logger.info(f"Cleaned up dummy project root: {dummy_project_root_main}")
             except OSError as e_ose:
-                print(f"Error removing directory {dummy_project_root_main}: {e_ose}")
+                main_logger.error(f"Error removing directory {dummy_project_root_main}: {e_ose}")
 
-    print("\n--- PhasePlanner Example Done ---")
+    main_logger.info("\n--- PhasePlanner Example Done ---")
