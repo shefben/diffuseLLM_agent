@@ -245,15 +245,37 @@ Provide only the code snippet to replace `{hole_marker}`:"""
                 print("DiffusionCore: Detected full script replacement proposal (e.g., for duplicate handling). Passing through.")
             return proposed_fix_script
 
-        # TODO: This method currently passes through most 'proposed_fix_script's.
-        # Phase 5 Spec: "DiffusionCore re-denoises only the affected spans to maintain global coherence."
-        # Future enhancements for true span-based re-denoising or intelligent merging:
-        # 1. Identify affected spans: Use traceback information (from context_data if available from the validation failure)
-        #    or diff `proposed_fix_script` against `failed_patch_script` to find changed regions.
-        # 2. Contextual Merge: If the fix is small, attempt to apply it contextually to `failed_patch_script`.
-        # 3. Diffusion Model: For true re-denoising, a diffusion model would take the `failed_patch_script`,
-        #    the `proposed_fix_script` (or its summary/intent), and context to regenerate only the affected spans.
-        # Current behavior does not perform these advanced operations.
+        # TODO: Implement true span-based re-denoising.
+        # The current implementation passes through the proposed_fix_script for non-duplicate cases.
+        # Intended future logic:
+        # 1. Diff `failed_patch_script` and `proposed_fix_script` to identify specific changed regions/hunks.
+        #    (e.g., using difflib or a similar library to get sequence of changes).
+        #    if self.verbose: print("DiffusionCore: (Future) Diffing failed script and proposed fix to find changed spans.")
+
+        # 2. Initialize `refined_script = failed_patch_script` (or a copy).
+        #    Iterate through identified spans that differ:
+        #    For each differing span:
+        #        - Identify the span in `failed_patch_script` (original_span_content, start_offset, end_offset).
+        #        - Identify the corresponding span in `proposed_fix_script` (llm_suggested_span_content).
+        #        - Extract prefix: `refined_script[:start_offset]`
+        #        - Extract suffix: `refined_script[end_offset:]` (adjust offsets if script is modified in place)
+        #        - Construct FIM prompt for a model like DivoT5:
+        #          fim_prompt = f"<PREFIX>{prefix}<SUFFIX>{suffix}<MIDDLE>"
+        #          # Or include llm_suggested_span_content as a hint in a more general prompt.
+        #          if self.verbose: print(f"DiffusionCore: (Future) Preparing FIM prompt for span. Prefix len: {len(prefix)}, Suffix len: {len(suffix)}")
+
+        #        - Conceptually call the infill model:
+        #          # infill_model_output = get_divot5_code_infill(model_dir_path=self.infill_model_path_for_divot5, prompt=fim_prompt, ...)
+        #          # if self.verbose: print(f"DiffusionCore: (Future) Received FIM output for span: {infill_model_output[:100]}...")
+
+        #        - Replace original_span_content in `refined_script` with `infill_model_output`.
+        #          # This requires careful management of offsets if script length changes.
+        #          # refined_script = prefix + infill_model_output + suffix (if processing one span at a time and rebuilding)
+        #          # Or, apply changes iteratively to a mutable representation of the script.
+
+        # If all spans processed successfully:
+        # if self.verbose: print("DiffusionCore: (Future) All spans processed by FIM model.")
+        # return refined_script
 
         if proposed_fix_script is None:
             print("DiffusionCore: No proposed fix script received from LLMCore (for targeted repair). Passing through None.")
@@ -267,5 +289,5 @@ Provide only the code snippet to replace `{hole_marker}`:"""
                     print(f"DiffusionCore Error: Failed to cast proposed_fix_script to string: {e_cast}. Returning None.")
                     return None
 
-            print(f"DiffusionCore: Passing through LLM-proposed targeted fix script (length: {len(proposed_fix_script)}) as is (no re-denoising).")
+            print(f"DiffusionCore: (Fallback) Passing through LLM-proposed targeted fix script (length: {len(proposed_fix_script)}) as is. True span-based re-denoising is pending implementation.")
             return proposed_fix_script

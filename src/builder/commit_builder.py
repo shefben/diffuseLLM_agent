@@ -131,38 +131,104 @@ class CommitBuilder:
         """
         print("\nCommitBuilder: Generating changelog entry...")
 
-        entry_lines = []
+        issue_desc = getattr(spec, 'issue_description', "No description provided.")
 
-        # Add issue description
-        if hasattr(spec, 'issue_description') and spec.issue_description:
-            entry_lines.append(f"Issue: {spec.issue_description}")
-        else:
-            entry_lines.append("Issue: No description provided in spec.")
-
-        # Add summary of operations
-        entry_lines.append("\nSummary of Operations:")
+        ops_summary_parts = ["Summary of Operations:"]
         if hasattr(spec, 'operations') and spec.operations:
             if isinstance(spec.operations, list) and all(isinstance(op, dict) for op in spec.operations):
-                for op in spec.operations:
+                for op_idx, op in enumerate(spec.operations):
                     op_name = op.get("name", "Unknown Operation")
                     op_target = op.get("target_file", "N/A")
-                    # Could add more details from op.get("parameters") if needed
-                    entry_lines.append(f"- Operation '{op_name}' on target '{op_target}'.")
+                    ops_summary_parts.append(f"  - Op {op_idx+1}: '{op_name}' on '{op_target}'.")
             else:
-                entry_lines.append("  (Operations format in spec is unexpected.)")
+                ops_summary_parts.append("  (Operations format in spec is unexpected.)")
         else:
-            entry_lines.append("  (No operations listed in spec.)")
+            ops_summary_parts.append("  (No operations listed in spec.)")
+        ops_summary_str = "\n".join(ops_summary_parts)
 
-        # Add diff summary
-        entry_lines.append("\nDiff Summary:")
-        if diff_summary and diff_summary.strip():
-            entry_lines.append(diff_summary)
-        else:
-            entry_lines.append("  (No diff summary provided.)")
+        diff_summary_str = "Diff Summary:\n" + (diff_summary.strip() if diff_summary and diff_summary.strip() else "  (No diff summary provided.)")
 
-        changelog_string = "\n".join(entry_lines)
-        print("CommitBuilder: Changelog entry generated.")
-        return changelog_string
+        # Simple paragraph style for the list item
+        changelog_markdown = f"- Issue: {issue_desc}\n  {ops_summary_str.replace('\\n', '\\n  ')}\n  {diff_summary_str.replace('\\n', '\\n  ')}\n"
+
+        print("CommitBuilder: Changelog entry (Markdown list item) generated.")
+        return changelog_markdown
+
+    def _update_changelog_file(self, project_root: Path, changelog_entry_markdown: str) -> bool:
+        """
+        Creates or updates CHANGELOG.md with the new entry under an "Unreleased" section.
+        """
+        changelog_path = project_root / "CHANGELOG.md"
+        new_entry = changelog_entry_markdown.rstrip() + "\n" # Ensure single newline at end of entry
+
+        try:
+            if not changelog_path.exists():
+                if self.verbose: print(f"CommitBuilder: CHANGELOG.md not found at {changelog_path}. Creating new one.")
+                content = f"""# Changelog
+All notable changes to this project will be documented in this file.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+{new_entry}"""
+                changelog_path.write_text(content, encoding="utf-8")
+                return True
+
+            lines = changelog_path.read_text(encoding="utf-8").splitlines()
+            unreleased_header_index = -1
+
+            # Find "## [Unreleased]" section
+            for i, line in enumerate(lines):
+                if re.match(r"^##\s*\[Unreleased\]", line, re.IGNORECASE):
+                    unreleased_header_index = i
+                    break
+
+            if unreleased_header_index != -1:
+                # Insert new entry after the "[Unreleased]" header
+                # Add a blank line before the new entry if the line after header isn't already blank or another list item
+                insert_point = unreleased_header_index + 1
+                if insert_point < len(lines) and lines[insert_point].strip() and not lines[insert_point].strip().startswith("-"):
+                    lines.insert(insert_point, "") # Add a blank line for separation
+                    insert_point +=1
+                elif insert_point == len(lines) and lines[unreleased_header_index].strip(): # Header is last line
+                    lines.append("") # Add blank line after header
+                    insert_point +=1
+
+                lines.insert(insert_point, new_entry)
+            else:
+                # No "[Unreleased]" section, try to add it after main changelog header or preamble
+                changelog_header_index = -1
+                preamble_end_index = -1
+                for i, line in enumerate(lines):
+                    if line.strip().startswith("# Changelog"):
+                        changelog_header_index = i
+                    if "Semantic Versioning" in line and changelog_header_index != -1: # End of common preamble
+                        preamble_end_index = i
+                        break
+
+                insert_point_for_section = 0
+                if preamble_end_index != -1:
+                    insert_point_for_section = preamble_end_index + 1
+                    lines.insert(insert_point_for_section, "") # Blank line after preamble
+                    insert_point_for_section +=1
+                elif changelog_header_index != -1:
+                    insert_point_for_section = changelog_header_index + 1
+                    lines.insert(insert_point_for_section, "") # Blank line after main header
+                    insert_point_for_section +=1
+
+                lines.insert(insert_point_for_section, "## [Unreleased]")
+                lines.insert(insert_point_for_section + 1, new_entry)
+
+            changelog_path.write_text("\n".join(lines) + "\n", encoding="utf-8") # Ensure trailing newline for file
+            if self.verbose: print(f"CommitBuilder: Updated CHANGELOG.md at {changelog_path} with new entry.")
+            return True
+
+        except IOError as e:
+            print(f"CommitBuilder Error: Failed to read/write {changelog_path}: {e}")
+            return False
+        except Exception as e_gen:
+            print(f"CommitBuilder Error: Unexpected error updating changelog {changelog_path}: {e_gen}")
+            return False
 
     def submit_via_git(
         self,
@@ -442,8 +508,14 @@ class CommitBuilder:
 
         # --- Generate Changelog ---
         if self.verbose: print("CommitBuilder: Generating changelog...")
-        changelog_text = self.generate_changelog_entry(spec, diff_summary)
-        if self.verbose: print(f"CommitBuilder: Generated changelog (length {len(changelog_text)} chars).")
+        changelog_text = self.generate_changelog_entry(spec, diff_summary) # This is now Markdown
+        if self.verbose: print(f"CommitBuilder: Generated changelog markdown (length {len(changelog_text)} chars).")
+
+        # --- Update CHANGELOG.md file ---
+        update_success = self._update_changelog_file(project_root, changelog_text)
+        if self.verbose and not update_success:
+            print("CommitBuilder Warning: Failed to update CHANGELOG.md file.")
+        # Continue with commit process even if CHANGELOG.md update fails, as it's a non-critical failure for the patch itself.
 
         # --- Construct Full Commit Message ---
         full_commit_message = f"""{commit_title}
