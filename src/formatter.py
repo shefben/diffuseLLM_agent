@@ -29,7 +29,7 @@ def format_code(
 
     Args:
         file_path: The Path to the Python file to format.
-        profile: A dictionary representing the unified style profile (currently placeholder usage).
+        profile: A dictionary representing the unified style profile. Currently, this argument is for conceptual lineage; Black and Ruff derive their configurations from pyproject.toml found within the 'project_root'.
         project_root: The root directory of the project, used as cwd for formatters.
         db_path: Optional path to the naming_conventions.db for identifier renaming.
 

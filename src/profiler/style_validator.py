@@ -241,25 +241,52 @@ class StyleValidatorCore:
                             expected_doc_style = effective_style.get("docstring_style") # Already fetched as docstring_style_from_profile
 
                             if expected_doc_style == "google":
-                                # Simplified check: "Args:" or "Arguments:" must be present, AND
-                                # one of "Returns:", "Yields:", or "Raises:" must be present.
-                                has_args = "Args:" in docstring or "Arguments:" in docstring
-                                has_returns_yields_raises = "Returns:" in docstring or "Yields:" in docstring or "Raises:" in docstring
-                                if not (has_args and has_returns_yields_raises):
-                                    # Allow if it's a short summary docstring (e.g. one line, no sections)
-                                    # This check is very basic. A more robust check would parse sections.
-                                    if len(docstring.splitlines()) > 2: # Arbitrary threshold for "short"
+                                expects_args_section = False
+                                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                    if node.args.args or node.args.vararg or node.args.kwarg or node.args.posonlyargs or node.args.kwonlyargs:
+                                        expects_args_section = True
+
+                                expects_returns_section = False
+                                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns:
+                                    is_none_return = False
+                                    if isinstance(node.returns, ast.Constant) and node.returns.value is None: is_none_return = True
+                                    elif isinstance(node.returns, ast.Name) and node.returns.id == "None": is_none_return = True
+                                    if not is_none_return: expects_returns_section = True
+
+                                if len(docstring.splitlines()) > 3: # Only apply to longer docstrings
+                                    has_args_tag = "Args:" in docstring or "Arguments:" in docstring
+                                    has_returns_tag = "Returns:" in docstring or "Yields:" in docstring
+
+                                    if expects_args_section and not has_args_tag:
                                         style_violation = True
+                                    if expects_returns_section and not has_returns_tag and not style_violation:
+                                        style_violation = True
+                                # For short docstrings (<=3 lines), the original simple check (or lack thereof) is implicitly less strict.
+                                # The subtask's goal was to refine for longer ones.
+
                             elif expected_doc_style == "numpy":
-                                # Simplified check: "Parameters\n" and "----------\n" (under Parameters) must be present,
-                                # AND "Returns\n" and "-------\n" (under Returns) must be present.
-                                # This assumes the clean=False docstring has raw newlines.
-                                has_params_header = "Parameters\n" in docstring and "----------" in docstring
-                                has_returns_header = "Returns\n" in docstring and "-------" in docstring # NumPy uses one less dash for Returns
-                                # More robust: check if "----------" is *after* "Parameters" and before next section
-                                if not (has_params_header and has_returns_header):
-                                     if len(docstring.splitlines()) > 3: # Arbitrary threshold
-                                        style_violation = True
+                                expects_params_section = False
+                                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                    if node.args.args or node.args.vararg or node.args.kwarg or node.args.posonlyargs or node.args.kwonlyargs:
+                                        expects_params_section = True
+
+                                expects_returns_section = False
+                                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns:
+                                    is_none_return = False
+                                    if isinstance(node.returns, ast.Constant) and node.returns.value is None: is_none_return = True
+                                    elif isinstance(node.returns, ast.Name) and node.returns.id == "None": is_none_return = True
+                                    if not is_none_return: expects_returns_section = True
+
+                                if len(docstring.splitlines()) > 4: # NumPy is more verbose, allow more lines for simple summary
+                                    if expects_params_section:
+                                        found_params_section = bool(re.search(r"^\s*Parameters\s*\n\s*-+\s*\n", docstring, re.MULTILINE | re.IGNORECASE))
+                                        if not found_params_section:
+                                            style_violation = True
+
+                                    if not style_violation and expects_returns_section:
+                                        found_returns_section = bool(re.search(r"^\s*Returns\s*\n\s*-+\s*\n", docstring, re.MULTILINE | re.IGNORECASE))
+                                        if not found_returns_section:
+                                            style_violation = True
 
                             if style_violation:
                                 public_elements_bad_style += 1

@@ -172,6 +172,13 @@ def get_active_naming_convention(cursor: sqlite3.Cursor, identifier_type: str) -
     row = cursor.fetchone()
     return row[0] if row else None
 
+# NOTE: This function currently maps line_length, docstring_style (to D rules),
+# preferred_quotes (to Q rules), and naming conventions (to N rules)
+# from the unified_profile to the Ruff configuration.
+# Other Ruff rule categories (e.g., for import styles, bugbear checks)
+# are not automatically configured from the current UnifiedStyleProfile structure,
+# as the profile doesn't yet capture those specific style preferences.
+# Ruff's default selections or a user-defined base 'select' list will apply for those.
 def generate_ruff_config_in_pyproject(
     unified_profile: Dict[str, Any],
     pyproject_path: Path = DEFAULT_PYPROJECT_PATH,
