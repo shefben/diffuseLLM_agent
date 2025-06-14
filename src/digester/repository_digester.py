@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import sys
 import os
 import re # For CallGraphVisitor._resolve_callee_fqn
-from collections import defaultdict
+from collections import defaultdict, deque # Ensure deque is explicitly imported
 import collections # Added for deque in get_call_graph_slice
 
 # Watchdog imports
@@ -75,6 +75,8 @@ from src.planner.phase_model import Phase # For type hinting phase_ctx
 # LibCST metadata providers for graph building
 from libcst.metadata import ParentNodeProvider, PositionProvider, QualifiedNameProvider, ScopeProvider
 
+    if TYPE_CHECKING: # Keep NodeID under TYPE_CHECKING if it's just for hints
+        from .graph_structures import NodeID # Ensure NodeID is available for hints
 
 @dataclass
 class ParsedFileResult:
@@ -156,7 +158,8 @@ class SymbolAndSignatureExtractorVisitor(ast.NodeVisitor): # Renamed
     def __init__(self, module_qname: str, file_path_str: str,
                  source_code_lines: List[str],
                  type_info_map_for_resolver: Optional[Dict[str, str]],
-                 signature_trie_ref: SignatureTrie):
+                 signature_trie_ref: SignatureTrie,
+                 digester_ref: 'RepositoryDigester'): # Added digester_ref
         self.module_qname: str = module_qname
         self.file_path_str: str = file_path_str
         self.source_code_lines: List[str] = source_code_lines
@@ -164,6 +167,7 @@ class SymbolAndSignatureExtractorVisitor(ast.NodeVisitor): # Renamed
         self.current_class_name: Optional[str] = None # FQN of current class context
         self.type_info_map_for_resolver = type_info_map_for_resolver if type_info_map_for_resolver else {}
         self.signature_trie_ref = signature_trie_ref
+        self.digester_ref = digester_ref # Stored digester_ref
 
     def _local_type_resolver(self, node: ast.AST, category_hint: str) -> Optional[str]:
         # PyanalyzeTypeExtractionVisitor keys:
@@ -417,6 +421,106 @@ class SymbolAndSignatureExtractorVisitor(ast.NodeVisitor): # Renamed
         super().generic_visit(node)
 
         self.current_class_name = original_outer_class_name_context
+
+        # Populate inheritance graph
+        derived_class_node_id = NodeID(class_fqn)
+        # Initialize even if no bases, to show the class exists in the graph context
+        self.digester_ref.project_inheritance_graph.setdefault(derived_class_node_id, [])
+
+        for base_node in node.bases:
+            base_class_fqn_str = "UNRESOLVED_BASE_CLASS" # Default
+            if hasattr(ast, 'unparse'):
+                try:
+                    base_class_fqn_str = ast.unparse(base_node)
+                except Exception: # Fallback if unparse fails for some complex node
+                    if isinstance(base_node, ast.Name):
+                        base_class_fqn_str = base_node.id
+                    elif isinstance(base_node, ast.Attribute):
+                        # Basic reconstruction for simple attributes like module.Class
+                        # This won't handle complex value expressions for base_node.value
+                        try:
+                            value_str = ast.unparse(base_node.value)
+                            base_class_fqn_str = f"{value_str}.{base_node.attr}"
+                        except Exception:
+                             base_class_fqn_str = f"UNRESOLVED_ATTRIBUTE_BASE:{type(base_node.value).__name__}.{base_node.attr}"
+                    else:
+                        base_class_fqn_str = f"UNRESOLVED_BASE_NODE_TYPE:{type(base_node).__name__}"
+            elif isinstance(base_node, ast.Name): # Fallback for Python < 3.9
+                base_class_fqn_str = base_node.id
+            elif isinstance(base_node, ast.Attribute) and isinstance(base_node.value, ast.Name): # e.g. some_module.MyClass
+                 base_class_fqn_str = f"{base_node.value.id}.{base_node.attr}"
+            # Note: More complex base expressions (e.g., Subscript, Call) are harder to resolve to a simple FQN string here.
+            # For now, they might remain "UNRESOLVED_BASE_CLASS" or similar.
+
+            base_class_node_id = NodeID(base_class_fqn_str)
+            self.digester_ref.project_inheritance_graph[derived_class_node_id].append(base_class_node_id)
+
+    def visit_Import(self, node: ast.Import):
+        current_module_node_id = NodeID(self.module_qname)
+        self.digester_ref.project_module_imports.setdefault(current_module_node_id, set())
+        for alias_node in node.names:
+            imported_module_name = alias_node.name # This is the name as it appears
+            imported_module_node_id = NodeID(imported_module_name)
+            self.digester_ref.project_module_imports[current_module_node_id].add(imported_module_node_id)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        current_module_node_id = NodeID(self.module_qname)
+        source_module_name_raw = node.module # This can be None for relative imports like 'from . import x'
+
+        resolved_source_module_fqn_str: Optional[str] = None
+
+        if node.level > 0: # Relative import
+            current_module_parts = self.module_qname.split('.')
+            if node.level > len(current_module_parts) and not (node.level == len(current_module_parts) and not source_module_name_raw): # e.g. from ...foo import bar in a top-level module, or from .. import foo in my_module
+                 # Allow from .. import foo in my_module.sub_module (len=2, level=2 -> effective_base_parts is empty, result is 'foo')
+                 # Disallow from .. import foo in my_module (len=1, level=2 -> error)
+                if self.digester_ref.verbose:
+                    print(f"RepositoryDigester Warning: Invalid relative import level {node.level} in module '{self.module_qname}' for import from '.{'.'*(node.level-1)}{source_module_name_raw or ''}'. Skipping.")
+                self.generic_visit(node)
+                return
+
+            effective_base_parts = current_module_parts[:-node.level]
+
+            if source_module_name_raw:
+                resolved_source_module_fqn_str = ".".join(effective_base_parts + [source_module_name_raw])
+            else: # e.g. from . import foo
+                resolved_source_module_fqn_str = ".".join(effective_base_parts) if effective_base_parts else ""
+                # If effective_base_parts is empty (e.g. `from . import foo` in `__init__.py` of a package `pkg`),
+                # this implies the symbols are directly in `pkg`. But `resolved_source_module_fqn_str` becomes empty.
+                # This needs careful handling. For `from . import X`, source is current package.
+                # If `self.module_qname` is `pkg.__init__`, `level=1` -> `effective_base_parts` is `['pkg']`
+                # If `module_qname` is `pkg.sub`, `level=1` -> `effective_base_parts` is `['pkg']`
+                # This seems to give the package FQN.
+
+        elif source_module_name_raw is not None: # Absolute import
+            resolved_source_module_fqn_str = source_module_name_raw
+        else: # Absolute import but node.module is None. Should not happen for valid Python.
+            if self.digester_ref.verbose:
+                print(f"RepositoryDigester Warning: Absolute import with no module name in '{self.module_qname}'. Node: {ast.dump(node)}. Skipping.")
+            self.generic_visit(node)
+            return
+
+        if resolved_source_module_fqn_str is None or not resolved_source_module_fqn_str.strip():
+            # This can happen if relative import logic results in an empty string, e.g. from .. in a top level module.
+            # Also, if `from . import foo` in `__init__.py` of `pkg`, `resolved_source_module_fqn_str` becomes `pkg`.
+            # If it's truly empty or None, it's problematic.
+            if self.digester_ref.verbose:
+                print(f"RepositoryDigester Warning: Could not resolve source module FQN for ImportFrom in '{self.module_qname}'. Level: {node.level}, Module: {node.module}. Skipping. Node: {ast.dump(node)}")
+            self.generic_visit(node)
+            return
+
+        source_module_node_id = NodeID(resolved_source_module_fqn_str)
+        # Ensure the entry for current_module -> source_module exists before adding symbols
+        self.digester_ref.project_symbol_imports.setdefault(current_module_node_id, defaultdict(set))
+        self.digester_ref.project_symbol_imports[current_module_node_id].setdefault(source_module_node_id, set())
+
+        for alias_node in node.names:
+            imported_symbol_name = alias_node.name # Name of the symbol being imported
+            # local_name = alias_node.asname or imported_symbol_name # How it's named locally
+            self.digester_ref.project_symbol_imports[current_module_node_id][source_module_node_id].add(imported_symbol_name)
+
+        self.generic_visit(node)
 
 
 class DataDependenceVisitor(ast.NodeVisitor):
@@ -1115,6 +1219,14 @@ class CallGraphVisitor(cst.CSTVisitor):
                 self.project_call_graph.setdefault(caller_fqn, set()).add(callee_fqn)
 
 class RepositoryDigester:
+    # Class-level type hints for new graph attributes
+    project_module_imports: Dict['NodeID', Set['NodeID']]
+    project_symbol_imports: Dict['NodeID', Dict['NodeID', Set[str]]]
+    project_inheritance_graph: Dict['NodeID', List['NodeID']]
+
+    if TYPE_CHECKING: # For forward reference of RepositoryDigester in its own methods' type hints if needed
+        pass # This is mostly for linters if RepositoryDigester methods hint RepositoryDigester
+
     def __init__(self,
                  repo_path: Union[str, Path],
                  app_config: Dict[str, Any]
@@ -1140,6 +1252,12 @@ class RepositoryDigester:
         self.project_call_graph: CallGraph = {}
         self.project_control_dependence_graph: ControlDependenceGraph = {}
         self.project_data_dependence_graph: DataDependenceGraph = defaultdict(set)
+
+        # New graph initializations
+        self.project_module_imports: Dict[NodeID, Set[NodeID]] = {}
+        self.project_symbol_imports: Dict[NodeID, Dict[NodeID, Set[str]]] = defaultdict(lambda: defaultdict(set))
+        self.project_inheritance_graph: Dict[NodeID, List[NodeID]] = {}
+
         self.signature_trie = SignatureTrie()
         self.fqn_to_symbol_map: Dict[NodeID, Dict[str, Any]] = {}
         self.observer: Optional[Observer] = None # For watchdog
@@ -1326,10 +1444,11 @@ class RepositoryDigester:
         type_info: Optional[Dict[str, str]]
     ) -> List[Dict[str, Any]]:
 
-        visitor = SymbolAndSignatureExtractorVisitor( # Renamed and passing new args
+        visitor = SymbolAndSignatureExtractorVisitor(
             module_qname, str(file_path), source_code_lines,
             type_info,
-            self.signature_trie
+            self.signature_trie,
+            self # Pass reference to self (RepositoryDigester instance)
         )
         visitor.visit(py_ast_module)
 
