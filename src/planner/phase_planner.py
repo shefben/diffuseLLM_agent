@@ -24,6 +24,7 @@ from .phase_model import Phase
 from .refactor_grammar import BaseRefactorOperation, REFACTOR_OPERATION_INSTANCES
 
 # Child component imports
+from src.learning.core_predictor import CorePredictor # Added import
 # T5Client is imported for spec normalization above, ensure no conflict if used for other purposes.
 # If T5Client is used for other things, the alias T5ClientForSpecNormalization should be used for spec.
 # For now, assume T5Client is primarily for spec normalization context here.
@@ -201,6 +202,24 @@ class PhasePlanner:
 
         self.plan_cache: Dict[str, List[Phase]] = {}
         # self.phi2_scorer_cache: Dict[str, float] = {} # Optional cache
+
+        # Determine CorePredictor model path from app_config or use a default
+        core_predictor_model_path_str = self.app_config.get("models", {}).get(
+            "core_predictor_model_path",
+            str(self.data_dir_path / "core_predictor.joblib") # Defaulting to data_dir now
+        )
+        # Ensure the default path is used if the config value is None or empty string
+        if not core_predictor_model_path_str: # Handle empty string from config
+            core_predictor_model_path_str = str(self.data_dir_path / "core_predictor.joblib")
+
+        core_predictor_model_path = Path(core_predictor_model_path_str)
+
+        self.core_predictor = CorePredictor(
+            model_path=core_predictor_model_path,
+            verbose=self.verbose
+        )
+        if self.verbose:
+            print(f"PhasePlanner: CorePredictor initialized. Model path: {core_predictor_model_path}, Ready: {self.core_predictor.is_ready}")
 
     def generate_plan_from_spec(self, spec: Spec) -> List[Phase]:
         """
@@ -463,6 +482,34 @@ Score:"""
         """
         best_plan = self.generate_plan_from_spec(spec)
 
+        predicted_core = None # Default if prediction fails or not possible
+        if best_plan: # Only try to predict if a plan was generated
+            if self.core_predictor and self.core_predictor.is_ready:
+                # Prepare raw_features for CorePredictor
+                raw_features_for_predictor = {
+                    "num_operations": len(spec.operations),
+                    "num_target_symbols": len(spec.target_files), # Use spec.target_files
+                    "num_input_code_lines": 0, # Placeholder
+                    "num_parameters_in_op": 0,   # Placeholder
+                }
+                op_counts = {op_name: 0 for op_name in self.core_predictor.KNOWN_OPERATION_TYPES}
+                for op_detail in spec.operations: # spec.operations is List[Dict[str,Any]]
+                    op_name = op_detail.get("name", "unknown_operation")
+                    if op_name in op_counts:
+                        op_counts[op_name] += 1
+                    else:
+                        op_counts["unknown_operation"] += 1
+                raw_features_for_predictor.update(op_counts)
+
+                if self.verbose:
+                    print(f"PhasePlanner: Raw features for CorePredictor: {raw_features_for_predictor}")
+
+                predicted_core = self.core_predictor.predict(raw_features_for_predictor)
+                if self.verbose:
+                    print(f"PhasePlanner: CorePredictor predicted preferred core: {predicted_core}")
+            elif self.verbose:
+                print("PhasePlanner: CorePredictor not ready or not available. Skipping core prediction.")
+
         if best_plan:
             # self.plan_cache[cache_key] = best_plan # Caching is now done within generate_plan_from_spec
             # print("PhasePlanner: Plan generated and cached.") # Logging also moved
@@ -474,13 +521,14 @@ Score:"""
                 try:
                     # The CollaborativeAgentGroup's run method signature is:
                     # run(self, phase_ctx: 'Phase', digester: 'RepositoryDigester',
-                    #     validator_handle: Callable, score_style_handle: Callable) -> Tuple[Optional[str], Optional[str]]:
+                    #     validator_handle: Callable, score_style_handle: Callable, predicted_core: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
                     # It uses its own initialized style_profile and naming_conventions_db_path.
-                    validated_patch_script, patch_source = self.agent_group.run( # Expects two return values now
+                    validated_patch_script, patch_source = self.agent_group.run(
                         phase_ctx=phase_obj,
                         digester=self.digester,
-                        validator_handle=self.validator_handle, # This is self.validator.validate_patch
-                        score_style_handle=self.score_style_handle
+                        validator_handle=self.validator_handle,
+                        score_style_handle=self.score_style_handle,
+                        predicted_core=predicted_core # Pass the predicted core
                     )
 
                     if validated_patch_script:

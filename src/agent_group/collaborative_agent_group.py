@@ -149,11 +149,16 @@ class CollaborativeAgentGroup:
         self,
         phase_ctx: 'Phase',
         digester: 'RepositoryDigester',
-        validator_handle: Callable[[Optional[str], Path, 'RepositoryDigester', Path], Tuple[bool, Optional[str]]], # Updated signature from R5.7
-        score_style_handle: Callable[[Any, Dict[str, Any]], float]
+        validator_handle: Callable[[Optional[str], Path, 'RepositoryDigester', Path, Optional[Dict[str,Any]]], Tuple[bool, Optional[str]]], # Updated for pdg_slice
+        score_style_handle: Callable[[Any, Dict[str, Any]], float],
+        predicted_core: Optional[str] = None # New parameter
     ) -> Tuple[Optional[str], Optional[str]]: # Returns (script_string, source_info_string)
         final_patch_script: Optional[str] = None
         patch_source_info: Optional[str] = None
+
+        if self.verbose:
+            print(f"CollaborativeAgentGroup.run: Received predicted_core: {predicted_core if predicted_core else 'Not provided'}")
+        # TODO (future step): Use predicted_core to influence agent logic (e.g., which core to try first).
 
         # self.current_patch_candidate will hold the LibCST SCRIPT string.
         # It's initialized to None in __init__.
@@ -186,7 +191,8 @@ class CollaborativeAgentGroup:
             "naming_conventions_db_path": self.naming_conventions_db_path,
             "score_style_handle": score_style_handle, # Passed from PhasePlanner
             "validator_handle": validator_handle,     # Passed from PhasePlanner
-            "repository_digester": digester           # Pass the digester instance
+            "repository_digester": digester,           # Pass the digester instance
+            "predicted_core_preference": predicted_core # New item
         }
 
         # Add PDG slice and code snippets from digester

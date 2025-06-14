@@ -37,22 +37,14 @@ def log_successful_patch(
 
     log_file_path = data_directory / "success_memory.jsonl"
 
-    # Prepare spec operations summary
-    spec_ops_summary = []
-    if spec and hasattr(spec, 'operations') and isinstance(spec.operations, list):
-        for op in spec.operations:
-            if isinstance(op, dict):
-                spec_ops_summary.append(op.get("name", "UnknownOperation"))
-            elif hasattr(op, 'name'): # If operations are objects with a 'name' attribute
-                spec_ops_summary.append(op.name)
-
+    # spec_ops_summary logic removed.
 
     log_entry: Dict[str, Any] = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(), # Switched to timezone.utc.now()
         "spec_issue_id": getattr(spec, 'issue_id', None), # Assuming Spec might have an issue_id
         "spec_issue_description": getattr(spec, 'issue_description', "N/A"),
         "spec_target_files": getattr(spec, 'target_files', []),
-        "spec_operations_summary": spec_ops_summary,
+        "spec_operations_details": getattr(spec, 'operations', []), # Changed key and value
         "successful_diff_summary": diff_summary, # Storing full diff summary
         "successful_script": successful_script_str,   # Storing full script string
         # Storing full script and diff. Consider external storage for extremely large entries in future.

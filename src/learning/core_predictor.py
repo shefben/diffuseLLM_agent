@@ -133,18 +133,23 @@ class CorePredictor:
                 if self.verbose: print(f"CorePredictor Warning: Skipping entry due to missing or invalid 'patch_source' (label): {entry.get('entry_id', 'Unknown ID')}")
                 continue
 
-            # Extract operation_type
-            spec_ops = entry.get("spec_operations_summary")
-            if isinstance(spec_ops, list) and spec_ops:
-                # Assuming the first operation's name is most indicative or operation_summary is a list of strings
-                if isinstance(spec_ops[0], str): # If summary is list of strings
-                    raw_features["operation_type"] = spec_ops[0].split(":")[0].strip() # e.g. "ADD_FUNCTION" from "ADD_FUNCTION: foo"
-                elif isinstance(spec_ops[0], dict) and "name" in spec_ops[0]: # If summary is list of dicts with "name"
-                    raw_features["operation_type"] = spec_ops[0]["name"]
-                else:
-                    raw_features["operation_type"] = "unknown_operation"
-            else:
-                raw_features["operation_type"] = "unknown_operation"
+            spec_operations_list = entry.get("spec_operations_details", [])
+            raw_features["num_operations"] = len(spec_operations_list)
+
+            op_type_counts = {op_name: 0 for op_name in self.KNOWN_OPERATION_TYPES}
+            for op in spec_operations_list:
+                if isinstance(op, dict): # Ensure op is a dictionary
+                    op_name = op.get("name", "unknown_operation")
+                    if op_name in op_type_counts:
+                        op_type_counts[op_name] += 1
+                    else:
+                        op_type_counts["unknown_operation"] += 1
+                else: # Handle case where an item in spec_operations_list is not a dict
+                    op_type_counts["unknown_operation"] += 1
+            raw_features.update(op_type_counts)
+
+            # Old single operation_type feature is removed.
+            # raw_features["operation_type"] = ...
 
             # Extract num_target_symbols (using num_target_files as proxy)
             target_files = entry.get("spec_target_files", [])
@@ -266,34 +271,25 @@ class CorePredictor:
 
         feature_vector: List[float] = []
 
-        # 1. One-hot encode 'operation_type'
-        op_type = features.get("operation_type", "unknown_operation")
-        if op_type not in self.KNOWN_OPERATION_TYPES:
-            op_type = "unknown_operation"
-        for known_op in self.KNOWN_OPERATION_TYPES:
-            feature_vector.append(1.0 if op_type == known_op else 0.0)
+        # 1. Process Operation Type Counts
+        # self.KNOWN_OPERATION_TYPES is sorted, ensuring consistent feature order.
+        for known_op_name in self.KNOWN_OPERATION_TYPES:
+            count = float(features.get(known_op_name, 0))
+            feature_vector.append(min(count, 5.0)) # Cap count at 5.0 as a simple scaling
 
-        # 2. Numerical features (with defaults and simple scaling/passthrough)
-        # These are conceptual features. Actual extraction from phase_ctx/context_data happens elsewhere.
+        # 2. Process Numerical Features
+        num_operations = float(features.get("num_operations", 0))
+        feature_vector.append(min(num_operations / 10.0, 5.0)) # Scale and cap
 
-        # Example: Number of lines in the primary code snippet being affected (conceptual)
-        # Assuming this would be pre-calculated and passed in `features` if used.
+        num_target_symbols = float(features.get("num_target_symbols", 0)) # This is effectively num_target_files
+        feature_vector.append(min(num_target_symbols / 10.0, 5.0)) # Scale and cap
+
+        # Placeholders - these will be 0.0 for now as data isn't in logs
         num_input_code_lines = float(features.get("num_input_code_lines", 0))
-        feature_vector.append(min(num_input_code_lines / 100.0, 5.0)) # Cap at 5 (e.g. 500 lines)
+        feature_vector.append(min(num_input_code_lines / 100.0, 5.0))
 
-        # Example: Number of symbols targeted by the operation (conceptual)
-        num_target_symbols = float(features.get("num_target_symbols", 0))
-        feature_vector.append(min(num_target_symbols / 10.0, 5.0)) # Cap at 5 (e.g. 50 symbols)
-
-        # Example: Number of parameters in the operation spec (conceptual)
-        # Assuming 'operation_parameters' is a dict passed in features
-        operation_params = features.get("operation_parameters", {})
-        num_parameters_in_op = float(len(operation_params) if isinstance(operation_params, dict) else 0)
-        feature_vector.append(min(num_parameters_in_op / 5.0, 3.0)) # Cap at 3 (e.g. 15 params)
-
-        # Example: A boolean feature (conceptual)
-        # is_multi_file_operation = 1.0 if features.get("is_multi_file", False) else 0.0
-        # feature_vector.append(is_multi_file_operation)
+        num_parameters_in_op = float(features.get("num_parameters_in_op", 0))
+        feature_vector.append(min(num_parameters_in_op / 5.0, 3.0))
 
         if self.verbose: print(f"CorePredictor: Transformed features to vector (length {len(feature_vector)}): {str(feature_vector)[:200]}...")
 
@@ -313,38 +309,120 @@ if __name__ == '__main__':
 
     predictor_no_model = CorePredictor(model_path=Path("./models/non_existent_predictor.joblib"), verbose=True)
 
-    # Updated sample features to include conceptual keys used in _transform_features
+    # Updated sample features to reflect the new raw_features structure
+    op_counts_1 = {op_name: 0 for op_name in predictor_no_model.KNOWN_OPERATION_TYPES}
+    op_counts_1["add_function"] = 1
     sample_features_1 = {
-        "operation_type": "add_function",
-        "num_input_code_lines": 50,
+        "num_operations": 1,
         "num_target_symbols": 1,
-        "operation_parameters": {"name": "new_func", "params": "x, y"} # 2 params
+        "num_input_code_lines": 0,
+        "num_parameters_in_op": 0,
     }
+    sample_features_1.update(op_counts_1)
     prediction1 = predictor_no_model.predict(sample_features_1)
-    print(f"Prediction for features_1 ({str(sample_features_1)[:100]}...): {prediction1}")
+    print(f"Prediction for features_1 (add_function): {prediction1}")
 
+    op_counts_2 = {op_name: 0 for op_name in predictor_no_model.KNOWN_OPERATION_TYPES}
+    op_counts_2["extract_method"] = 2 # Example: two extract_method operations
+    op_counts_2["add_import"] = 1
     sample_features_2 = {
-        "operation_type": "extract_method",
-        "num_input_code_lines": 120,
-        "num_target_symbols": 3,
-        "operation_parameters": {"start_line": 10, "end_line": 25, "new_name": "extracted"} # 3 params
+        "num_operations": 3, # 2 extract_method + 1 add_import
+        "num_target_symbols": 2,
+        "num_input_code_lines": 0,
+        "num_parameters_in_op": 0,
     }
+    sample_features_2.update(op_counts_2)
     prediction2 = predictor_no_model.predict(sample_features_2)
-    print(f"Prediction for features_2 ({str(sample_features_2)[:100]}...): {prediction2}")
+    print(f"Prediction for features_2 (2 extract_method, 1 add_import): {prediction2}")
 
-    sample_features_3 = { # Test fallback for unknown operation_type
-        "operation_type": "super_specific_custom_op",
-        "num_input_code_lines": 10,
-        "num_target_symbols": 0,
-        "operation_parameters": {}
+    op_counts_3 = {op_name: 0 for op_name in predictor_no_model.KNOWN_OPERATION_TYPES}
+    op_counts_3["unknown_operation"] = 1 # Test unknown operation
+    sample_features_3 = {
+        "num_operations": 1,
+        "num_target_symbols": 1,
+        "num_input_code_lines": 0,
+        "num_parameters_in_op": 0,
     }
+    sample_features_3.update(op_counts_3)
     prediction3 = predictor_no_model.predict(sample_features_3)
-    print(f"Prediction for features_3 ({str(sample_features_3)[:100]}...): {prediction3}")
+    print(f"Prediction for features_3 (unknown_operation): {prediction3}")
 
-    # Conceptual call to train (won't actually train but will print info)
-    predictor_no_model.train(Path("./training_data_placeholder.jsonl"))
+    # Setup for training test
+    import tempfile
+    import json # For writing jsonl
 
-    # To test with a real model (requires creating a dummy model first)
+    with tempfile.TemporaryDirectory() as temp_dir_name:
+        temp_data_dir = Path(temp_dir_name)
+        dummy_training_data_path = temp_data_dir / "success_memory.jsonl"
+
+        # Create dummy success_memory.jsonl data
+        sample_log_entries = [
+            {
+                "timestamp_utc": "2023-01-01T10:00:00Z", "spec_issue_id": "ISSUE-001",
+                "spec_issue_description": "Add a login function.",
+                "spec_target_files": ["src/auth.py"],
+                "spec_operations_details": [
+                    {"name": "add_function", "target_file": "src/auth.py", "parameters": {"function_name": "login"}},
+                    {"name": "add_import", "target_file": "src/auth.py", "import_statement": "from flask import session"}
+                ],
+                "successful_diff_summary": "+ def login():\n+  pass",
+                "successful_script": "class AddLoginCommand(...): ...",
+                "patch_source": "LLMCore"
+            },
+            {
+                "timestamp_utc": "2023-01-02T11:00:00Z", "spec_issue_id": "ISSUE-002",
+                "spec_issue_description": "Refactor user model for clarity.",
+                "spec_target_files": ["src/models.py"],
+                "spec_operations_details": [
+                    {"name": "extract_method", "target_file": "src/models.py", "parameters": {"method_name": "get_user_details"}},
+                    {"name": "rename_variable", "target_file": "src/models.py", "parameters": {"old_name": "usr", "new_name": "user_record"}}
+                ],
+                "successful_diff_summary": "- usr = ...\n+ user_record = ...",
+                "successful_script": "class RefactorUserCommand(...): ...",
+                "patch_source": "DiffusionCore"
+            },
+            { # Entry to test "unknown_operation"
+                "timestamp_utc": "2023-01-03T12:00:00Z", "spec_issue_id": "ISSUE-003",
+                "spec_issue_description": "Implement a custom sorting algorithm.",
+                "spec_target_files": ["src/utils.py"],
+                "spec_operations_details": [
+                    {"name": "custom_sort_algo", "target_file": "src/utils.py", "parameters": {}}
+                ],
+                "successful_diff_summary": "+ def custom_sort(): ...",
+                "successful_script": "class CustomSortCommand(...): ...",
+                "patch_source": "LLMCore"
+            }
+        ]
+        with open(dummy_training_data_path, "w", encoding="utf-8") as f_log:
+            for entry in sample_log_entries:
+                f_log.write(json.dumps(entry) + "\n")
+
+        print(f"\n--- Training CorePredictor with dummy data from {dummy_training_data_path} ---")
+        # Use a unique model path for this test training
+        trained_model_path = temp_data_dir / "trained_test_core_predictor.joblib"
+        predictor_for_training = CorePredictor(model_path=trained_model_path, verbose=True)
+        training_success = predictor_for_training.train(training_data_path=temp_data_dir, model_output_path=trained_model_path)
+        print(f"Training reported success: {training_success}")
+
+        if training_success and predictor_for_training.is_ready:
+            print("\n--- Predicting with newly trained model ---")
+            # Use one of the sample_features defined earlier, or create new ones aligned with training data
+            prediction_after_train = predictor_for_training.predict(sample_features_1) # Re-use sample_features_1
+            print(f"Prediction for features_1 (add_function) using trained model: {prediction_after_train}")
+
+            op_counts_eval = {op_name: 0 for op_name in predictor_for_training.KNOWN_OPERATION_TYPES}
+            op_counts_eval["extract_method"] = 1
+            op_counts_eval["rename_variable"] = 1
+            sample_features_eval = {
+                "num_operations": 2, "num_target_symbols": 1,
+                "num_input_code_lines": 0, "num_parameters_in_op": 0,
+            }
+            sample_features_eval.update(op_counts_eval)
+            prediction_eval = predictor_for_training.predict(sample_features_eval)
+            print(f"Prediction for features representing (extract_method, rename_variable): {prediction_eval}")
+
+    # Original test with a pre-existing dummy model (if joblib and sklearn available)
+    # This part is kept for basic model loading test, separate from training test.
     if joblib:
         # Use a more specific, test-only model path to avoid conflicts
         dummy_model_path = Path("./models/dummy_core_predictor_test.joblib")
