@@ -351,8 +351,8 @@ Provide only the code snippet to replace `{hole_marker}`:"""
             return proposed_fix_script
 
         # Basic span-based merging of proposed fix into the failed script.
-        # This is a simplified implementation using difflib to avoid replacing
-        # the entire script when only a few lines changed.
+        # Use difflib to rewrite only the changed regions while preserving
+        # unchanged lines from the failed script.
         if proposed_fix_script is not None and failed_patch_script is not None:
             try:
                 import difflib
@@ -364,7 +364,12 @@ Provide only the code snippet to replace `{hole_marker}`:"""
                 for tag, i1, i2, j1, j2 in matcher.get_opcodes():
                     if tag == "equal":
                         merged_lines.extend(failed_lines[i1:i2])
-                    else:
+                    elif tag == "replace":
+                        merged_lines.extend(proposed_lines[j1:j2])
+                    elif tag == "delete":
+                        # skip lines from failed script
+                        continue
+                    elif tag == "insert":
                         merged_lines.extend(proposed_lines[j1:j2])
 
                 merged_script = "\n".join(merged_lines)
