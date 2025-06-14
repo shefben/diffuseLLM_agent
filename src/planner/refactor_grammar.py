@@ -114,12 +114,26 @@ class AddImport(BaseRefactorOperation):
             return False
         return True
 
+class GenericCodeEdit(BaseRefactorOperation):
+    name: str = "generic_code_edit"
+    description: str = "Applies a generic code modification to a specified file based on a natural language description."
+    required_parameters: List[str] = ["edit_description"]
+
+    def validate_parameters(self, params: Dict[str, Any]) -> bool:
+        if not super().validate_parameters(params):
+            return False
+        edit_desc = params.get("edit_description")
+        if not isinstance(edit_desc, str) or not edit_desc.strip():
+            print(f"Error: 'edit_description' must be a non-empty string for '{self.name}'.")
+            return False
+        return True
+
 # --- Refactor Operation Map ---
 
 # We instantiate the classes here to store instances in the map,
 # allowing access to their methods and class attributes directly.
 REFACTOR_OPERATION_INSTANCES: Dict[str, BaseRefactorOperation] = {
-    op.name: op() for op in [AddDecorator, ExtractMethod, UpdateDocstring, AddImport]
+    op.name: op() for op in [AddDecorator, ExtractMethod, UpdateDocstring, AddImport, GenericCodeEdit]
 }
 
 # To store types instead (useful for creating new instances with specific data):
@@ -128,6 +142,7 @@ REFACTOR_OPERATION_CLASSES: Dict[str, Type[BaseRefactorOperation]] = {
     ExtractMethod.name: ExtractMethod,
     UpdateDocstring.name: UpdateDocstring,
     AddImport.name: AddImport,
+    GenericCodeEdit.name: GenericCodeEdit,
 }
 
 
@@ -196,3 +211,12 @@ if __name__ == "__main__":
         print(json.dumps(AddDecorator.model_json_schema(), indent=2))
     elif hasattr(AddDecorator, 'schema_json'): # Fallback for Pydantic V1
         print(AddDecorator.schema_json(indent=2))
+
+    generic_edit_op = REFACTOR_OPERATION_INSTANCES[GenericCodeEdit.name]
+    print(f"\nOperation: {generic_edit_op.name} - {generic_edit_op.description}")
+    valid_generic_params = {"edit_description": "Change the return value of foo to True."}
+    print(f"Params: {valid_generic_params}, Valid? {generic_edit_op.validate_parameters(valid_generic_params)}")
+    invalid_generic_params = {"edit_description": ""}
+    print(f"Params: {invalid_generic_params}, Valid? {generic_edit_op.validate_parameters(invalid_generic_params)}")
+    missing_generic_params = {}
+    print(f"Params: {missing_generic_params}, Valid? {generic_edit_op.validate_parameters(missing_generic_params)}")

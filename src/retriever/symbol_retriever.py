@@ -4,6 +4,8 @@ import numpy as np
 from pathlib import Path # Added Path
 import re # For basic keyword splitting
 
+from src.digester.graph_structures import NodeID # Ensure NodeID is imported
+
 # Attempt to import load_success_memory, handle if not available (e.g. during isolated testing)
 try:
     from src.utils import load_success_memory
@@ -76,14 +78,14 @@ class SymbolRetriever:
             return vector
         return vector / norm
 
-    def retrieve_symbol_bag(
+    def search_relevant_symbols_with_details(
         self,
         raw_request: str,
         top_k: int = 50,
         similarity_threshold: float = 0.25
-    ) -> str:
+    ) -> List[Dict[str, Any]]:
         """
-        Retrieves a 'bag-of-symbols' (FQN strings) relevant to the raw_request
+        Retrieves detailed information for symbols relevant to the raw_request
         by performing a FAISS search on pre-computed embeddings.
 
         Args:
@@ -92,13 +94,18 @@ class SymbolRetriever:
             similarity_threshold: Minimum cosine similarity for a symbol to be included.
 
         Returns:
-            A string containing unique FQNs joined by '|', or an empty string.
+            A list of dictionaries, where each dictionary contains details of a relevant symbol
+            (fqn, item_type, file_path, start_line, end_line, similarity_score).
+            Returns an empty list if no relevant symbols are found or if components are missing.
         """
         if not raw_request or not self.embedding_model or not self.faiss_index or self.faiss_index.ntotal == 0 or self.np_module is None:
-            if self.np_module is None: print("SymbolRetriever: Numpy not available for FAISS search.")
-            return ""
+            if self.np_module is None and self.verbose: print("SymbolRetriever: Numpy not available for FAISS search.")
+            if not self.embedding_model and self.verbose: print("SymbolRetriever: Embedding model not available.")
+            if not self.faiss_index and self.verbose: print("SymbolRetriever: FAISS index not available.")
+            if self.faiss_index and self.faiss_index.ntotal == 0 and self.verbose: print("SymbolRetriever: FAISS index is empty.")
+            return []
 
-        print(f"SymbolRetriever: Encoding raw request: '{raw_request[:100]}...'")
+        if self.verbose: print(f"SymbolRetriever: Encoding raw request for symbol search: '{raw_request[:100]}...'")
         query_embedding_list = self.embedding_model.encode([raw_request], show_progress_bar=False)
 
         query_embedding: np.ndarray
@@ -108,8 +115,8 @@ class SymbolRetriever:
             elif isinstance(query_embedding_list, self.np_module.ndarray) and query_embedding_list.ndim == 1:
                 query_embedding = query_embedding_list.astype(self.np_module.float32).reshape(1, -1)
             else:
-                print("Warning: Unexpected query embedding format. Cannot perform FAISS search.")
-                return ""
+            print("Warning: Unexpected query embedding format. Cannot perform FAISS search.")
+            return []
         else:
             query_embedding = query_embedding_list.astype(self.np_module.float32)
 
@@ -117,41 +124,52 @@ class SymbolRetriever:
         # If not, uncomment:
         # query_embedding = self._l2_normalize_vector(query_embedding.flatten()).reshape(1, -1)
 
-        print(f"SymbolRetriever: Querying FAISS with top_k={top_k}...")
+        if self.verbose: print(f"SymbolRetriever: Querying FAISS with top_k={top_k}...")
         try:
             distances, faiss_ids = self.faiss_index.search(query_embedding, top_k)
         except Exception as e:
-            print(f"Error during FAISS search: {e}")
-            return ""
+            print(f"SymbolRetriever Error: Error during FAISS search: {e}")
+            return []
 
-        relevant_fqns_ordered: List[str] = []
-        processed_fqns: Set[str] = set()
+        retrieved_symbols_details: List[Dict[str, Any]] = []
+        # processed_fqns: Set[str] = set() # Not strictly needed if FAISS metadata ensures unique FQNs per entry
 
         if faiss_ids.size > 0:
-            for i in range(faiss_ids.shape[1]):
-                faiss_id = faiss_ids[0, i]
-                if faiss_id == -1:  continue
+            for i in range(faiss_ids.shape[1]): # Iterate through retrieved results for the query
+                faiss_id = faiss_ids[0, i] # Get the FAISS ID for the i-th result
+                if faiss_id == -1: continue # Skip invalid FAISS IDs
 
                 l2_dist = distances[0, i]
+                # Cosine similarity from L2 distance (assuming normalized vectors): sim = 1 - (L2_dist^2 / 2)
                 cosine_similarity = 1 - (l2_dist**2 / 2)
 
                 if cosine_similarity >= similarity_threshold:
                     if 0 <= faiss_id < len(self.faiss_id_to_metadata):
                         metadata = self.faiss_id_to_metadata[int(faiss_id)]
-                        fqn = metadata.get("fqn")
-                        if fqn and fqn not in processed_fqns:
-                            relevant_fqns_ordered.append(fqn)
-                            processed_fqns.add(fqn)
+                        # fqn = metadata.get("fqn") # No longer need processed_fqns if we append dicts directly
+                        # if fqn and fqn not in processed_fqns:
+                        symbol_detail = {
+                            "fqn": metadata.get("fqn"),
+                            "item_type": metadata.get("item_type"),
+                            "file_path": metadata.get("file_path"),
+                            "start_line": metadata.get("start_line"),
+                            "end_line": metadata.get("end_line"),
+                            "similarity_score": float(cosine_similarity) # Ensure float for JSON
+                        }
+                        retrieved_symbols_details.append(symbol_detail)
+                            # processed_fqns.add(fqn)
                     else:
-                        print(f"Warning: FAISS ID {faiss_id} out of bounds for metadata list (len {len(self.faiss_id_to_metadata)}).")
+                        if self.verbose: print(f"SymbolRetriever Warning: FAISS ID {faiss_id} out of bounds for metadata list (len {len(self.faiss_id_to_metadata)}).")
 
-        if not relevant_fqns_ordered:
-            print("SymbolRetriever: No symbols found meeting similarity threshold.")
-            return ""
+        # Sort by similarity score descending before returning, if multiple results
+        retrieved_symbols_details.sort(key=lambda x: x.get("similarity_score", 0.0), reverse=True)
 
-        symbol_bag_string = "|".join(relevant_fqns_ordered)
-        print(f"SymbolRetriever: Constructed symbol_bag: '{symbol_bag_string[:200]}...'")
-        return symbol_bag_string
+        if not retrieved_symbols_details:
+            if self.verbose: print("SymbolRetriever: No symbols found meeting similarity threshold.")
+            return []
+
+        if self.verbose: print(f"SymbolRetriever: Retrieved {len(retrieved_symbols_details)} symbol details.")
+        return retrieved_symbols_details
 
     def _get_repository_fqns_for_context(self, max_symbols: Optional[int] = 500) -> List[str]:
         """
@@ -208,8 +226,62 @@ class SymbolRetriever:
         if self.verbose:
             print(f"SymbolRetriever: Getting enriched context for spec fusion. Issue: '{raw_issue_text[:100]}...'")
 
-        # 1. Get FQNs from repository digest
-        repo_fqn_list = self._get_repository_fqns_for_context(max_symbols=max_fqns)
+        # 1. Use Semantic Search for Symbols
+        retrieved_symbols_list = self.search_relevant_symbols_with_details(
+            raw_request=raw_issue_text,
+            top_k=max_fqns,
+            similarity_threshold=0.3 # Default threshold, can be tuned
+        )
+
+        enriched_symbols_details: List[Dict[str, Any]] = []
+        if self.digester and hasattr(self.digester, 'fqn_to_symbol_map') and hasattr(self.digester, 'get_file_content'):
+            for symbol_data in retrieved_symbols_list:
+                enriched_symbol = symbol_data.copy()
+                fqn_str = symbol_data.get('fqn')
+
+                if fqn_str:
+                    # Add Signature
+                    # Assuming fqn_to_symbol_map keys might be strings or NodeID.
+                    # If NodeID, cast: node_id = NodeID(fqn_str)
+                    # For now, trying direct string lookup first, then NodeID.
+                    details_from_map = self.digester.fqn_to_symbol_map.get(fqn_str)
+                    if not details_from_map and isinstance(NodeID, type): # Try casting if NodeID is a type
+                        details_from_map = self.digester.fqn_to_symbol_map.get(NodeID(fqn_str))
+
+                    if details_from_map:
+                        enriched_symbol['signature_str'] = details_from_map.get('signature_str')
+
+                # Add Code Snippet
+                file_path_str = symbol_data.get('file_path')
+                start_line = symbol_data.get('start_line')
+                end_line = symbol_data.get('end_line')
+
+                if file_path_str and isinstance(start_line, int) and start_line > 0 and isinstance(end_line, int) and end_line >= start_line:
+                    # Construct absolute path if file_path_str is relative (which it should be from fqn_to_symbol_map)
+                    abs_file_path = self.digester.repo_path / file_path_str
+                    file_content_str = self.digester.get_file_content(abs_file_path) # get_file_content expects absolute path
+
+                    if file_content_str is not None:
+                        file_lines = file_content_str.splitlines()
+                        context_lines_window = 2 # Number of lines before and after
+
+                        # Adjust for 0-based indexing for list slicing
+                        snippet_start_idx = max(0, start_line - 1 - context_lines_window)
+                        # end_line is inclusive as per typical editor line numbers; list slicing is exclusive for end
+                        snippet_end_idx = min(len(file_lines), end_line + context_lines_window)
+
+                        code_snippet_lines = file_lines[snippet_start_idx:snippet_end_idx]
+                        enriched_symbol['code_snippet'] = "\n".join(code_snippet_lines)
+                    else:
+                        enriched_symbol['code_snippet'] = "Could not retrieve file content."
+                else:
+                    enriched_symbol['code_snippet'] = "File path or line numbers missing/invalid for snippet."
+
+                enriched_symbols_details.append(enriched_symbol)
+        elif self.verbose:
+            print("SymbolRetriever: Digester or its fqn_to_symbol_map/get_file_content not available. Skipping detail enrichment.")
+            enriched_symbols_details = retrieved_symbols_list # Return symbols as is from search
+
 
         # 2. Get success examples from memory
         success_examples_for_prompt: List[Dict[str, str]] = []
@@ -260,7 +332,7 @@ class SymbolRetriever:
             if not self.data_dir_path: print("  SymbolRetriever: No data_dir_path for success memory.")
             if not load_success_memory: print("  SymbolRetriever: load_success_memory function not available.")
 
-        return {"fqns": repo_fqn_list, "success_examples": success_examples_for_prompt}
+        return {"relevant_symbols": enriched_symbols_details, "success_examples": success_examples_for_prompt}
 
 
 # Example Usage (conceptual, as it needs a populated RepositoryDigester)
@@ -335,19 +407,27 @@ if __name__ == '__main__':
             # Cosine sims: 1 - (0.25/2) = 0.875,  1 - (1.0/2) = 0.5
 
             print(f"\nTesting with threshold 0.7 (should get func_a):")
-            symbol_bag = retriever.retrieve_symbol_bag(raw_request_example, top_k=5, similarity_threshold=0.7)
-            print(f"Example symbol_bag (thresh 0.7): '{symbol_bag}'") # Expected: "module.func_a"
-            assert symbol_bag == "module.func_a"
+            symbols_details_high_thresh = retriever.search_relevant_symbols_with_details(raw_request_example, top_k=5, similarity_threshold=0.7)
+            print(f"Example symbols_details (thresh 0.7): {symbols_details_high_thresh}")
+            assert len(symbols_details_high_thresh) == 1
+            assert symbols_details_high_thresh[0]['fqn'] == "module.func_a"
+            assert 'similarity_score' in symbols_details_high_thresh[0]
+            assert symbols_details_high_thresh[0]['similarity_score'] > 0.87 # Approx
 
             print(f"\nTesting with threshold 0.4 (should get both):")
-            symbol_bag_both = retriever.retrieve_symbol_bag(raw_request_example, top_k=5, similarity_threshold=0.4)
-            print(f"Example symbol_bag (thresh 0.4): '{symbol_bag_both}'") # Expected: "module.func_a|module.ClassB.method_c"
-            assert symbol_bag_both == "module.func_a|module.ClassB.method_c"
+            symbols_details_low_thresh = retriever.search_relevant_symbols_with_details(raw_request_example, top_k=5, similarity_threshold=0.4)
+            print(f"Example symbols_details (thresh 0.4): {symbols_details_low_thresh}")
+            assert len(symbols_details_low_thresh) == 2
+            # Results should be sorted by score
+            assert symbols_details_low_thresh[0]['fqn'] == "module.func_a"
+            assert symbols_details_low_thresh[1]['fqn'] == "module.ClassB.method_c"
+            assert symbols_details_low_thresh[0]['similarity_score'] > symbols_details_low_thresh[1]['similarity_score']
+
 
             print(f"\nTesting with threshold 0.9 (should get none):")
-            symbol_bag_none = retriever.retrieve_symbol_bag(raw_request_example, top_k=5, similarity_threshold=0.9)
-            print(f"Example symbol_bag (thresh 0.9): '{symbol_bag_none}'") # Expected: ""
-            assert symbol_bag_none == ""
+            symbols_details_no_match = retriever.search_relevant_symbols_with_details(raw_request_example, top_k=5, similarity_threshold=0.9)
+            print(f"Example symbols_details (thresh 0.9): {symbols_details_no_match}")
+            assert len(symbols_details_no_match) == 0
         else:
             print("Mock digester components not fully initialized for example.")
     else:

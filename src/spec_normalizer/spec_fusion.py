@@ -76,24 +76,35 @@ class SpecFusion:
         if self.verbose:
             print(f"\nSpecFusion: Normalizing request: '{raw_issue_text[:100]}...'")
 
-        # 1. Retrieve Enriched Context (FQNs and Success Examples)
-        fqn_list: List[str] = []
+        # 1. Retrieve Enriched Context (Symbols and Success Examples)
+        relevant_symbols_list: List[Dict[str, Any]] = []
         success_examples: List[Dict[str, str]] = []
         context_symbols_string = "No specific context symbols or examples retrieved." # Default
 
         if self.symbol_retriever:
             try:
-                if self.verbose: print("SpecFusion: Retrieving enriched context (FQNs and examples)...")
-                # Max_fqns and max_success_examples can be made configurable if needed.
+                if self.verbose: print("SpecFusion: Retrieving enriched context (symbols and examples)...")
                 retrieved_context = self.symbol_retriever.get_enriched_context_for_spec_fusion(raw_issue_text)
 
-                fqn_list = retrieved_context.get("fqns", [])
+                relevant_symbols_list = retrieved_context.get("relevant_symbols", [])
                 success_examples = retrieved_context.get("success_examples", [])
 
                 context_parts = []
-                if fqn_list:
-                    context_parts.append("Relevant Project Symbols FQNs: " + ", ".join(fqn_list))
-                    if self.verbose: print(f"SpecFusion: Retrieved {len(fqn_list)} FQNs.")
+                if relevant_symbols_list:
+                    symbol_details_strs = ["Relevant Project Symbols:"]
+                    for i, sym_data in enumerate(relevant_symbols_list, 1):
+                        detail = (
+                            f"  Symbol {i}:\n"
+                            f"    FQN: {sym_data.get('fqn', 'N/A')}\n"
+                            f"    Type: {sym_data.get('item_type', 'N/A')}\n"
+                            f"    File: {sym_data.get('file_path', 'N/A')}:{sym_data.get('start_line', 'N/A')}-{sym_data.get('end_line', 'N/A')}\n"
+                            f"    Signature: {sym_data.get('signature_str', 'N/A')}\n"
+                            f"    Similarity: {sym_data.get('similarity_score', 0.0):.2f}\n"
+                            f"    Snippet:\n      ---\n      {sym_data.get('code_snippet', 'N/A').replace('\\n', '\\n      ')}\n      ---"
+                        )
+                        symbol_details_strs.append(detail)
+                    context_parts.append("\n".join(symbol_details_strs))
+                    if self.verbose: print(f"SpecFusion: Retrieved and formatted {len(relevant_symbols_list)} relevant symbols.")
 
                 if success_examples:
                     example_strs = ["Previously successful related examples:"]

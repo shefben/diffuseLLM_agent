@@ -221,6 +221,52 @@ class PhasePlanner:
         if self.verbose:
             print(f"PhasePlanner: CorePredictor initialized. Model path: {core_predictor_model_path}, Ready: {self.core_predictor.is_ready}")
 
+    def _suggest_alternative_operations(
+        self,
+        current_op_spec_item: Dict[str, Any],
+        spec: 'Spec'
+    ) -> List[Dict[str, Any]]:
+        """
+        Suggests alternative operations for a given operation spec item.
+        Currently, this is a placeholder and returns the original operation.
+        Future enhancements could use heuristics or an LLM to propose alternatives.
+        """
+        alternative_ops = [current_op_spec_item.copy()]
+        current_op_name = current_op_spec_item.get("name")
+
+        if current_op_name and current_op_name != "generic_code_edit":
+            # Construct edit_description for the generic_code_edit alternative
+            original_op_params = current_op_spec_item.get("parameters", {})
+            if isinstance(original_op_params, dict):
+                original_op_params_str = ", ".join(f"{k}='{v}'" for k, v in original_op_params.items())
+            else: # Fallback if parameters is not a dict (though it should be)
+                original_op_params_str = str(original_op_params)
+
+            if not original_op_params_str and original_op_params: # If params is not empty but str is (e.g. empty dict)
+                 original_op_params_str = str(original_op_params)
+
+
+            generic_edit_desc = (
+                f"Original operation was '{current_op_name}' with parameters: {original_op_params_str}. "
+                f"Consider if a direct code edit can achieve the intended outcome described by the original operation. "
+                f"Original spec issue: {spec.issue_description}"
+            )
+
+            # Limit length of description
+            if len(generic_edit_desc) > 500:
+                generic_edit_desc = generic_edit_desc[:497] + "..."
+
+            generic_code_edit_op_spec_item = {
+                "name": "generic_code_edit",
+                "target_file": current_op_spec_item.get("target_file"), # Inherit target_file
+                "parameters": {"edit_description": generic_edit_desc}
+            }
+            alternative_ops.append(generic_code_edit_op_spec_item)
+            if self.verbose:
+                print(f"PhasePlanner._suggest_alternative_operations: Suggested 'generic_code_edit' as an alternative for '{current_op_name}'.")
+
+        return alternative_ops
+
     def generate_plan_from_spec(self, spec: Spec) -> List[Phase]:
         """
         Generates a plan (a list of Phase objects) from a given Spec object.
@@ -405,41 +451,43 @@ Score:"""
         if not spec.operations:
             return []
 
-        # Iterate through each operation defined in the spec
-        for op_idx, op_spec_item in enumerate(spec.operations):
+        # Iterate through each operation defined in the input spec
+        for op_idx, op_spec_item_from_input_spec in enumerate(spec.operations): # Renamed for clarity
             next_beam_candidates: List[Tuple[List[Phase], float]] = []
 
-            op_name = op_spec_item.get("name")
-            if not op_name or not isinstance(op_name, str): # Ensure op_name is a string
-                print(f"Warning: Spec operation item at index {op_idx} is missing a 'name' or 'name' is not a string. Skipping this item.")
-                continue
+            candidate_op_spec_items = self._suggest_alternative_operations(op_spec_item_from_input_spec, spec)
 
-            operation_instance = self.refactor_op_map.get(op_name)
-            if not operation_instance:
-                print(f"Warning: Operation '{op_name}' (spec index {op_idx}) not found in refactor grammar. Skipping this item.")
-                continue
+            for current_candidate_op_item in candidate_op_spec_items:
+                op_name = current_candidate_op_item.get("name")
+                if not op_name or not isinstance(op_name, str): # Ensure op_name is a string
+                    print(f"Warning: Candidate operation item (derived from input spec index {op_idx}) is missing a 'name' or 'name' is not a string: {current_candidate_op_item}. Skipping this candidate.")
+                    continue
 
-            phase_parameters = {k: v for k, v in op_spec_item.items() if k not in ["name", "target_file"]}
-            target_file_for_phase = op_spec_item.get("target_file")
-            if target_file_for_phase is not None and not isinstance(target_file_for_phase, str): # Ensure target_file is str or None
-                print(f"Warning: 'target_file' for operation '{op_name}' (spec index {op_idx}) is not a string: {target_file_for_phase}. Treating as None.")
-                target_file_for_phase = None
+                operation_instance = self.refactor_op_map.get(op_name)
+                if not operation_instance:
+                    print(f"Warning: Operation '{op_name}' (from candidate derived from input spec index {op_idx}) not found in refactor grammar. Skipping this candidate.")
+                    continue
 
+                phase_parameters = {k: v for k, v in current_candidate_op_item.items() if k not in ["name", "target_file"]}
+                target_file_for_phase = current_candidate_op_item.get("target_file")
+                if target_file_for_phase is not None and not isinstance(target_file_for_phase, str):
+                    print(f"Warning: 'target_file' for operation '{op_name}' (from candidate derived from input spec index {op_idx}) is not a string: {target_file_for_phase}. Treating as None.")
+                    target_file_for_phase = None
 
-            if not operation_instance.validate_parameters(phase_parameters):
-                print(f"Warning: Parameters for operation '{op_name}' (spec index {op_idx}, target: {target_file_for_phase or 'repo-level'}) are invalid. This operation will not be added to plans in the current beam step.")
-                continue
+                if not operation_instance.validate_parameters(phase_parameters):
+                    print(f"Warning: Parameters for operation '{op_name}' (from candidate derived from input spec index {op_idx}, target: {target_file_for_phase or 'repo-level'}) are invalid. This candidate operation will not be added to plans.")
+                    continue
 
-            # For each current plan in the beam, try to extend it with the current operation
-            for current_plan_phases, current_plan_score in beam:
-                new_phase = Phase(
-                    operation_name=op_name,
-                    target_file=target_file_for_phase,
-                    parameters=phase_parameters,
-                    description=f"Op {op_idx + 1}/{len(spec.operations)}: {operation_instance.description} for '{op_name}' on '{target_file_for_phase or 'repo-level'}'"
-                )
+                # For each current plan in the beam, try to extend it with the current candidate operation
+                for current_plan_phases, current_plan_score in beam:
+                    new_phase = Phase(
+                        operation_name=op_name, # From current_candidate_op_item
+                        target_file=target_file_for_phase, # From current_candidate_op_item
+                        parameters=phase_parameters, # From current_candidate_op_item
+                        description=f"Op (Input Spec Idx {op_idx + 1}/{len(spec.operations)} - Candidate: '{op_name}'): {operation_instance.description} on '{target_file_for_phase or 'repo-level'}'"
+                    )
 
-                extended_plan_phases = current_plan_phases + [new_phase]
+                    extended_plan_phases = current_plan_phases + [new_phase]
                 extended_score = self._score_candidate_plan_with_llm(extended_plan_phases, graph_stats)
                 next_beam_candidates.append((extended_plan_phases, extended_score))
 

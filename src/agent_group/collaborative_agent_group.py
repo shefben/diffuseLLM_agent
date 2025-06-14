@@ -149,7 +149,7 @@ class CollaborativeAgentGroup:
         self,
         phase_ctx: 'Phase',
         digester: 'RepositoryDigester',
-        validator_handle: Callable[[Optional[str], Path, 'RepositoryDigester', Path, Optional[Dict[str,Any]]], Tuple[bool, Optional[str]]], # Updated for pdg_slice
+        validator_handle: Callable[[Optional[str], Path, 'RepositoryDigester', Path, Optional[Dict[str,Any]]], Tuple[bool, Optional[str]]],
         score_style_handle: Callable[[Any, Dict[str, Any]], float],
         predicted_core: Optional[str] = None # New parameter
     ) -> Tuple[Optional[str], Optional[str]]: # Returns (script_string, source_info_string)
@@ -191,7 +191,7 @@ class CollaborativeAgentGroup:
             "naming_conventions_db_path": self.naming_conventions_db_path,
             "score_style_handle": score_style_handle, # Passed from PhasePlanner
             "validator_handle": validator_handle,     # Passed from PhasePlanner
-            "repository_digester": digester,           # Pass the digester instance
+            "repository_digester": digester,
             "predicted_core_preference": predicted_core # New item
         }
 
