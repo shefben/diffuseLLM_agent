@@ -419,20 +419,39 @@ Your goal is to refine the provided LibCST script for clarity, correctness, and 
             script_lines_to_embed = current_failed_script_content.splitlines()
 
             empty_line_calls_str_list = []
+            # Header comments
             for line_content in header_comment_text.split('\n'):
-                # Escape for embedding inside an f-string within another f-string, then inside cst.Comment
                 escaped_line = line_content.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
                 empty_line_calls_str_list.append(f'cst.EmptyLine(comment=cst.Comment(f"# {escaped_line}"))')
 
             empty_line_calls_str_list.append('cst.EmptyLine()') # Blank line for separation
 
+            # --- Start of commented-out original script ---
+            empty_line_calls_str_list.append('cst.EmptyLine(comment=cst.Comment("# --- Start of commented-out original script ---"))')
             for line_content in script_lines_to_embed:
                 escaped_line = line_content.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
-                # The line itself is already a comment line if we are commenting out a script
-                # but if current_failed_script_content is not a script but some other text, prefixing is safer.
-                # The previous logic prefixed with "# ". Here, we are generating a CST node.
-                # The cst.Comment will handle the "#".
                 empty_line_calls_str_list.append(f'cst.EmptyLine(comment=cst.Comment(f"# {escaped_line}"))')
+            # --- End of commented-out original script ---
+            empty_line_calls_str_list.append('cst.EmptyLine(comment=cst.Comment("# --- End of commented-out original script ---"))')
+
+            empty_line_calls_str_list.append('cst.EmptyLine()') # Blank line for separation
+
+            # TODO comments for actionable next steps
+            todo_comments = [
+                "# TODO: Replace the logic above (now commented out) by importing and",
+                "# TODO: calling the existing helper function/method that was detected as a duplicate.",
+                "# TODO: Example: from existing_module import existing_helper",
+                "# TODO: result = existing_helper_placeholder_function(args_if_known)"
+            ]
+            for comment_line in todo_comments:
+                escaped_comment_line = comment_line.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
+                empty_line_calls_str_list.append(f'cst.EmptyLine(comment=cst.Comment(f"{escaped_comment_line}"))') # No extra # prefix needed here for cst.Comment
+
+            empty_line_calls_str_list.append('cst.EmptyLine()') # Blank line
+
+            # Placeholder function call
+            empty_line_calls_str_list.append('cst.EmptyLine(comment=cst.Comment(f"# Placeholder call (remove or replace):"))')
+            empty_line_calls_str_list.append('cst.Expr(value=cst.Call(func=cst.Name("existing_helper_placeholder_function")))');
 
             new_body_elements_initializer_str = "[\n            " + ",\n            ".join(empty_line_calls_str_list) + "\n        ]"
 

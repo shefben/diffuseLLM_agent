@@ -16,12 +16,18 @@ if TYPE_CHECKING:
 
 # Actual imports
 from src.utils.config_loader import DEFAULT_APP_CONFIG # For default model paths
+from src.spec_normalizer.spec_normalizer_interface import SpecNormalizerModelInterface
+from src.spec_normalizer.t5_client import T5Client as T5ClientForSpecNormalization # Alias if T5Client is imported elsewhere
+from src.spec_normalizer.diffusion_spec_normalizer import DiffusionSpecNormalizer
 from .spec_model import Spec
 from .phase_model import Phase
 from .refactor_grammar import BaseRefactorOperation, REFACTOR_OPERATION_INSTANCES
 
 # Child component imports
-from src.profiler.t5_client import T5Client # Assuming direct import is fine
+# T5Client is imported for spec normalization above, ensure no conflict if used for other purposes.
+# If T5Client is used for other things, the alias T5ClientForSpecNormalization should be used for spec.
+# For now, assume T5Client is primarily for spec normalization context here.
+from src.profiler.t5_client import T5Client # Assuming direct import is fine - this is potentially the same as T5ClientForSpecNormalization
 from src.retriever.symbol_retriever import SymbolRetriever # Assuming direct import
 from src.spec_normalizer.spec_fusion import SpecFusion # Assuming direct import
 from src.validator.validator import Validator
@@ -140,9 +146,29 @@ class PhasePlanner:
         if self.verbose: print(f"PhasePlanner: Beam width set to {self.beam_width}")
 
         # Instantiate Child Components (Passing app_config or derived configs)
-        self.t5_client = T5Client(app_config=self.app_config)
+
+        # Spec Normalizer Selection Logic
+        spec_normalizer_type = self.app_config.get("spec_normalizer", {}).get("type", "t5") # Default to t5
+        spec_model_instance: SpecNormalizerModelInterface
+
+        if spec_normalizer_type.lower() == "diffusion":
+            if self.verbose:
+                print("PhasePlanner: Using DiffusionSpecNormalizer for spec normalization.")
+            spec_model_instance = DiffusionSpecNormalizer(app_config=self.app_config)
+        elif spec_normalizer_type.lower() == "t5":
+            if self.verbose:
+                print("PhasePlanner: Using T5Client for spec normalization.")
+            # Ensure T5ClientForSpecNormalization or a T5Client instance is used.
+            # Using T5Client directly, assuming it's the one intended for spec normalization.
+            spec_model_instance = T5Client(app_config=self.app_config)
+        else:
+            if self.verbose:
+                print(f"PhasePlanner Warning: Unknown spec_normalizer type '{spec_normalizer_type}'. Defaulting to T5Client.")
+            spec_model_instance = T5Client(app_config=self.app_config)
+
+        # self.t5_client = T5Client(app_config=self.app_config) # Removed as spec_model_instance replaces its role for SpecFusion
         self.symbol_retriever = SymbolRetriever(digester=self.digester, app_config=self.app_config)
-        self.spec_normalizer = SpecFusion(spec_model_interface=self.t5_client, symbol_retriever=self.symbol_retriever, app_config=self.app_config)
+        self.spec_normalizer = SpecFusion(spec_model_interface=spec_model_instance, symbol_retriever=self.symbol_retriever, app_config=self.app_config)
         self.validator = Validator(app_config=self.app_config)
         if self.verbose: print("PhasePlanner: Validator instance initialized.")
 
