@@ -46,13 +46,19 @@ class DiffusionSpecNormalizer(SpecNormalizerModelInterface):
             if self.verbose:
                 print(f"DiffusionSpecNormalizer: Would use diffusion model for: {raw_issue_text[:50]}...")
             # Placeholder: Actual call to diffusion model
+            context_info_for_mock = "No context symbols provided."
+            if context_symbols_string:
+                context_info_for_mock = context_symbols_string[:200] + "..." if len(context_symbols_string) > 200 else context_symbols_string
+
             mock_yaml = f'''
-issue_description: "Processed by (placeholder) DiffusionSpecNormalizer: {raw_issue_text[:50]}"
+issue_description: "Processed by (placeholder) DiffusionSpecNormalizer: {raw_issue_text[:100]}"
 target_files:
   - "src/mock/diffusion_target.py"
 operations:
   - name: "diffusion_generated_op"
     description: "Operation suggested by diffusion spec normalizer."
+context_used: |
+  {context_info_for_mock}
 acceptance_tests:
   - "Ensure diffusion normalization worked."
 '''
@@ -60,7 +66,7 @@ acceptance_tests:
         elif self.fallback_t5_client and self.fallback_t5_client.is_ready:
             if self.verbose:
                 print(f"DiffusionSpecNormalizer: Using T5Client fallback for: {raw_issue_text[:50]}...")
-            return self.fallback_t_client.generate_spec_yaml(raw_issue_text, context_symbols_string)
+            return self.fallback_t5_client.generate_spec_yaml(raw_issue_text, context_symbols_string)
         else:
             if self.verbose:
                 print("DiffusionSpecNormalizer Error: Neither diffusion model nor T5 fallback is ready.")

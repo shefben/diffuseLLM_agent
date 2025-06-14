@@ -151,9 +151,10 @@ class SpecFusion:
         spec_object: Optional[Spec] = None
         try:
             if self.verbose: print("SpecFusion: Validating dictionary and instantiating Spec model...")
-            # Add raw inputs to the dict before Spec instantiation if desired
-            parsed_dict["raw_issue_text"] = raw_issue_text
-            parsed_dict["raw_yaml_spec"] = yaml_spec_str
+            # The Spec model itself should not store these raw inputs if they are not part of its schema.
+            # They can be stored alongside the Spec object by the caller if needed.
+            # parsed_dict["raw_issue_text"] = raw_issue_text # Removed
+            # parsed_dict["raw_yaml_spec"] = yaml_spec_str # Removed
 
             spec_object = Spec(**parsed_dict)
             if self.verbose: print("SpecFusion: Successfully normalized request to Spec object.")
@@ -287,7 +288,7 @@ acceptance_tests:
 
 
     spec_fuser = SpecFusion(
-        t5_client=mock_t5_client,
+        spec_model_interface=mock_t5_client,
         symbol_retriever=mock_symbol_retriever,
         app_config=app_cfg_main
     )
