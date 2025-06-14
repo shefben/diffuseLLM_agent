@@ -1136,20 +1136,106 @@ class RepositoryDigester:
 
 
         # FAISS Index Initialization (depends on successful model loading)
+        # TODO: Implement multi-level FAISS caching (RAM cache + on-disk main index) for very large repos if IndexFlatL2 RAM usage becomes an issue.
         self.faiss_index: Optional[faiss.Index] = None
         self.faiss_id_to_metadata: List[Dict[str, Any]] = []
-        if faiss and self.embedding_model and self.embedding_dimension:
+        self.faiss_index_path: Optional[Path] = None
+        self.faiss_metadata_path: Optional[Path] = None
+        self._faiss_dirty_flag = True # Assume dirty until loaded or successfully saved
+
+        faiss_on_disk_path_str = self.app_config.get("digester", {}).get("faiss_on_disk_path")
+        if faiss_on_disk_path_str:
+            base_path = Path(faiss_on_disk_path_str)
+            if not base_path.is_absolute():
+                default_data_dir = Path(self.app_config.get("general", {}).get("data_dir", self.repo_path / ".agent_data"))
+                base_path = (default_data_dir / base_path).resolve()
+
+            self.faiss_index_path = base_path.parent / (base_path.name + ".faiss")
+            self.faiss_metadata_path = base_path.parent / (base_path.name + "_metadata.json")
+            self.faiss_index_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.verbose:
+                print(f"RepositoryDigester Info: FAISS on-disk index path set to: {self.faiss_index_path}")
+                print(f"RepositoryDigester Info: FAISS on-disk metadata path set to: {self.faiss_metadata_path}")
+
+        loaded_from_disk = False
+        if faiss and self.embedding_model and self.embedding_dimension and self.faiss_index_path and self.faiss_metadata_path:
+            loaded_from_disk = self._load_faiss_index_and_metadata(self.faiss_index_path, self.faiss_metadata_path)
+            if loaded_from_disk:
+                self._faiss_dirty_flag = False # Loaded successfully, so not dirty initially
+                if self.verbose: print(f"RepositoryDigester Info: FAISS index and metadata loaded from disk. Index contains {self.faiss_index.ntotal if self.faiss_index else 0} items.")
+            else:
+                if self.verbose: print("RepositoryDigester Info: Failed to load FAISS from disk or paths not set. Will create a new index if possible.")
+
+        if not loaded_from_disk and faiss and self.embedding_model and self.embedding_dimension:
             try:
-                if self.verbose: print(f"RepositoryDigester Info: Initializing FAISS IndexFlatL2 with dimension {self.embedding_dimension}...")
+                if self.verbose: print(f"RepositoryDigester Info: Initializing new FAISS IndexFlatL2 with dimension {self.embedding_dimension}...")
                 self.faiss_index = faiss.IndexFlatL2(self.embedding_dimension) # type: ignore
-                if self.verbose: print("RepositoryDigester Info: FAISS Index initialized.")
+                self.faiss_id_to_metadata = [] # Ensure metadata is also reset
+                self._faiss_dirty_flag = True # New index is considered dirty until first save
+                if self.verbose: print("RepositoryDigester Info: New FAISS Index initialized in RAM.")
             except Exception as e:
-                print(f"RepositoryDigester Error: Error initializing FAISS index: {e}")
+                print(f"RepositoryDigester Error: Error initializing new FAISS index: {e}")
                 self.faiss_index = None
         elif not faiss:
             print("RepositoryDigester Warning: faiss library not available. FAISS indexing disabled.")
         elif not self.embedding_model or not self.embedding_dimension:
             print("RepositoryDigester Warning: Embedding model not loaded or dimension unknown. FAISS indexing disabled.")
+
+    def _load_faiss_index_and_metadata(self, index_path: Path, metadata_path: Path) -> bool:
+        if not faiss: return False
+        if self.verbose: print(f"RepositoryDigester: Attempting to load FAISS index from {index_path} and metadata from {metadata_path}")
+        loaded_index = None
+        loaded_metadata = []
+        try:
+            if index_path.exists() and index_path.is_file():
+                loaded_index = faiss.read_index(str(index_path))
+                if self.verbose: print(f"  FAISS index {index_path.name} loaded.")
+            else:
+                if self.verbose: print(f"  FAISS index file {index_path.name} not found.")
+                return False
+
+            if loaded_index.d != self.embedding_dimension:
+                if self.verbose: print(f"  Error: Loaded FAISS index dimension {loaded_index.d} does not match model dimension {self.embedding_dimension}. Will create a new index.")
+                return False
+
+            if metadata_path.exists() and metadata_path.is_file():
+                with open(metadata_path, "r", encoding='utf-8') as f:
+                    loaded_metadata = json.load(f)
+                if self.verbose: print(f"  Metadata {metadata_path.name} loaded ({len(loaded_metadata)} entries).")
+            else:
+                if self.verbose: print(f"  FAISS metadata file {metadata_path.name} not found. Cannot fully restore index state.")
+                return False
+
+            if loaded_index.ntotal != len(loaded_metadata):
+                if self.verbose: print(f"  Error: Loaded FAISS index size {loaded_index.ntotal} does not match metadata entries {len(loaded_metadata)}. Will create new index.")
+                return False
+
+            self.faiss_index = loaded_index
+            self.faiss_id_to_metadata = loaded_metadata
+            if self.verbose: print("RepositoryDigester: FAISS index and metadata loaded successfully.")
+            return True
+        except Exception as e:
+            if self.verbose: print(f"RepositoryDigester: Error loading FAISS index/metadata: {e}. A new index will be created if needed.")
+            return False
+
+    def _save_faiss_index_and_metadata(self, index_path: Path, metadata_path: Path) -> bool:
+        if not faiss: return False
+        if self.faiss_index is None:
+            if self.verbose: print("RepositoryDigester: No FAISS index in memory to save.")
+            return False
+        if self.verbose: print(f"RepositoryDigester: Saving FAISS index to {index_path} and metadata to {metadata_path}")
+        try:
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            faiss.write_index(self.faiss_index, str(index_path))
+            if self.verbose: print(f"  FAISS index {index_path.name} saved ({self.faiss_index.ntotal} vectors).")
+
+            with open(metadata_path, "w", encoding='utf-8') as f:
+                json.dump(self.faiss_id_to_metadata, f, indent=2) # Use indent for readability of full JSON list
+            if self.verbose: print(f"  Metadata {metadata_path.name} saved ({len(self.faiss_id_to_metadata)} entries).")
+            return True
+        except Exception as e:
+            if self.verbose: print(f"RepositoryDigester: Error saving FAISS index/metadata: {e}")
+            return False
 
     def _extract_symbols_and_docstrings_from_ast(
         self,
@@ -1720,8 +1806,22 @@ class RepositoryDigester:
             if self.verbose: print("RepositoryDigester Info: FAISS index is dirty. Committing changes by rebuilding...")
             try:
                 self._rebuild_full_faiss_index() # This method handles its own errors internally
-                self._faiss_dirty_flag = False # Cleared only on successful rebuild
-                if self.verbose: print("RepositoryDigester Info: FAISS index rebuild complete.")
+
+                # After successful rebuild, attempt to save if paths are configured
+                if self.faiss_index_path and self.faiss_metadata_path:
+                    save_ok = self._save_faiss_index_and_metadata(self.faiss_index_path, self.faiss_metadata_path)
+                    if save_ok:
+                        self._faiss_dirty_flag = False # Clear dirty flag only if save is successful
+                        if self.verbose: print("RepositoryDigester Info: FAISS index and metadata saved to disk.")
+                    else:
+                        # Keep dirty flag true if save failed, so it tries again next time
+                        if self.verbose: print("RepositoryDigester Warning: Failed to save FAISS index/metadata to disk. Index remains dirty.")
+                        return False # Indicate commit failed due to save error
+                else:
+                    # No on-disk path configured, so RAM index is now considered "committed"
+                    self._faiss_dirty_flag = False
+
+                if self.verbose: print("RepositoryDigester Info: FAISS index rebuild (and optional save) complete.")
                 return True
             except Exception as e_rebuild:
                 print(f"RepositoryDigester Error: Unexpected error during _rebuild_full_faiss_index via commit: {e_rebuild}")
