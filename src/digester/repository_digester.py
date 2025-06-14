@@ -1967,6 +1967,7 @@ class RepositoryDigester:
         slice_nodes: List[Dict[str, Any]] = []
         slice_edges: List[Dict[str, Any]] = []
         info_parts: List[str] = [f"PDG Slice for phase: {phase_ctx.operation_name} on {phase_ctx.target_file or 'N/A'}."]
+        added_node_ids_to_slice = set() # Keep track of NodeIDs already added to slice_nodes
 
         target_file_str = phase_ctx.target_file
         parameters = phase_ctx.parameters if phase_ctx.parameters else {}
@@ -1976,98 +1977,163 @@ class RepositoryDigester:
             return {"nodes": [], "edges": [], "info": " ".join(info_parts)}
 
         try:
-            target_file_rel_path = str(Path(target_file_str).relative_to(self.repo_path))
-        except ValueError: # Not under repo_path, or target_file_str is absolute
-            # Try to use target_file_str as is if it's a key in digested_files or can be matched
-            # This part might need more robust path handling depending on how target_file_str is formatted.
-            # For now, assume it's a relative path from repo root as intended.
-            target_file_rel_path = target_file_str
+            # Ensure target_file_rel_path is consistently used as a string relative path.
+            # If target_file_str is absolute, make it relative. If already relative, ensure correct format.
+            path_obj_target_file = Path(target_file_str)
+            if path_obj_target_file.is_absolute():
+                target_file_rel_path = str(path_obj_target_file.relative_to(self.repo_path))
+            else: # Assume already relative to repo_path
+                target_file_rel_path = str(Path(target_file_str)) # Normalize
+        except ValueError:
+            info_parts.append(f"Error: Target file '{target_file_str}' is not relative to repo_path '{self.repo_path}'.")
+            return {"nodes": [], "edges": [], "info": " ".join(info_parts)}
 
+        abs_target_file_path = self.repo_path / target_file_rel_path
+        parsed_target_file_result = self.digested_files.get(abs_target_file_path)
+
+        def _get_node_details(node_id_val: NodeID) -> Dict[str, Any]:
+            node_id_str = str(node_id_val)
+            parts = node_id_str.split(':')
+            file_p = parts[0]
+            lineno = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            col_offset = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            node_type = parts[3] if len(parts) > 3 else "UnknownType"
+            name = parts[4] if len(parts) > 4 else ""
+            category = parts[5] if len(parts) > 5 else ""
+
+            snippet = "Snippet not available (source file not found or issue)"
+            node_abs_file_path = self.repo_path / file_p
+            parsed_file_res = self.digested_files.get(node_abs_file_path)
+            if parsed_file_res and parsed_file_res.source_code:
+                lines = parsed_file_res.source_code.splitlines()
+                if 0 <= lineno - 1 < len(lines):
+                    snippet = lines[lineno - 1].strip()
+                else:
+                    snippet = "Snippet not available (line out of bounds)"
+
+            return {
+                "id": node_id_str, "label": f"{node_type}:{name}" if name else node_type,
+                "file": file_p, "line": lineno, "col": col_offset,
+                "category": category, "snippet": snippet
+            }
 
         target_func_name = parameters.get("target_function_name")
-        # target_class_name = parameters.get("target_class_name") # For future enhancement
+        target_class_name = parameters.get("target_class_name")
 
         if target_func_name:
-            info_parts.append(f"Targeting function: {target_func_name}.")
-            # NodeID category suffix for func defs in DataDependenceVisitor is "def"
-            # and in SymbolAndSignatureExtractorVisitor it's "function_code" or "method_code"
-            # _create_ast_node_id uses `type(node).__name__` which would be "FunctionDef"
-            # Let's assume node IDs for function definitions might include ":FunctionDef:func_name:def"
-            # Need to be consistent with how _create_ast_node_id forms these.
-            # For DataDependenceGraph, defs are like "file.py:line:col:Name:var_name:def"
-            # For function definitions, it's "file.py:line:col:FunctionDef:func_name:def"
+            info_parts.append(f"Targeting function: {target_func_name}" + (f" in class {target_class_name}" if target_class_name else "") + ".")
 
-            # Simplified: search for NodeIDs that contain the file and function name.
-            # This is a basic search and might need refinement based on exact NodeID format.
+            # Determine the FQN prefix for _find_node_ids_in_graphs if class is involved
+            # This is tricky as _find_node_ids_in_graphs uses simple name matching.
+            # For now, assume target_func_name is unique enough within the file or class context.
 
-            # We need a way to get the primary NodeID of the function definition itself.
-            # This might require looking up the symbol in self.digested_files[target_file_path].extracted_symbols
-            # then creating a NodeID from its file/line/col.
-            # For now, let's assume _find_node_ids_in_graphs can find it with a "def" category.
-
-            # The category suffix for function definition node itself (e.g. in control graph or as a target of calls)
-            # might just be its FQN, or an ID derived from its AST node type 'FunctionDef'.
-            # Let's use a placeholder category that implies definition.
             func_def_node_ids = self._find_node_ids_in_graphs(
-                target_file_rel_path, target_func_name, "FunctionDef:def" # Heuristic category
+                target_file_rel_path, target_func_name, "FunctionDef:def"
             )
+            if not func_def_node_ids and target_class_name: # If it's a method, try with class context in name for some finders
+                 # This part is heuristic and depends on how _find_node_ids_in_graphs and NodeID creation handle method names.
+                 # For now, direct search for FunctionDef:def with simple name is primary.
+                 pass
 
-            if not func_def_node_ids:
-                 func_def_node_ids = self._find_node_ids_in_graphs(
-                    target_file_rel_path, target_func_name, "def" # More generic def
-                )
+            for func_node_id in func_def_node_ids:
+                if str(func_node_id) not in added_node_ids_to_slice:
+                    slice_nodes.append(_get_node_details(func_node_id))
+                    added_node_ids_to_slice.add(str(func_node_id))
 
-
-            added_node_ids = set()
-
-            for func_node_id_str in func_def_node_ids:
-                if func_node_id_str not in added_node_ids:
-                    slice_nodes.append({"id": func_node_id_str, "label": f"FunctionDef: {target_func_name}"})
-                    added_node_ids.add(func_node_id_str)
-
-                # Control dependencies: nodes controlled by this function's internal constructs
-                # This requires iterating controllers *within* the function.
-                # For simplicity, let's find nodes *controlled by* the function itself if it acts as a scope controller,
-                # or nodes that are part of the function's definition.
-                # A simple approach: add all nodes from the same file that mention the function name.
-                # This is very heuristic. A better way is to traverse the graph.
-
-                # Outgoing Control Dependencies (nodes this function's parts control)
-                # This is complex. A function node itself isn't usually a controller in CDG.
-                # Its internal If/For/While nodes are.
-                # For now, we won't traverse deep into the function's internal control flow for PDG slice.
-
-                # Incoming Data Dependencies (data flowing into the function or its params)
-                # Search for data dependencies where a node *uses* something defined by func_node_id
-                # This is backwards. We want what func_node_id USES.
-                # So, func_node_id (or parts of it) will be a 'use_node_id' in DDG.
-                for use_node, def_nodes in self.project_data_dependence_graph.items():
-                    if target_func_name in str(use_node) and target_file_rel_path in str(use_node): # Heuristic: use_node is part of our target function
-                        for def_node in def_nodes:
-                            if def_node not in added_node_ids:
-                                slice_nodes.append({"id": str(def_node), "label": str(def_node)}) # Basic label
-                                added_node_ids.add(str(def_node))
+                # Data Dependencies for the function
+                # Incoming: Data used by the function (func_node_id is a 'use' node)
+                for use_node, def_nodes_set in self.project_data_dependence_graph.items():
+                    if use_node == func_node_id or (target_func_name in str(use_node) and target_file_rel_path in str(use_node)):
+                        for def_node in def_nodes_set:
+                            if str(def_node) not in added_node_ids_to_slice:
+                                slice_nodes.append(_get_node_details(def_node))
+                                added_node_ids_to_slice.add(str(def_node))
                             slice_edges.append({"from": str(def_node), "to": str(use_node), "type": "data"})
 
-                # Outgoing Data Dependencies (data flowing out from definitions within the function)
-                # Search for data dependencies where a node *defines* something used by func_node_id
-                # This means func_node_id (or parts of it) is a 'def_node_id' in DDG.
-                for use_node_key, def_nodes_set in self.project_data_dependence_graph.items():
-                    for def_node_val in def_nodes_set:
-                        if target_func_name in str(def_node_val) and target_file_rel_path in str(def_node_val): # Heuristic: def_node is part of our target function
-                             if use_node_key not in added_node_ids:
-                                slice_nodes.append({"id": str(use_node_key), "label": str(use_node_key)})
-                                added_node_ids.add(str(use_node_key))
-                             slice_edges.append({"from": str(def_node_val), "to": str(use_node_key), "type": "data"})
+                # Outgoing: Data defined by the function that is used elsewhere (func_node_id is a 'def' node)
+                for other_use_node, def_nodes_set_for_other_use in self.project_data_dependence_graph.items():
+                    if func_node_id in def_nodes_set_for_other_use or \
+                       any(target_func_name in str(dn) and target_file_rel_path in str(dn) for dn in def_nodes_set_for_other_use):
+                        if str(other_use_node) not in added_node_ids_to_slice:
+                            slice_nodes.append(_get_node_details(other_use_node))
+                            added_node_ids_to_slice.add(str(other_use_node))
+                        # Find which specific def_node from the set matches our func_node_id context
+                        # For simplicity, assume if func_node_id is in the set, it's the source.
+                        relevant_def_node = func_node_id # Or iterate to find the exact one if set contains multiple
+                        slice_edges.append({"from": str(relevant_def_node), "to": str(other_use_node), "type": "data"})
 
-            info_parts.append(f"Found {len(func_def_node_ids)} main definition node(s) for function '{target_func_name}'.")
-            info_parts.append(f"Slice includes {len(slice_nodes)} nodes and {len(slice_edges)} edges (simplified depth-1 data dependencies).")
+                # Control Dependencies for the function's internals
+                func_details = _get_node_details(func_node_id)
+                func_start_line = func_details.get("line", 0)
+                func_end_line = -1 # Placeholder, needs to be determined
 
+                if parsed_target_file_result and parsed_target_file_result.extracted_symbols:
+                    for sym in parsed_target_file_result.extracted_symbols:
+                        if sym.get("fqn", "").endswith(target_func_name) and sym.get("start_line") == func_start_line:
+                            func_end_line = sym.get("end_line", -1)
+                            break
+
+                if func_start_line > 0 and func_end_line > 0:
+                    for controller_node_id_obj, dependent_nodes_set in self.project_control_dependence_graph.items():
+                        controller_details = _get_node_details(controller_node_id_obj)
+                        if controller_details["file"] == target_file_rel_path and \
+                           func_start_line <= controller_details["line"] <= func_end_line:
+                            if str(controller_node_id_obj) not in added_node_ids_to_slice:
+                                slice_nodes.append(controller_details) # Already detailed from _get_node_details
+                                added_node_ids_to_slice.add(str(controller_node_id_obj))
+                            for dep_node_id_obj in dependent_nodes_set:
+                                if str(dep_node_id_obj) not in added_node_ids_to_slice:
+                                    slice_nodes.append(_get_node_details(dep_node_id_obj))
+                                    added_node_ids_to_slice.add(str(dep_node_id_obj))
+                                slice_edges.append({"from": str(controller_node_id_obj), "to": str(dep_node_id_obj), "type": "control"})
+                else:
+                    info_parts.append(f"Could not determine line range for function '{target_func_name}' for precise control dependency slicing.")
+
+        elif target_class_name:
+            info_parts.append(f"Targeting class: {target_class_name}.")
+            class_def_node_ids = self._find_node_ids_in_graphs(target_file_rel_path, target_class_name, "ClassDef:def")
+
+            method_node_ids_in_class: List[NodeID] = []
+            if parsed_target_file_result and parsed_target_file_result.extracted_symbols:
+                class_qname_prefix = f"{self._get_module_qname_from_path(abs_target_file_path, self.repo_path)}.{target_class_name}"
+                for sym in parsed_target_file_result.extracted_symbols:
+                    if sym.get("fqn","").startswith(class_qname_prefix + ".") and sym.get("item_type") == "method_code":
+                        method_name = sym["fqn"].split('.')[-1]
+                        # Find NodeID for this method
+                        # Category needs to be consistent with how FunctionDef for methods are stored.
+                        # Assuming "FunctionDef:def" or similar from _create_ast_node_id for methods too.
+                        method_ids = self._find_node_ids_in_graphs(target_file_rel_path, method_name, "FunctionDef:def")
+                        method_node_ids_in_class.extend(method_ids)
+
+
+            nodes_to_process_for_deps = class_def_node_ids + method_node_ids_in_class
+            for node_id_obj in nodes_to_process_for_deps:
+                if str(node_id_obj) not in added_node_ids_to_slice:
+                    slice_nodes.append(_get_node_details(node_id_obj))
+                    added_node_ids_to_slice.add(str(node_id_obj))
+
+                # Simplified Data Dependencies for class/methods (similar to function logic above)
+                # Incoming
+                for use_node, def_nodes_set in self.project_data_dependence_graph.items():
+                    if use_node == node_id_obj: # Direct use of class/method itself (e.g. instantiation, call)
+                        for def_node in def_nodes_set:
+                            if str(def_node) not in added_node_ids_to_slice:
+                                slice_nodes.append(_get_node_details(def_node))
+                                added_node_ids_to_slice.add(str(def_node))
+                            slice_edges.append({"from": str(def_node), "to": str(use_node), "type": "data"})
+                # Outgoing
+                for other_use_node, def_nodes_set_for_other_use in self.project_data_dependence_graph.items():
+                    if node_id_obj in def_nodes_set_for_other_use: # Class/method defined something used elsewhere
+                        if str(other_use_node) not in added_node_ids_to_slice:
+                            slice_nodes.append(_get_node_details(other_use_node))
+                            added_node_ids_to_slice.add(str(other_use_node))
+                        slice_edges.append({"from": str(node_id_obj), "to": str(other_use_node), "type": "data"})
+
+            info_parts.append(f"Found {len(class_def_node_ids)} def node(s) for class '{target_class_name}' and {len(method_node_ids_in_class)} methods.")
         else:
-            info_parts.append("No specific function target. PDG slicing for classes or other elements not yet fully implemented.")
-            # Fallback to returning some context if possible, e.g. all nodes from the target file.
-            # For now, returns empty if no function target.
+            info_parts.append("No specific function or class target. PDG slice might be limited.")
 
+        info_parts.append(f"Final slice includes {len(slice_nodes)} nodes and {len(slice_edges)} edges.")
         return {
             "nodes": slice_nodes,
             "edges": slice_edges,

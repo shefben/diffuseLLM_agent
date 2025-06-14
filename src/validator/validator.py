@@ -319,7 +319,7 @@ class Validator:
             if tmp_file_path_str and Path(tmp_file_path_str).exists():
                 os.remove(tmp_file_path_str) # Corrected variable name here
 
-    def _run_pytest(self, target_file_path: Path, project_root: Path, modified_content_for_target_file: str) -> Optional[str]:
+    def _run_pytest(self, target_file_path: Path, project_root: Path, modified_content_for_target_file: str, pdg_slice: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """
         Runs Pytest in a temporary copy of the project with the modified file.
         Args:
@@ -362,25 +362,79 @@ class Validator:
                 pytest_run_location = temp_project_path # CWD for pytest
                 specific_test_targets: List[str] = []
 
-                # Check if the original target_file_path is within the project's default test directory structure
-                # or if its name suggests it's a test file.
-                # project_root / self.default_pytest_target_dir gives the absolute path to the default test dir.
-                is_target_in_test_dir = str(target_file_path).startswith(str(project_root / self.default_pytest_target_dir))
-                is_target_a_test_file_by_name = "test" in target_file_path.name.lower()
+                # PDG-based test target selection
+                pdg_derived_test_targets = set()
+                if pdg_slice and pdg_slice.get("nodes"):
+                    if self.verbose: print(f"Validator: Using PDG slice to find test targets. Slice has {len(pdg_slice['nodes'])} nodes.")
+                    source_files_in_slice = set()
+                    for node_info in pdg_slice["nodes"]:
+                        if isinstance(node_info, dict) and node_info.get("file"):
+                            # Assuming 'file' in node_info is relative to project_root or absolute.
+                            # We need it relative to project_root for constructing test paths.
+                            node_file_path = Path(node_info["file"])
+                            if node_file_path.is_absolute():
+                                try:
+                                    node_file_rel_path = node_file_path.relative_to(project_root)
+                                    source_files_in_slice.add(node_file_rel_path)
+                                except ValueError: # If not under project_root, skip
+                                    if self.verbose: print(f"Validator: PDG node file {node_file_path} is outside project_root {project_root}, skipping.")
+                                    continue
+                            else: # Already relative
+                                source_files_in_slice.add(node_file_path)
 
-                if is_target_in_test_dir or is_target_a_test_file_by_name:
-                    # If the modified file is a test file, test it directly (using its relative path within the temp project)
-                    specific_test_targets.append(str(relative_target_path))
-                    if self.verbose: print(f"Validator: Pytest will target the modified test file: {relative_target_path}")
+
+                    for src_file_rel_path in source_files_in_slice:
+                        # Heuristic 1: tests/src/module/test_file.py (if src_file_rel_path starts with src/)
+                        # or tests/module/test_file.py (if src_file_rel_path does not start with src/)
+                        test_path_1_parts = [self.default_pytest_target_dir] + list(src_file_rel_path.parent.parts) + [f"test_{src_file_rel_path.name}"]
+                        test_path_1 = Path(*test_path_1_parts)
+
+                        # Heuristic 2: tests/module/test_file.py (specifically if src_file_rel_path was like 'src/module/file.py')
+                        test_path_2 = None
+                        if src_file_rel_path.parts and src_file_rel_path.parts[0] == 'src':
+                            test_path_2_parts = [self.default_pytest_target_dir] + list(src_file_rel_path.parts[1:]).parent.parts + [f"test_{src_file_rel_path.name}"]
+                            test_path_2 = Path(*test_path_2_parts)
+
+                        # Heuristic 3: tests/test_module_file.py (flatter structure)
+                        test_path_3_parts = [self.default_pytest_target_dir]
+                        if src_file_rel_path.parent.name and src_file_rel_path.parent.name != '.': # Avoid if file is in root
+                             test_path_3_parts.append(f"test_{src_file_rel_path.parent.name}_{src_file_rel_path.stem}.py")
+                        else:
+                             test_path_3_parts.append(f"test_{src_file_rel_path.stem}.py")
+                        test_path_3 = Path(*test_path_3_parts)
+
+
+                        potential_test_files = [test_path_1, test_path_2, test_path_3]
+                        for pt_path in potential_test_files:
+                            if pt_path is None: continue
+                            # Path for checking existence is in the temp_project_path (where tests are copied)
+                            # pt_path is already relative to temp_project_path/project_root due to construction.
+                            abs_potential_test_path_in_temp = temp_project_path / pt_path
+                            if abs_potential_test_path_in_temp.is_file():
+                                pdg_derived_test_targets.add(str(pt_path)) # Add relative path for pytest command
+                                if self.verbose: print(f"Validator: Added PDG-derived test target: {pt_path}")
+
+                if pdg_derived_test_targets:
+                    specific_test_targets = list(pdg_derived_test_targets)
+                    if self.verbose: print(f"Validator: Using PDG-derived test targets: {specific_test_targets}")
                 else:
-                    # If modified file is not a test file, run tests in the default test directory within the temp copy.
-                    default_test_dir_in_temp_rel_path = self.default_pytest_target_dir
-                    if (temp_project_path / default_test_dir_in_temp_rel_path).is_dir():
-                        specific_test_targets.append(default_test_dir_in_temp_rel_path)
-                        if self.verbose: print(f"Validator: Pytest will target default test directory: {default_test_dir_in_temp_rel_path}")
+                    # Fallback to existing logic if no PDG targets found
+                    if self.verbose: print("Validator: No PDG-derived test targets found, using fallback logic.")
+                    # relative_target_path is defined when the modified file is written to temp_project_path
+                    is_target_in_test_dir = str(target_file_path).startswith(str(project_root / self.default_pytest_target_dir))
+                    is_target_a_test_file_by_name = "test" in target_file_path.name.lower()
+
+                    if is_target_in_test_dir or is_target_a_test_file_by_name:
+                        specific_test_targets.append(str(relative_target_path))
+                        if self.verbose: print(f"Validator: Pytest will target the modified test file: {relative_target_path}")
                     else:
-                        specific_test_targets.append(".") # Fallback to run all tests in temp project root
-                        if self.verbose: print(f"Validator: Default test directory not found in temp copy. Pytest will target temp project root '.'")
+                        default_test_dir_in_temp_rel_path = self.default_pytest_target_dir
+                        if (temp_project_path / default_test_dir_in_temp_rel_path).is_dir():
+                            specific_test_targets.append(default_test_dir_in_temp_rel_path)
+                            if self.verbose: print(f"Validator: Pytest will target default test directory: {default_test_dir_in_temp_rel_path}")
+                        else:
+                            specific_test_targets.append(".")
+                            if self.verbose: print(f"Validator: Default test directory not found in temp copy. Pytest will target temp project root '.'")
 
                 # 4. Execute Pytest
                 command = [self.pytest_path] + specific_test_targets + ["-qq", "--disable-warnings", "--cache-clear"]
@@ -433,7 +487,8 @@ class Validator:
         modified_code_content_str: Optional[str],
         target_file_path_str: str,
         digester: 'RepositoryDigester',
-        project_root: Path
+        project_root: Path,
+        pdg_slice: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, Optional[str]]: # Error message is now the second element, payload removed
         """
         Validates the modified code content by running mock tools.
@@ -474,8 +529,7 @@ class Validator:
 
         # Pytest runs on the project state. The modified_code_content_str represents the change
         # to one file. A real pytest would run against the filesystem.
-        # Removed digester from _run_pytest call as it's no longer needed with full project copy.
-        pytest_errors = self._run_pytest(target_file_path, project_root, modified_code_content_str)
+        pytest_errors = self._run_pytest(target_file_path, project_root, modified_code_content_str, pdg_slice=pdg_slice)
         if pytest_errors: all_errors.append(pytest_errors)
 
         if not all_errors:

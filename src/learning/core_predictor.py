@@ -28,6 +28,7 @@ class CorePredictor:
         self.verbose = verbose
         self.model_path = model_path if model_path else Path("./models/core_predictor.joblib")
         self.model: Any = None # To store the loaded scikit-learn model
+        self.label_encoder: Any = None # To store the scikit-learn LabelEncoder
         self.is_ready: bool = False
 
         # Make KNOWN_OPERATION_TYPES an instance variable for easier access and potential modification per instance if ever needed.
@@ -48,27 +49,29 @@ class CorePredictor:
         if self.model_path.exists() and self.model_path.is_file():
             try:
                 self.model = joblib.load(self.model_path)
-                self.is_ready = True # Mark as ready only if model is successfully loaded
                 if self.verbose: print(f"CorePredictor Info: Model loaded successfully from {self.model_path}")
+
+                # Attempt to load the label encoder
+                label_encoder_path = self.model_path.parent / (self.model_path.stem + "_label_encoder.joblib")
+                if label_encoder_path.exists():
+                    self.label_encoder = joblib.load(label_encoder_path)
+                    if self.verbose: print(f"CorePredictor Info: Label encoder loaded successfully from {label_encoder_path}")
+                    self.is_ready = True # Ready if model and label encoder (if present) are loaded
+                elif self.model: # Model loaded, but no label encoder found - might be an old model or error
+                    print(f"CorePredictor Warning: Model loaded from {self.model_path}, but corresponding label encoder not found at {label_encoder_path}. Predictions might be numerical if model outputs numbers.")
+                    # Consider it ready if model is there, but prediction needs to be careful.
+                    # For robust operation, if label_encoder is expected, this could be self.is_ready = False
+                    self.is_ready = True # Or False, depending on strictness. Let's be optimistic.
+
             except Exception as e:
-                print(f"CorePredictor Error: Failed to load model from {self.model_path}: {e}")
+                print(f"CorePredictor Error: Failed to load model or label encoder from {self.model_path} (or derived path): {e}")
                 self.model = None
+                self.label_encoder = None
                 self.is_ready = False
         else:
             if self.verbose: print(f"CorePredictor Info: Model file not found at {self.model_path}. Predictor will use placeholder logic.")
-            # is_ready remains False, as no model is loaded.
-            # The predict method can still function with placeholder logic.
             self.is_ready = False
 
-    def predict(self, features: Dict[str, Any]) -> Optional[str]:
-        if self.is_ready and self.model is not None:
-            # Placeholder for actual feature transformation and prediction
-            # X_transformed = self._transform_features(features)
-            # prediction = self.model.predict(X_transformed) # Assuming model is scikit-learn like
-            # return prediction[0]
-            if self.verbose:
-                print(f"CorePredictor: Real model loaded. Using placeholder prediction logic for now. Features: {str(features)[:200]}...")
-            # Fall through to placeholder if real prediction logic (feature transform + model.predict) isn't implemented yet
     def predict(self, features: Dict[str, Any]) -> Optional[str]:
         if not self.is_ready or self.model is None:
             if self.verbose: print("CorePredictor Info: Model not ready or not loaded. Using placeholder prediction logic.")
@@ -81,10 +84,18 @@ class CorePredictor:
             else:
                 try:
                     # Scikit-learn models expect a 2D array: [n_samples, n_features]
-                    prediction = self.model.predict([feature_vector])
-                    predicted_label = str(prediction[0])
-                    if self.verbose: print(f"CorePredictor: Model prediction: '{predicted_label}' from features: {str(features)[:100]}...")
-                    return predicted_label
+                    predicted_numerical_label_array = self.model.predict([feature_vector])
+                    predicted_numerical_label = predicted_numerical_label_array[0]
+
+                    if self.label_encoder:
+                        predicted_label_str = self.label_encoder.inverse_transform([predicted_numerical_label])[0]
+                        if self.verbose: print(f"CorePredictor: Model prediction (decoded): '{predicted_label_str}' from numerical '{predicted_numerical_label}' using features: {str(features)[:100]}...")
+                        return predicted_label_str
+                    else:
+                        # If no label encoder, return the raw numerical prediction as string
+                        predicted_label_raw_str = str(predicted_numerical_label)
+                        if self.verbose: print(f"CorePredictor Warning: No label encoder loaded. Model prediction (raw numerical): '{predicted_label_raw_str}' from features: {str(features)[:100]}...")
+                        return predicted_label_raw_str
                 except Exception as e:
                     print(f"CorePredictor Error: Real model prediction failed: {e}. Falling back to placeholder.")
                     # Fall through to placeholder logic
@@ -156,56 +167,94 @@ class CorePredictor:
 
         print(f"  INFO: Extracted {len(X_features)} feature sets for training.")
 
-        # --- Actual model training would happen here ---
-        # Example (conceptual, using scikit-learn conventions):
-        # if self.model is None: # Or if retraining is forced
-        #     from sklearn.model_selection import train_test_split
-        #     from sklearn.ensemble import RandomForestClassifier # Example classifier
-        #     from sklearn.metrics import classification_report
-        #
-        #     X_train, X_test, y_train, y_test = train_test_split(X_features, y_labels, test_size=0.2, random_state=42, stratify=y_labels)
-        #     self.model = RandomForestClassifier(random_state=42)
-        #     self.model.fit(X_train, y_train)
-        #     y_pred = self.model.predict(X_test)
-        #     print("  INFO: (Conceptual) Model trained. Classification report on test set:")
-        #     print(classification_report(y_test, y_pred))
-        #     self.is_ready = True # Mark as ready after training
-        # else:
-        #     print("  INFO: (Conceptual) Model already exists. Incremental training / re-training logic not implemented.")
-        print("  INFO: Actual model training logic (fitting a classifier) is a placeholder.")
+        try:
+            from sklearn.model_selection import train_test_split
+            from sklearn.ensemble import RandomForestClassifier # Or LogisticRegression
+            from sklearn.metrics import classification_report
+            from sklearn.preprocessing import LabelEncoder
+            sklearn_available = True
+        except ImportError:
+            sklearn_available = False
+            print("CorePredictor Warning: scikit-learn not found. Actual model training will be skipped.")
 
+        if not sklearn_available or not X_features or not y_labels:
+            print("CorePredictor Info: Skipping model training due to missing scikit-learn or no data.")
+            return False
 
+        # Label Encoding
+        self.label_encoder = LabelEncoder()
+        y_numerical = self.label_encoder.fit_transform(y_labels)
+        if self.verbose: print(f"  INFO: Labels encoded. Classes: {list(self.label_encoder.classes_)}")
+
+        # Train/Test Split
+        # Stratify if there's more than one unique label and enough samples per label
+        stratify_option = y_numerical if len(set(y_numerical)) > 1 and len(y_numerical) > len(set(y_numerical)) * 2 else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_features, y_numerical, test_size=0.2, random_state=42, stratify=stratify_option
+        )
+        if self.verbose: print(f"  INFO: Data split. Train size: {len(X_train)}, Test size: {len(X_test)}")
+
+        # Model Instantiation and Training
+        # Using simpler parameters for faster placeholder training
+        classifier = RandomForestClassifier(random_state=42, n_estimators=10, min_samples_leaf=5, class_weight='balanced_subsample')
+        try:
+            classifier.fit(X_train, y_train)
+            self.model = classifier
+            self.is_ready = True # Model is trained
+            if self.verbose: print("  INFO: RandomForestClassifier model trained.")
+        except Exception as e:
+            print(f"CorePredictor Error: Model training failed: {e}")
+            self.model = None
+            self.is_ready = False
+            return False
+
+        # Evaluation
+        if self.model and X_test: # Ensure X_test is not empty
+            try:
+                y_pred = self.model.predict(X_test)
+                # Ensure all predicted labels are known to the encoder before generating report
+                # This can happen if a class is only in test set due to small data.
+                # For simplicity, we'll assume fit_transform on all y_labels covers this for now.
+                # For a robust solution, handle cases where y_pred might contain new labels not seen by encoder.
+                # However, with stratify and proper data, this should be less of an issue.
+                report_target_names = list(self.label_encoder.classes_)
+                # If y_test or y_pred are empty, classification_report can fail.
+                if len(y_test) > 0 and len(y_pred) > 0:
+                    report = classification_report(y_test, y_pred, target_names=report_target_names, zero_division=0)
+                    if self.verbose: print("  INFO: Model evaluation complete. Classification report on test set:\n", report)
+                elif self.verbose:
+                    print("  INFO: Skipping classification report due to empty y_test or y_pred.")
+            except Exception as e_report:
+                 if self.verbose: print(f"CorePredictor Warning: Could not generate classification report: {e_report}")
+        elif self.verbose:
+            print("  INFO: Skipping model evaluation as model or test data is unavailable.")
+
+        # Model Saving
         output_path = model_output_path if model_output_path else self.model_path
-        # if self.model and joblib:
-        #     try:
-        #         output_path.parent.mkdir(parents=True, exist_ok=True)
-        #         joblib.dump(self.model, output_path)
-        #         print(f"  INFO: (Conceptual) Trained model saved to: {output_path}")
-        #     except Exception as e:
-        #         print(f"CorePredictor Error: Failed to save conceptual model to {output_path}: {e}")
-        #         return False # Consider this a failure if saving was intended
-        # elif not joblib:
-        #     print("CorePredictor Error: joblib not installed. Cannot save conceptual model.")
-        #     return False
-        # elif not self.model:
-        #     print("CorePredictor Info: No conceptual model was trained/instantiated to save.")
-        #     return False # No model means training effectively failed for persistence
-
-        print(f"  INFO: Placeholder for saving trained model to: {output_path}.")
-        if joblib is None:
-            print("CorePredictor Error: joblib is not installed. Cannot save conceptual model (if it were trained).")
-            # Even if conceptual, if joblib isn't there, can't save.
-            # But for this subtask, the focus is data loading, so return True if data loading was okay.
-            # However, if the goal of train() is to produce a usable model, then this is a failure.
-            # Let's stick to: if it can't save, it's not a successful train completion.
-            # For now, as per original, returning False if joblib missing for saving.
-            # This subtask doesn't change the saving part, just data loading.
-            # The original returns False if joblib is None for saving.
-
-        print("  INFO: Placeholder training data processing complete. Actual model training/saving is conceptual.")
-        # For this subtask, success means data loading and feature prep.
-        # The actual training is still placeholder.
-        return True # Indicate that data loading and feature prep part was "successful".
+        if self.model and joblib:
+            try:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                joblib.dump(self.model, output_path)
+                # Also save the label encoder
+                if self.label_encoder:
+                    label_encoder_path = output_path.parent / (output_path.stem + "_label_encoder.joblib")
+                    joblib.dump(self.label_encoder, label_encoder_path)
+                    if self.verbose: print(f"  INFO: Trained model and label encoder saved to: {output_path} and {label_encoder_path}")
+                else: # Should not happen if training set self.label_encoder
+                    if self.verbose: print(f"  INFO: Trained model saved to: {output_path}. Label encoder was not set.")
+                return True # Successful training and saving
+            except Exception as e:
+                print(f"CorePredictor Error: Failed to save trained model or label encoder to {output_path}: {e}")
+                self.is_ready = False # Failed to save, so not fully ready
+                return False
+        elif not joblib:
+            print("CorePredictor Error: joblib not installed. Trained model cannot be saved.")
+            self.is_ready = False # Cannot persist model
+            return False # Indicate failure to save
+        elif not self.model: # Should not happen if training occurred and set self.model
+            print("CorePredictor Info: No model was trained. Nothing to save.")
+            # is_ready would be False from training failure
+            return False # Training effectively failed if no model produced
 
     # Placeholder for feature transformation logic needed before calling a real model's predict
     # def _transform_features(self, features: Dict[str, Any]) -> Any:

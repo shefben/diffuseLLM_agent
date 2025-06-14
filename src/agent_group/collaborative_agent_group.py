@@ -307,7 +307,8 @@ class CollaborativeAgentGroup:
                     modified_code_content_for_iteration, # Pass applied code content
                     Path(target_file_str), # Pass Path object
                     digester,
-                    digester.repo_path # Pass project_root
+                    digester.repo_path, # Pass project_root
+                    context_data.get("pdg_slice") # Pass PDG slice
                 )
                 if not is_valid and error_traceback_validator: # If validator provides an error, use it.
                     error_traceback = error_traceback_validator
@@ -373,7 +374,7 @@ class CollaborativeAgentGroup:
                         print(f"CollaborativeAgentGroup Error: {final_error_traceback}")
                     elif modified_content_after_polish is not None and target_file_str:
                         final_is_valid, final_error_traceback = validator_handle( # type: ignore
-                            modified_content_after_polish, Path(target_file_str), digester, digester.repo_path
+                            modified_content_after_polish, Path(target_file_str), digester, digester.repo_path, context_data.get("pdg_slice") # Pass PDG slice
                         )
                         final_style_score = score_style_handle(self.current_patch_candidate, self.style_profile) # Score the script
                     else: # Should not be reached if logic is correct
