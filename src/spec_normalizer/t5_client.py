@@ -1,218 +1,228 @@
 # src/spec_normalizer/t5_client.py
-from typing import Optional, Dict, Any, Tuple, List # Added Tuple, List for Pydantic fallback
 from pathlib import Path
-import re
+from typing import Optional, Dict, Any
 
-# Guarded imports for major dependencies
+from .spec_normalizer_interface import SpecNormalizerModelInterface
+
+# Guarded import for Hugging Face Transformers and PyTorch
 try:
     import torch
-    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, PreTrainedTokenizerBase, PreTrainedModel # More specific types
+    from transformers import T5ForConditionalGeneration, T5TokenizerFast
 except ImportError:
     torch = None # type: ignore
-    AutoTokenizer = None # type: ignore
-    AutoModelForSeq2SeqLM = None # type: ignore
-    PreTrainedTokenizerBase = None # type: ignore
-    PreTrainedModel = None # type: ignore
-    print("Warning: PyTorch or Hugging Face Transformers not found. T5 client for spec normalization will be disabled.")
+    T5ForConditionalGeneration = None # type: ignore
+    T5TokenizerFast = None # type: ignore
+    print("Warning: PyTorch or Hugging Face Transformers not found. T5Client will not function with real models.")
 
-try:
-    import yaml
-except ImportError:
-    yaml = None # type: ignore
-    print("Warning: PyYAML not found. YAML parsing for T5 output will be disabled.")
+class T5Client(SpecNormalizerModelInterface):
+    # NOTE: This T5Client uses a standard T5ForConditionalGeneration model.
+    # Phase 3 of the original plan mentions a LoRA-adapted Tiny-T5 diffusion pipeline
+    # for the SpecFusion component, which this client serves. The LoRA adaptation
+    # and specific diffusion pipeline aspects are not implemented within this client itself.
+    def __init__(self, app_config: Dict[str, Any]):
+        """
+        Initializes the T5Client.
 
-# Assuming Spec is defined in src.specs.schemas and can be imported
-# from ..specs.schemas import Spec # Ideal relative import
-# Placeholder for subtask if direct relative import is an issue:
-try:
-    from pydantic import BaseModel, Field
-except ImportError:
-    BaseModel = object # type: ignore
-    Field = None # type: ignore
-    print("Warning: Pydantic not found. Spec model will not function.")
+        Args:
+            app_config: Application configuration dictionary.
+                        Expected keys:
+                        - general.verbose (bool, optional)
+                        - models.t5_spec_normalizer_dir (str, required)
+        """
+        self.app_config = app_config
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
 
-class Spec(BaseModel): # Fallback Spec definition
-    task: str = Field(..., description="Free-text summary of the task or issue.")
-    target_symbols: List[str] = Field(default_factory=list, description="FQNs")
-    operations: List[str] = Field(default_factory=list, description="Verbs")
-    acceptance: List[str] = Field(default_factory=list, description="Tests")
-    # Ad-hoc fields for error reporting from normalise_request
-    raw_output: Optional[str] = Field(default=None, description="Raw output from T5 model on error.")
-    raw_yaml: Optional[str] = Field(default=None, description="Extracted YAML string on parsing error.")
-    parsed_dict: Optional[Dict[str, Any]] = Field(default=None, description="Parsed dictionary on validation error.")
+        models_config = self.app_config.get("models", {})
+        self.model_path_or_name = models_config.get("t5_spec_normalizer_dir")
 
-    class Config:
-        extra = 'allow' # Allow ad-hoc fields like raw_output for error reporting
+        if self.model_path_or_name is None:
+            print("T5Client Critical Error: 'models.t5_spec_normalizer_dir' not found in app_config!")
+            self.model_path_or_name = "./models/ERROR_PATH_NOT_IN_CONFIG" # Ensure _load_model fails gracefully
 
-# End placeholder
+        self.model: Optional[T5ForConditionalGeneration] = None
+        self.tokenizer: Optional[T5TokenizerFast] = None
+        self.device: Optional[str] = None
+        self._is_ready: bool = False # Renamed attribute
+        self._load_model()
 
+    @property
+    def is_ready(self) -> bool:
+        return self._is_ready
 
-# Global cache for models and tokenizers to avoid reloading
-_model_cache: Dict[str, PreTrainedModel] = {}
-_tokenizer_cache: Dict[str, PreTrainedTokenizerBase] = {}
+    def _load_model(self) -> None:
+        """
+        Attempts to load the T5 model and tokenizer from the specified path or Hugging Face Hub.
+        Sets `self.is_ready` to True on success, False on failure.
+        """
+        if T5ForConditionalGeneration is None or T5TokenizerFast is None or torch is None:
+            print("T5Client Error: Required libraries (Transformers/PyTorch) not installed. Model loading aborted.")
+            self._is_ready = False # Use renamed attribute
+            return
 
+        actual_model_path: str
+        default_local_t5_path = Path("./models/placeholder_t5_spec_normalizer/")
 
-def _load_t5_model_and_tokenizer(model_path_str: str, device: str) -> Tuple[Optional[PreTrainedModel], Optional[PreTrainedTokenizerBase]]:
-    if model_path_str in _model_cache and model_path_str in _tokenizer_cache:
-        print(f"Using cached T5 model and tokenizer for {model_path_str}")
-        # Move model to device again in case device changed, though cache usually per device
-        # For simplicity, assume model in cache is already on a suitable device or this is handled by caller.
-        # A more robust cache would key by (model_path, device).
-        return _model_cache[model_path_str].to(device), _tokenizer_cache[model_path_str]
+        potential_path = Path(self.model_path_or_name)
 
-    if not (AutoTokenizer and AutoModelForSeq2SeqLM and torch):
-        return None, None
+        if potential_path.is_dir(): # Check if it's an existing directory first
+            actual_model_path = str(potential_path.resolve())
+            if self.verbose: print(f"T5Client Info: Attempting to load model from provided local directory: {actual_model_path}")
+        elif self.model_path_or_name == str(default_local_t5_path) or \
+             self.model_path_or_name.endswith("placeholder_t5_spec_normalizer") or \
+             self.model_path_or_name == "t5-small": # Common default or placeholder names
+            if default_local_t5_path.is_dir():
+                actual_model_path = str(default_local_t5_path.resolve())
+                print(f"T5Client Info: Using default local T5 model directory: {actual_model_path}")
+            else:
+                # If it was a placeholder name but default local path doesn't exist, try HF Hub with the original name
+                actual_model_path = self.model_path_or_name
+                print(f"T5Client Warning: Default local path '{default_local_t5_path}' not found. Attempting to load '{actual_model_path}' from Hugging Face Hub.")
+        else: # Treat as HF identifier
+            actual_model_path = self.model_path_or_name
+            if self.verbose: print(f"T5Client Info: Attempting to load model '{actual_model_path}' from Hugging Face Hub.")
 
-    try:
-        print(f"Loading T5 tokenizer from: {model_path_str}")
-        tokenizer = AutoTokenizer.from_pretrained(model_path_str)
-        print(f"Loading T5 model from: {model_path_str} onto device: {device}")
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_path_str).to(device)
-        model.eval()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        if self.verbose: print(f"T5Client Info: Using device: {self.device}")
 
-        _tokenizer_cache[model_path_str] = tokenizer
-        _model_cache[model_path_str] = model
-        return model, tokenizer
-    except Exception as e:
-        print(f"Error loading T5 model/tokenizer from {model_path_str}: {e}")
-        return None, None
+        try:
+            if self.verbose: print(f"T5Client Info: Loading tokenizer from '{actual_model_path}'...")
+            self.tokenizer = T5TokenizerFast.from_pretrained(actual_model_path)
 
+            if self.verbose: print(f"T5Client Info: Loading model from '{actual_model_path}' to {self.device}...")
+            self.model = T5ForConditionalGeneration.from_pretrained(actual_model_path).to(self.device) # type: ignore
+            self.model.eval() # type: ignore
 
-def normalise_request(
-    raw_request_text: str,
-    symbol_bag_string: str,
-    model_path: str,
-    device: Optional[str] = None,
-    max_input_length: int = 1024,
-    max_output_length: int = 512
-) -> Spec:
-    if not (torch and AutoModelForSeq2SeqLM and AutoTokenizer and yaml and Spec and Field): # Check Field too
-        error_msg = "T5 client dependencies (Transformers, PyTorch, PyYAML, Pydantic) not available."
-        print(f"Error: {error_msg}")
-        return Spec(task=f"Error: {error_msg}")
+            self._is_ready = True # Use renamed attribute
+            print(f"T5Client Info: Model '{actual_model_path}' loaded successfully on {self.device}.")
+        except Exception as e:
+            print(f"T5Client Error: Failed to load model/tokenizer from '{actual_model_path}': {e}")
+            self._is_ready = False # Use renamed attribute
+            self.model = None
+            self.tokenizer = None
 
-    selected_device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+    def generate_spec_yaml(self, raw_issue_text: str, context_symbols_string: Optional[str] = None) -> Optional[str]:
+        """
+        Generates a YAML specification string from raw issue text and context.
+        Returns None if generation fails.
 
-    model, tokenizer = _load_t5_model_and_tokenizer(model_path, selected_device)
+        Args:
+            raw_issue_text: The raw text description of the issue.
+            context_symbols_string: An optional string containing context symbols like FQNs.
 
-    if model is None or tokenizer is None:
-        error_msg = f"Failed to load T5 model/tokenizer from {model_path}."
-        return Spec(task=f"Error: {error_msg}")
+        Returns:
+            A string containing the YAML specification, or None if an error occurs or model is not ready.
+        """
+        if not self.is_ready or self.model is None or self.tokenizer is None: # Property is_ready used here
+            print("T5Client Error: Model not ready or not loaded. Cannot process request.")
+            return None
 
-    input_text = f"<RAW_REQUEST> {raw_request_text} </RAW_REQUEST> <SYMBOL_BAG> {symbol_bag_string} </SYMBOL_BAG>"
+        # Enhanced prompt for better YAML spec generation
+        prompt = f"""Translate the following software development issue and context into a structured YAML specification.
 
-    yaml_string_from_model = ""
-    try:
-        print(f"T5 Client: Normalizing request. Input text length: {len(input_text)}")
-        inputs = tokenizer(
-            input_text,
-            return_tensors="pt",
-            max_length=max_input_length,
-            truncation=True,
-            padding="max_length"
-        ).to(selected_device)
+Your output must be a single YAML block. Do not include any text before or after the YAML.
+The YAML should conform to the following structure:
+issue_description: "A concise summary of the issue, derived from the input."
+target_files:
+  - "path/to/relevant/file1.py"
+  - "path/to/another/file.py"
+  # List source files that likely need changes.
+operations:
+  - name: "operation_name" # e.g., add_function, modify_class, fix_bug, refactor_method, update_docs
+    target_file: "path/to/file_for_this_operation.py" # Optional, can be same as in target_files or different if op is specific
+    # Parameters specific to the operation 'name'. Examples:
+    # For 'add_function':
+    #   function_name: "my_new_function"
+    #   parameters: {{"arg1": "int", "arg2": "Optional[str]"}} # Type hints as strings
+    #   return_type: "bool"
+    #   body: "pass # TODO: Implement actual logic" # Brief placeholder
+    # For 'modify_class':
+    #   class_name: "MyExistingClass"
+    #   changes:
+    #     - type: "add_method"
+    #       method_name: "new_utility_method"
+    #       parameters: {{"data": "List[Dict]"}}
+    #       return_type: "None"
+    #     - type: "change_attribute"
+    #       attribute_name: "some_attribute"
+    #       new_value: "new_default_value_if_applicable"
+    # For 'fix_bug':
+    #   description: "Detailed description of the fix to be applied."
+    #   target_element: "function_or_method_name_if_specific" # e.g. "validate_input"
+  # Add more operations as needed based on the issue.
+acceptance_tests:
+  - "Human-readable description of test case 1 to verify the fix."
+  - "Description of test case 2, e.g., covering edge cases."
+  # These should be understandable criteria for when the task is considered complete.
 
-        with torch.no_grad():
-            output_sequences = model.generate(
-                input_ids=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                temperature=0.3, # Example: Slightly reduced from default 1.0
-                top_p=0.9,       # Example: Nucleus sampling
-                max_length=max_output_length,
-                num_beams=4,      # Example: Beam search
-                early_stopping=True
-            )
+Context symbols from the codebase (e.g., relevant functions, classes):
+{context_symbols_string if context_symbols_string else 'None available'}.
 
-        if output_sequences is not None and len(output_sequences) > 0:
-            yaml_string_from_model = tokenizer.decode(output_sequences[0], skip_special_tokens=True).strip()
-            print(f"T5 Client: Raw output from model: '{yaml_string_from_model[:300]}...'")
-        else:
-            print("Warning: T5 model returned an empty or unexpected response.")
-            return Spec(task="Error: T5 model returned empty response.", raw_output=yaml_string_from_model)
+Issue Description to process:
+{raw_issue_text}
 
-    except Exception as e:
-        print(f"Error during T5 model inference: {e}")
-        return Spec(task=f"Error: T5 inference failed: {e}")
+Generate the YAML:
+"""
 
-    match = re.search(r"<SPEC_YAML>(.*?)</SPEC_YAML>", yaml_string_from_model, re.DOTALL | re.IGNORECASE)
-    if not match:
-        print(f"Error: Could not find <SPEC_YAML>...</SPEC_YAML> tags in T5 output. Output was: {yaml_string_from_model[:500]}")
-        return Spec(task="Error: Malformed T5 output (missing SPEC_YAML tags).", raw_output=yaml_string_from_model)
+        if self.verbose:
+            print(f"\nT5Client: Sending prompt to T5 model (length: {len(prompt)}):\n{prompt[:500]}...")
 
-    extracted_yaml_str = match.group(1).strip()
-    print(f"T5 Client: Extracted YAML string: '{extracted_yaml_str[:300]}...'")
+        try:
+            inputs = self.tokenizer(prompt, return_tensors="pt", max_length=1024, truncation=True, padding="longest").to(self.device)
 
-    loaded_yaml_dict: Optional[Dict[str, Any]] = None
-    try:
-        loaded_yaml_dict = yaml.safe_load(extracted_yaml_str)
-        if not isinstance(loaded_yaml_dict, dict):
-            raise yaml.YAMLError("YAML content did not parse into a dictionary.")
+            generation_config = {
+                "max_length": 512,
+                "num_beams": 4,
+                "early_stopping": True
+                # Consider adding: "temperature", "top_p", "top_k" for more diverse/controlled generation
+            }
+            if self.verbose: print(f"T5Client Info: Using generation config: {generation_config}")
 
-        spec_object = Spec(**loaded_yaml_dict)
-        return spec_object
-    except yaml.YAMLError as e_yaml:
-        print(f"Error parsing YAML from T5 output: {e_yaml}. YAML was: {extracted_yaml_str[:500]}")
-        return Spec(task=f"Error: Failed to parse YAML from T5: {e_yaml}", raw_yaml=extracted_yaml_str)
-    except Exception as e_pydantic:
-        print(f"Error validating Spec from T5 output: {e_pydantic}. Data was: {loaded_yaml_dict if loaded_yaml_dict is not None else extracted_yaml_str[:500]}")
-        return Spec(task=f"Error: Failed to validate Spec from T5: {e_pydantic}", raw_yaml=extracted_yaml_str, parsed_dict=loaded_yaml_dict)
+            outputs = self.model.generate(inputs.input_ids, **generation_config) # type: ignore
 
+            yaml_spec_string = self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+
+            if self.verbose:
+                print(f"T5Client Info: Raw model output (YAML spec string):\n{yaml_spec_string}")
+
+            return yaml_spec_string
+        except Exception as e:
+            print(f"T5Client Error: Exception during T5 model inference: {e}")
+            return None
 
 if __name__ == '__main__':
-    from unittest.mock import MagicMock # For mocking in example
+    from src.utils.config_loader import load_app_config, DEFAULT_APP_CONFIG # For __main__
 
-    if not (torch and AutoModelForSeq2SeqLM and AutoTokenizer and yaml and Spec and Field):
-        print("Skipping T5 client __main__ example due to missing dependencies.")
+    print("--- T5Client Example Usage ---")
+
+    app_cfg_main = load_app_config() # Load defaults or from a test file
+    app_cfg_main["general"]["verbose"] = True # Example override
+
+    # Ensure the relevant model path is set in app_cfg for testing.
+    # If you have a local placeholder or want to test with "t5-small":
+    # Option 1: Use the default from DEFAULT_APP_CONFIG if suitable
+    # app_cfg_main["models"]["t5_spec_normalizer_dir"] = DEFAULT_APP_CONFIG["models"]["t5_spec_normalizer_dir"]
+    # Option 2: Explicitly set for testing (e.g., if default placeholder doesn't exist and you want to use t5-small)
+    if not Path(DEFAULT_APP_CONFIG["models"]["t5_spec_normalizer_dir"]).exists():
+         app_cfg_main["models"]["t5_spec_normalizer_dir"] = "t5-small" # Fallback to HF download for test
+
+    print(f"\nAttempting to initialize T5Client with app_config (model: {app_cfg_main['models']['t5_spec_normalizer_dir']})")
+    t5_client = T5Client(app_config=app_cfg_main)
+
+    if t5_client.is_ready:
+        print("\nT5Client ready. Requesting spec...")
+        issue_text = "The user login fails when the password contains special characters like '!@#$%'. Need to update the validation logic in 'src/auth/validation.py' to handle these cases correctly. The function `validate_password` should be checked."
+        context_symbols = "src.auth.validation.validate_password, src.user.models.User"
+
+        yaml_output = t5_client.request_spec_from_text(issue_text, context_symbols)
+
+        if yaml_output:
+            print("\n--- Generated YAML Spec ---")
+            print(yaml_output)
+            print("-------------------------")
+        else:
+            print("\nFailed to generate YAML spec from T5Client.")
     else:
-        print("--- Testing T5 Client for Spec Normalization ---")
-        test_model_path = "t5-small"
+        print("\nT5Client initialization failed or model not ready. Cannot request spec.")
+        print("This is expected if a real T5 model is not available at the specified/default paths or if Transformers/PyTorch are not installed.")
 
-        raw_req = "add a new method to the user service to update email addresses and refactor the tests"
-        sym_bag = "UserService.get_email|UserService.update_profile|test_user_service.test_email_update"
-
-        print(f"Input Raw Request: {raw_req}")
-        print(f"Input Symbol Bag: {sym_bag}")
-
-        simulated_model_yaml_output = """<SPEC_YAML>
-task: "add user email update functionality"
-target_symbols:
-  - "UserService.update_profile"
-  - "UserService.get_email"
-operations:
-  - "add_method"
-  - "update_existing_method"
-  - "refactor_test"
-acceptance:
-  - "test_user_service.test_email_update_success"
-  - "test_user_service.test_email_update_invalid_email"
-</SPEC_YAML>"""
-
-        class MockModelInstance: # More complete mock for .to and .eval
-            def generate(self, input_ids, attention_mask, temperature, top_p, max_length, num_beams, early_stopping):
-                # This needs a real tokenizer to create output_sequences correctly
-                # For simplicity, we'll assume the tokenizer used in normalise_request can be used here
-                # if we can get an instance of it.
-                temp_tokenizer = AutoTokenizer.from_pretrained(test_model_path)
-                return temp_tokenizer(simulated_model_yaml_output, return_tensors="pt").input_ids
-            def to(self, device): return self
-            def eval(self): pass
-
-        # Patch the global _load_t5_model_and_tokenizer to control model and tokenizer instances
-        mock_tokenizer_instance = AutoTokenizer.from_pretrained(test_model_path) # Use a real tokenizer for decode
-
-        with patch('src.spec_normalizer.t5_client._load_t5_model_and_tokenizer',
-                   return_value=(MockModelInstance(), mock_tokenizer_instance)) as mock_load_fn:
-
-            spec_result = normalise_request(raw_req, sym_bag, model_path=test_model_path)
-
-            print("\n--- Generated Spec Object ---")
-            if "Error:" in spec_result.task and spec_result.task.startswith("Error:"): # Check if task field contains an error message
-                 print(f"Task: {spec_result.task}")
-                 if spec_result.raw_yaml: print(f"Raw YAML: {spec_result.raw_yaml}")
-                 if spec_result.parsed_dict: print(f"Parsed Dict: {spec_result.parsed_dict}")
-            else:
-                print(spec_result.model_dump_json(indent=2))
-
-            assert spec_result.task == "add user email update functionality"
-            assert "add_method" in spec_result.operations
-        print("\n--- T5 Client Example Done ---")
+    print("\n--- T5Client Example Done ---")

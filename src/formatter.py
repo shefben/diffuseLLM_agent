@@ -13,21 +13,14 @@ import shutil # For finding executables
 # Placeholder for StyleProfile type if we define a dataclass for it formally
 StyleProfileType = Dict[str, Any]
 
-# from .transformer.identifier_renamer import rename_identifiers_in_code # Ideal import
-# Placeholder for subtask if direct relative import is an issue:
-def rename_identifiers_in_code_placeholder(source_code: str, db_path: Path) -> str:
-    print(f"Placeholder: Would rename identifiers in code using rules from {db_path}")
-    print(f"Code snippet received by renamer placeholder:\n{source_code[:200]}...")
-    # Simulate some change or no change for testing flow
-    if "my_class_to_rename" in source_code: # A simple trigger for simulated change
-        return source_code.replace("my_class_to_rename", "MyClassToRename")
-    return source_code
+from src.transformer.identifier_renamer import rename_identifiers_in_code
+
 # End placeholder
 
 def format_code(
     file_path: Path,
     profile: StyleProfileType, # Currently not directly used by format_code's core logic beyond being a placeholder
-    pyproject_path: Path = Path("pyproject.toml"),
+    project_root: Path, # Added project_root
     db_path: Optional[Path] = None # Path to naming_conventions.db, make optional
 ) -> bool:
     """
@@ -36,8 +29,8 @@ def format_code(
 
     Args:
         file_path: The Path to the Python file to format.
-        profile: A dictionary representing the unified style profile (currently placeholder usage).
-        pyproject_path: Path to the pyproject.toml where Black/Ruff configs are managed.
+        profile: A dictionary representing the unified style profile. Currently, this argument is for conceptual lineage; Black and Ruff derive their configurations from pyproject.toml found within the 'project_root'.
+        project_root: The root directory of the project, used as cwd for formatters.
         db_path: Optional path to the naming_conventions.db for identifier renaming.
 
     Returns:
@@ -72,7 +65,7 @@ def format_code(
         # Exit codes: 0 if no changes or successful reformatting.
         #             1 if internal error.
         #             123 if syntax error in input.
-        black_process = subprocess.run([black_executable, str(file_path)], capture_output=True, text=True, check=False)
+        black_process = subprocess.run([black_executable, str(file_path)], capture_output=True, text=True, check=False, cwd=project_root)
         if black_process.returncode == 123: # Syntax error
             print(f"Black error: Syntax error in {file_path}. Cannot proceed with formatting or renaming.")
             print(black_process.stderr)
@@ -100,7 +93,7 @@ def format_code(
         return False
     try:
         print(f"Running Ruff Formatter on {file_path}...")
-        ruff_format_process = subprocess.run([ruff_executable, "format", str(file_path)], capture_output=True, text=True, check=False)
+        ruff_format_process = subprocess.run([ruff_executable, "format", str(file_path)], capture_output=True, text=True, check=False, cwd=project_root)
         if ruff_format_process.returncode != 0:
             print(f"Ruff format may have failed or had issues for {file_path} (exit code {ruff_format_process.returncode}). Check Ruff output.")
             # print(f"Ruff format stderr:\n{ruff_format_process.stderr}") # Optional
@@ -109,7 +102,7 @@ def format_code(
             print(f"Ruff formatting successful for {file_path}.")
 
         print(f"Running Ruff Lint (--fix) on {file_path}...")
-        ruff_lint_process = subprocess.run([ruff_executable, "check", "--fix", "--exit-zero-even-if-changed", str(file_path)], capture_output=True, text=True, check=False)
+        ruff_lint_process = subprocess.run([ruff_executable, "check", "--fix", "--exit-zero-even-if-changed", str(file_path)], capture_output=True, text=True, check=False, cwd=project_root)
         if ruff_lint_process.returncode == 1: # Unfixable errors remain
             print(f"Ruff lint found unfixable issues in {file_path} (after attempting fixes).")
             # print(f"Ruff lint stdout (includes remaining issues):\n{ruff_lint_process.stdout}") # Optional
@@ -133,8 +126,7 @@ def format_code(
             # Replace placeholder with actual import once available and verified
             # For subtask, it uses the placeholder. In real code, it would be:
             # from src.transformer.identifier_renamer import rename_identifiers_in_code
-            # renamed_code = rename_identifiers_in_code(current_code_content, db_path)
-            renamed_code = rename_identifiers_in_code_placeholder(current_code_content, db_path)
+            renamed_code = rename_identifiers_in_code(current_code_content, db_path)
 
 
             if renamed_code != current_code_content:
@@ -223,7 +215,8 @@ def very_long_function_name_that_will_certainly_exceed_the_line_length_limit_of_
         f.write(original_content)
 
     print(f"\n--- Formatting {test_file_path.name} ---")
-    success = format_code(test_file_path, dummy_profile, pyproject_path=dummy_pyproject_path)
+    # Pass project_root, remove pyproject_path from call
+    success = format_code(test_file_path, dummy_profile, project_root=test_dir, db_path=None)
 
     if success:
         print(f"Formatting function reported success for {test_file_path.name}.")

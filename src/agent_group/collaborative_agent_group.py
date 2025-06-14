@@ -1,100 +1,169 @@
-from typing import TYPE_CHECKING, Any, Dict, Tuple, Callable, Optional
+from typing import TYPE_CHECKING, Any, Dict, Tuple, Callable, Optional, List # Added List
 from pathlib import Path
+import difflib # Added for diff generation
 
 # Local imports
+from .exceptions import PhaseFailure # New import
 from .llm_core import LLMCore
 from .diffusion_core import DiffusionCore
+from src.profiler.style_validator import StyleValidatorCore
+import ast # For parsing modified code in duplicate guard
+from src.digester.signature_trie import generate_function_signature_string # For duplicate guard
+from src.transformer import apply_libcst_codemod_script, PatchApplicationError # For applying script in run
 
 if TYPE_CHECKING:
     from src.planner.phase_model import Phase
     from src.digester.repository_digester import RepositoryDigester
+    from src.validator.validator import Validator # For type hinting
     # Define Path from pathlib for type hinting if not already globally available
     # from pathlib import Path
 
 class CollaborativeAgentGroup:
     def __init__(self,
+                 app_config: Dict[str, Any],
+                 digester: 'RepositoryDigester', # Added digester
                  style_profile: Dict[str, Any],
                  naming_conventions_db_path: Path,
-                 llm_core_config: Optional[Dict[str, Any]] = None,
-                 diffusion_core_config: Optional[Dict[str, Any]] = None
+                 validator_instance: 'Validator'
                  ):
         """
         Initializes the CollaborativeAgentGroup.
         Args:
+            app_config: The main application configuration dictionary.
+            digester: An instance of RepositoryDigester.
             style_profile: Dictionary containing style profile information.
             naming_conventions_db_path: Path to the naming conventions database.
-            llm_core_config: Optional configuration for LLMCore.
-            diffusion_core_config: Optional configuration for DiffusionCore.
+            validator_instance: An instance of the Validator class.
         """
+        self.app_config = app_config
+        self.digester = digester # Store digester instance, will also be passed in run()
         self.style_profile = style_profile
         self.naming_conventions_db_path = naming_conventions_db_path
+        self.validator = validator_instance
+        self.max_repair_attempts = self.app_config.get("agent_group", {}).get("max_repair_attempts", 3)
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
 
-        # Initialize Core Agents
+        # Initialize Core Agents using app_config
         self.llm_agent = LLMCore(
+            app_config=self.app_config,
             style_profile=self.style_profile,
-            naming_conventions_db_path=self.naming_conventions_db_path,
-            config=llm_core_config
+            naming_conventions_db_path=self.naming_conventions_db_path
         )
+        # Assuming DiffusionCore will also be refactored to take app_config
+        # For now, its existing signature might be config and style_profile.
+        # We'll pass app_config as its 'config' for now.
         self.diffusion_agent = DiffusionCore(
-            style_profile=self.style_profile,
-            config=diffusion_core_config
+            app_config=self.app_config, # Corrected
+            style_profile=self.style_profile
         )
+        self.style_validator_agent = StyleValidatorCore(app_config=self.app_config, style_profile=self.style_profile) # Added
 
         self.current_patch_candidate: Optional[Any] = None
-        self.patch_history: list = [] # To store (patch, validation_result, score) tuples
+        self.patch_history: list = [] # To store (script, validation_result, score, error) tuples
+        self._current_run_context_data: Optional[Dict[str, Any]] = None # For preview context
 
-        print("CollaborativeAgentGroup initialized with LLMCore and DiffusionCore.")
+        if self.verbose:
+            # This print statement is conditional on verbosity
+            print(f"CollaborativeAgentGroup initialized. Max repair attempts: {self.max_repair_attempts}, LLM, Diffusion, StyleValidator cores configured.")
+        else:
+            # A non-verbose, standard initialization message
+            print("CollaborativeAgentGroup initialized with LLMCore, DiffusionCore, StyleValidatorCore.")
 
-    def _perform_duplicate_guard(self, patch_script_str: Optional[str], context_data: Dict[str, Any]) -> bool:
+    def _perform_duplicate_guard(self, modified_code_str: Optional[str], target_file_path: Path, context_data: Dict[str, Any]) -> bool:
         """
-        Checks if the proposed patch script might be creating a duplicate function/method.
-        This is a mock implementation.
+        Checks if the modified code string contains any function/method signatures
+        that already exist in the project's signature trie.
         """
-        if not patch_script_str:
+        if not modified_code_str:
+            print("DuplicateGuard: No modified code string provided. Skipping check.")
             return False
-
-        print(f"CollaborativeAgentGroup._perform_duplicate_guard called for script (first 100 chars): '{patch_script_str[:100]}...'")
 
         digester = context_data.get("repository_digester")
-        if not digester or not hasattr(digester, 'signature_trie'):
-            print("  DuplicateGuard: Digester or SignatureTrie not available in context. Skipping check.")
+        if not digester or not hasattr(digester, 'signature_trie') or not hasattr(digester, 'repo_path'):
+            print("DuplicateGuard: Digester, signature_trie, or repo_path not available in context. Skipping check.")
             return False
 
-        # Mock duplicate detection logic:
-        # Try to find if the script defines a function named "new_mock_function"
-        # This is highly simplified. A real implementation would parse the script,
-        # extract defined function/method signatures, and check them.
-        if "def new_mock_function(" in patch_script_str or "function_name=\"new_mock_function\"" in patch_script_str :
-            # This specific signature is hardcoded in SignatureTrie.search to return True for testing
-            mock_function_signature = "new_mock_function(arg1: int) -> str"
-            print(f"  DuplicateGuard: Mocking check for signature: '{mock_function_signature}'")
+        print(f"DuplicateGuard: Checking for duplicate signatures in modified code for target: {target_file_path.name}")
 
-            try:
-                # The SignatureTrie.search method was updated to return bool
-                is_duplicate = digester.signature_trie.search(mock_function_signature)
-                print(f"  DuplicateGuard: SignatureTrie search result for '{mock_function_signature}': {is_duplicate}")
-                if is_duplicate:
-                    print("  DuplicateGuard: Mock duplicate signature detected!")
+        try:
+            module_ast = ast.parse(modified_code_str, filename=str(target_file_path))
+        except SyntaxError as e:
+            print(f"DuplicateGuard: SyntaxError parsing modified code for {target_file_path.name}: {e}. Cannot check for duplicates.")
+            return False # Let validator handle syntax error
+
+        project_root = digester.repo_path
+        # Assuming _get_module_qname_from_path is a static or instance method on digester
+        module_qname = digester._get_module_qname_from_path(target_file_path, project_root)
+
+        def simple_type_resolver(node: ast.AST, hint_category: str) -> Optional[str]:
+            # For nodes within modified_code_str, we don't have Pyanalyze types yet.
+            # Fallback to "Any" or try to get text from annotation if present.
+            # Node is the annotation node itself if category is 'return_annotation'
+            # Node is ast.arg if category is parameter-related.
+            annotation_node = None
+            if category_hint.endswith("return_annotation"):
+                annotation_node = node # node is the annotation itself
+            elif hasattr(node, 'annotation') and node.annotation:
+                annotation_node = node.annotation
+
+            if annotation_node:
+                if isinstance(annotation_node, ast.Name): return annotation_node.id
+                if isinstance(annotation_node, ast.Constant): # Python 3.8+ for str/None consts in annotations
+                    if isinstance(annotation_node.value, str): return annotation_node.value
+                    return str(annotation_node.value)
+                if hasattr(ast, 'unparse'): # Attempt to unparse more complex annotations
+                    try: return ast.unparse(annotation_node)
+                    except: pass # Fall through if unparse fails
+                # For older Pythons or complex types not handled by unparse if simple,
+                # a more basic representation might be needed, or just default to Any.
+                # For now, ast.unparse is a good general attempt for Py 3.9+.
+            return "typing.Any" # Default to Any
+
+        for item_node in module_ast.body:
+            if isinstance(item_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # For top-level functions
+                # The generate_function_signature_string expects func_node, type_resolver, and optional class_name
+                signature_str = generate_function_signature_string(item_node, simple_type_resolver)
+                # SignatureTrie.search returns List[str] of FQNs if found, or empty list.
+                # We need to check if the list is non-empty.
+                # The mock in SignatureTrie was returning bool, this needs to be aligned.
+                # Assuming search now returns List[str] as per its typical design.
+                if digester.signature_trie.search(signature_str): # If list is not empty, a duplicate exists
+                    print(f"DuplicateGuard: Duplicate top-level function signature found for '{module_qname}.{item_node.name}': {signature_str}")
                     return True
-            except Exception as e:
-                print(f"  DuplicateGuard: Error during SignatureTrie search: {e}")
-                return False # Fail safe
+            elif isinstance(item_node, ast.ClassDef):
+                class_name_simple = item_node.name
+                # class_fqn_prefix = f"{module_qname}.{class_name_simple}" # Full FQN not needed for prefix arg
+                for method_node in item_node.body:
+                    if isinstance(method_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        # Pass simple class name as prefix for method name part of signature string
+                        signature_str = generate_function_signature_string(method_node, simple_type_resolver, class_fqn_prefix_for_method_name=class_name_simple)
+                        if digester.signature_trie.search(signature_str):
+                            print(f"DuplicateGuard: Duplicate method signature found for '{module_qname}.{class_name_simple}.{method_node.name}': {signature_str}")
+                            return True
 
-        print("  DuplicateGuard: No duplicate detected by mock logic.")
+        print(f"DuplicateGuard: No duplicate signatures found in {target_file_path.name}.")
         return False
 
     def run(
         self,
         phase_ctx: 'Phase',
         digester: 'RepositoryDigester',
-        validator_handle: Callable[[Any, 'RepositoryDigester', 'Phase'], Tuple[bool, Any, Optional[str]]],
-        score_style_handle: Callable[[Any, Dict[str, Any]], float]
-    ) -> Optional[Any]:
-        # Initialize variables to store outputs from agent calls
-        scaffold_patch_script: Optional[str] = None
-        edit_summary_list: Optional[List[str]] = None
-        completed_patch_script: Optional[str] = None # For output of diffusion pass
-        # self.current_patch_candidate is initialized in __init__ and will hold the evolving script/patch
+        validator_handle: Callable[[Optional[str], Path, 'RepositoryDigester', Path, Optional[Dict[str,Any]]], Tuple[bool, Optional[str]]],
+        score_style_handle: Callable[[Any, Dict[str, Any]], float],
+        predicted_core: Optional[str] = None # New parameter
+    ) -> Tuple[Optional[str], Optional[str]]: # Returns (script_string, source_info_string)
+        final_patch_script: Optional[str] = None
+        patch_source_info: Optional[str] = None
+
+        if self.verbose:
+            print(f"CollaborativeAgentGroup.run: Received predicted_core: {predicted_core if predicted_core else 'Not provided'}")
+        # TODO (future step): Use predicted_core to influence agent logic (e.g., which core to try first).
+
+        # self.current_patch_candidate will hold the LibCST SCRIPT string.
+        # It's initialized to None in __init__.
+        # Patch history stores (script_str, is_valid, score, error_traceback_str)
+        # For this subtask, patch_source_info is not added to patch_history records yet.
 
         """
         Main execution loop for the agent group to generate and refine a patch.
@@ -122,13 +191,16 @@ class CollaborativeAgentGroup:
             "naming_conventions_db_path": self.naming_conventions_db_path,
             "score_style_handle": score_style_handle, # Passed from PhasePlanner
             "validator_handle": validator_handle,     # Passed from PhasePlanner
-            "repository_digester": digester           # Pass the digester instance
+            "repository_digester": digester,
+            "predicted_core_preference": predicted_core # New item
         }
 
         # Add PDG slice and code snippets from digester
-        # These calls assume digester methods handle potential errors or missing data gracefully.
         context_data["retrieved_code_snippets"] = digester.get_code_snippets_for_phase(phase_ctx)
         context_data["pdg_slice"] = digester.get_pdg_slice_for_phase(phase_ctx)
+
+        # Store context for potential use in utility methods like generate_patch_preview
+        self._current_run_context_data = context_data
 
         print(f"Step 1: Context Broadcast prepared. Context keys: {list(context_data.keys())}")
         if context_data["retrieved_code_snippets"]:
@@ -146,96 +218,130 @@ class CollaborativeAgentGroup:
 
         if scaffold_patch_script is None or edit_summary_list is None:
             print("LLMCore failed to generate an initial scaffold script or edit summary. Aborting.")
-            return None
+            return None, "LLMCore_scaffold_failed" # Return None script, source info
+        patch_source_info = "LLMCore_scaffold_v1"
 
-        print(f"Step 2: LLM scaffolding pass complete. Received script (len: {len(scaffold_patch_script)}) and summary (items: {len(edit_summary_list)}).")
-        print(f"   Edit Summary: {edit_summary_list}")
-        # print(f"   Scaffold Script:\n{scaffold_patch_script}") # Potentially very long
+        print(f"Step 2: LLM scaffolding pass complete. Script len: {len(scaffold_patch_script)}, Summary: {edit_summary_list}")
 
-        # --- Phase 5: Step 2 (continued, now Step 3 in Phase 5 doc): Diffusion Core expands scaffold ---
-        # Ensure edit_summary_list is passed correctly (e.g. as a string or processed if needed by expand_scaffold)
-        # DiffusionCore.expand_scaffold expects edit_summary as str. Let's join the list.
+        # --- Diffusion Core expands scaffold ---
         diffusion_edit_summary_str = "; ".join(edit_summary_list) if edit_summary_list else ""
-
-        # Call expand_scaffold
         completed_patch_script = self.diffusion_agent.expand_scaffold(scaffold_patch_script, diffusion_edit_summary_str, context_data)
 
         if completed_patch_script is None:
             print("DiffusionCore failed to expand/complete the scaffold script. Aborting.")
-            return None
-        print(f"Step 3: Diffusion expansion pass complete. Completed script (len: {len(completed_patch_script)}).")
-        # print(f"   Completed Script:\n{completed_patch_script}") # Potentially very long
+            return None, patch_source_info # Keep last known source
 
-        # At this point, completed_patch_script is a string (the LibCST script).
-        # For the iterative refinement loop, self.current_patch_candidate needs to be
-        # the actual patch object/data structure that the validator_handle expects.
-        # For now, the placeholder validator_handle in PhasePlanner might accept this string,
-        # or we assume a (not-yet-implemented) step here to "execute" or "interpret" this script
-        # to produce a patch object.
-        # Let's assume for this subtask, current_patch_candidate will store the script string.
-        # This will need adjustment in Phase 5 Step 3 (Validate Patch).
+        if completed_patch_script != scaffold_patch_script : # Update source if script changed
+            patch_source_info = "DiffusionCore_expansion_v1"
         self.current_patch_candidate = completed_patch_script
+        print(f"Step 3: Diffusion expansion pass complete. Script len: {len(self.current_patch_candidate)}. Source: {patch_source_info}")
 
-        # --- Iterative Refinement Loop (Simplified Placeholder) ---
-        max_iterations = 3
-        for i in range(max_iterations):
-            print(f"\n--- Iteration {i + 1} ---")
+        # --- Iterative Refinement Loop ---
+        # self.max_repair_attempts defined in __init__
+        # self.current_patch_candidate holds the LibCST SCRIPT string.
 
-            # --- Step 5 (Part A): Duplicate Guard ---
-            # self.current_patch_candidate holds the script string from diffusion or previous repair
-            is_duplicate_detected = self._perform_duplicate_guard(self.current_patch_candidate, context_data)
+        self.digester = digester # Store digester instance for access in other methods if needed, or pass via context
 
-            # Initialize validation results for the iteration
-            is_valid = True
+        for i in range(self.max_repair_attempts):
+            print(f"\n--- Repair Iteration {i + 1}/{self.max_repair_attempts} ---")
+
+            modified_code_content_for_iteration: Optional[str] = None
             error_traceback: Optional[str] = None
             validation_payload: Any = None
+            is_duplicate_detected = False # Initialize
 
-            if is_duplicate_detected:
-                print("CollaborativeAgentGroup: Duplicate detected by guard! Attempting repair to reuse existing functionality.")
-                is_valid = False # Mark as not valid to trigger repair logic
-                error_traceback = "DUPLICATE_DETECTED: REUSE_EXISTING_HELPER"
-                # Skip direct validation if duplicate is found, proceed to repair logic.
-                # The style score might not be relevant here, or could be set to a low value.
-                style_score = 0.0 # Or skip scoring for duplicates
-                self.patch_history.append((self.current_patch_candidate, is_valid, style_score, error_traceback))
+            target_file_str = context_data.get("phase_target_file")
+            original_content: Optional[str] = None
+
+            if not target_file_str:
+                is_valid = False
+                error_traceback = "PhaseConfigurationError: Missing target_file in phase context."
+                print(f"CollaborativeAgentGroup Error: {error_traceback}")
+            elif not self.current_patch_candidate: # Should be a LibCST script string
+                is_valid = False
+                error_traceback = "AgentError: No current patch candidate (script) to apply."
+                print(f"CollaborativeAgentGroup Error: {error_traceback}")
             else:
-                # --- Step 5 (Part B): Validate Patch (if not a duplicate) ---
-                # The validator_handle currently in PhasePlanner is a mock that takes (patch, digester, phase_ctx)
-                # The 'patch' it receives will be the completed_patch_script string.
-                # This mock validator needs to be aware it might receive a script string.
-                is_valid, validation_payload, error_traceback = validator_handle(
-                    self.current_patch_candidate, # This is the script string
+                # Attempt to apply the patch script
+                original_content = self.digester.get_file_content(Path(target_file_str))
+                if original_content is None:
+                    # Check if it's a new file scenario (target might not exist yet)
+                    # For new files, original_content should be effectively empty.
+                    # This needs to be determined based on phase intention, e.g. "create_file" op.
+                    # For now, if get_file_content returns None, and it's not explicitly a new file op, it's an issue.
+                    # Assuming for now that if target_file is specified, it should exist unless it's a new file op.
+                    # Let's assume for new file, original_content would be "" (handled by get_file_content or here)
+                    # If it's not a new file op and content is None, that's an issue.
+                    # For simplicity, if get_file_content returns None, we'll treat as empty for application.
+                    print(f"CollaborativeAgentGroup Info: Original content for '{target_file_str}' not found. Assuming empty for patch application (e.g. new file).")
+                    original_content = ""
+
+                try:
+                    modified_code_content_for_iteration = apply_libcst_codemod_script(
+                        original_content,
+                        self.current_patch_candidate # This is the LibCST script string
+                    )
+                    print(f"CollaborativeAgentGroup: Successfully applied script for iteration {i+1}.")
+                except PatchApplicationError as pae:
+                    is_valid = False
+                    error_traceback = f"PatchApplicationError: Failed to apply LibCST script: {pae}"
+                    modified_code_content_for_iteration = None # Ensure it's None on failure
+                    print(f"CollaborativeAgentGroup Error: {error_traceback}")
+                except Exception as e_apply: # Catch other unexpected errors during application
+                    is_valid = False
+                    error_traceback = f"UnexpectedErrorApplyingPatch: {type(e_apply).__name__} - {e_apply}"
+                    modified_code_content_for_iteration = None
+                    print(f"CollaborativeAgentGroup Error: {error_traceback}")
+
+            # --- Step 5 (Part A): Duplicate Guard (if script application was successful) ---
+            if is_valid and modified_code_content_for_iteration is not None and target_file_str:
+                is_duplicate_detected = self._perform_duplicate_guard(modified_code_content_for_iteration, Path(target_file_str), context_data)
+                if is_duplicate_detected:
+                    is_valid = False
+                    error_traceback = "DUPLICATE_DETECTED: REUSE_EXISTING_HELPER"
+                    print(f"CollaborativeAgentGroup: {error_traceback}")
+
+            # --- Step 5 (Part B): Validate Patch (if script applied and no duplicate) ---
+            # This now expects validator_handle to take modified_code_content_str.
+            # The actual change to Validator.validate_patch's signature is the next step.
+            if is_valid and modified_code_content_for_iteration is not None and target_file_str:
+                # Assuming validator_handle's signature will be:
+                # (modified_code_content: str, target_file: Path, digester: 'RepositoryDigester', project_root: Path)
+                # -> (bool, Optional[str], Optional[str]) where payload is now the error string.
+                # For now, the payload from validator_handle is still Any.
+                is_valid, validation_payload, error_traceback_validator = validator_handle(
+                    modified_code_content_for_iteration, # Pass applied code content
+                    Path(target_file_str), # Pass Path object
                     digester,
-                    phase_ctx
+                    digester.repo_path, # Pass project_root
+                    context_data.get("pdg_slice") # Pass PDG slice
                 )
-                print(f"Loop Step A (Validation): Validation result for script: is_valid={is_valid}, payload={validation_payload}, error='{bool(error_traceback)}'")
+                if not is_valid and error_traceback_validator: # If validator provides an error, use it.
+                    error_traceback = error_traceback_validator
+                print(f"Loop Step A (Validation on content): is_valid={is_valid}, payload={validation_payload}, error='{bool(error_traceback)}'")
+            elif is_valid and modified_code_content_for_iteration is None: # Should have been caught by patch application checks
+                is_valid = False
+                error_traceback = "InternalError: modified_code_content is None despite is_valid being True before validation call."
+                print(f"CollaborativeAgentGroup Error: {error_traceback}")
 
-            # --- Phase 5: Step 4 (Score Patch Style - was Step 4, now part of loop) ---
-            # This step is now after duplicate check and potential direct validation skip.
-            # If duplicate, style_score was set to 0.0. Otherwise, calculate it.
-            if not is_duplicate_detected:
-                style_score = score_style_handle(
-                    self.current_patch_candidate, # This is the script string
-                    self.style_profile
-                )
-                print(f"Loop Step B (Style Score): Style score for script: {style_score:.2f}")
-                self.patch_history.append((self.current_patch_candidate, is_valid, style_score, error_traceback))
 
-            # Decision logic based on validation (and duplicate check)
-            if is_valid: # This means not a duplicate AND validator_handle returned True
-                print(f"Script validated successfully in iteration {i+1}. Proceeding to polish.")
-                # --- Phase 5: Step 4 (LLM Polishing Pass - was Step 5 in old numbering) ---
-            # The score_style_handle also takes the patch (script string here)
-            style_score = score_style_handle(
-                self.current_patch_candidate, # This is the script string
-                self.style_profile
-            )
-            print(f"Loop Step B (Style Score): Style score for script: {style_score:.2f}")
+            # --- Score Patch Style ---
+            # Style scoring should ideally run on the modified_code_content_for_iteration.
+            # However, score_style_handle expects the "patch" which has been the script.
+            # For now, we continue passing the script to style scorer. This could be refined.
+            style_score_content_to_score = self.current_patch_candidate # Default to script
+            if is_duplicate_detected : # If duplicate, style score is low.
+                 style_score = 0.0
+            else:
+                 style_score = score_style_handle(style_score_content_to_score, self.style_profile)
 
+            print(f"Loop Step B (Style Score on script): Style score: {style_score:.2f}")
+            # Record history using the SCRIPT that was attempted.
             self.patch_history.append((self.current_patch_candidate, is_valid, style_score, error_traceback))
 
+            # --- Decision logic based on validation ---
             if is_valid:
-                print(f"Script validated successfully in iteration {i+1}. Proceeding to polish.")
+                print(f"Script validated successfully in iteration {i+1}. Proceeding to polish the SCRIPT.")
                 # --- Phase 5: Step 4 (LLM Polishing Pass - was Step 5 in old numbering) ---
                 polished_script = self.llm_agent.polish_patch(self.current_patch_candidate, context_data)
                 print(f"Loop Step C (Polish): LLMCore polished the script. New length: {len(polished_script) if polished_script else 'N/A'}.")
@@ -249,21 +355,52 @@ class CollaborativeAgentGroup:
                     is_valid = False # Mark as not valid to trigger repair or end loop
                     # Skip directly to repair logic or end of loop processing
                 else:
-                    final_is_valid, validation_payload, final_error_traceback = validator_handle(self.current_patch_candidate, digester, phase_ctx)
-                    final_style_score = score_style_handle(self.current_patch_candidate, self.style_profile)
-                    print(f"Loop Step C.1 (Post-Polish Validation): Valid: {final_is_valid}, Style: {final_style_score:.2f}")
+                    # Validator_handle now expects: (modified_code_content: str, target_file: Path, digester: 'RepositoryDigester', project_root: Path)
+                    # We need to apply the polished script first.
+                    # This re-application logic is similar to the start of the loop.
 
-                    # Update history with the polished attempt
+                    temp_error_applying_polished: Optional[str] = None
+                    modified_content_after_polish: Optional[str] = None
+                    if target_file_str: # target_file_str defined at the start of the loop
+                        try:
+                            # original_content was fetched at the start of the loop iteration.
+                            # If current_patch_candidate (polished script) is None, this block is skipped.
+                            modified_content_after_polish = apply_libcst_codemod_script(original_content if original_content is not None else "", self.current_patch_candidate)
+                        except PatchApplicationError as pae_polish:
+                            temp_error_applying_polished = f"PatchApplicationError after polish: {pae_polish}"
+                        except Exception as e_polish_apply:
+                             temp_error_applying_polished = f"Unexpected error applying polished script: {e_polish_apply}"
+                    else: # Should not happen if initial checks for target_file_str are done
+                        temp_error_applying_polished = "Target file string was missing for post-polish validation."
+
+                    if temp_error_applying_polished:
+                        final_is_valid = False
+                        final_error_traceback = temp_error_applying_polished
+                        final_style_score = 0.0 # Or previous score
+                        print(f"CollaborativeAgentGroup Error: {final_error_traceback}")
+                    elif modified_content_after_polish is not None and target_file_str:
+                        final_is_valid, final_error_traceback = validator_handle( # type: ignore
+                            modified_content_after_polish, Path(target_file_str), digester, digester.repo_path, context_data.get("pdg_slice") # Pass PDG slice
+                        )
+                        final_style_score = score_style_handle(self.current_patch_candidate, self.style_profile) # Score the script
+                    else: # Should not be reached if logic is correct
+                        final_is_valid = False
+                        final_error_traceback = "Internal error: Could not re-apply polished script for final validation."
+                        final_style_score = 0.0
+                        print(f"CollaborativeAgentGroup Error: {final_error_traceback}")
+
+
+                    print(f"Loop Step C.1 (Post-Polish Validation): Valid: {final_is_valid}, Style: {final_style_score:.2f}")
                     self.patch_history.append((self.current_patch_candidate, final_is_valid, final_style_score, final_error_traceback))
-                    is_valid = final_is_valid # Update is_valid based on post-polish validation
-                    error_traceback = final_error_traceback if final_error_traceback else error_traceback # Persist new error if any
+                    is_valid = final_is_valid
+                    error_traceback = final_error_traceback if final_error_traceback else error_traceback
 
                     if final_is_valid:
                         print(f"Polished script is valid. Final style score: {final_style_score:.2f}. This script is the result of this phase.")
-                        return self.current_patch_candidate
+                        patch_source_info = f"LLMCore_polish_iteration_{i + 1}" # Or more specific based on pre-repair/post-repair
+                        return self.current_patch_candidate, patch_source_info
                     else:
                         print("Polished script failed validation.")
-                        # error_traceback should be set from final_error_traceback for the repair step
                         # Fall through to repair logic for the polished_but_failed_script
 
             # If not valid after initial check, or if polish made it invalid / returned None:
@@ -271,37 +408,84 @@ class CollaborativeAgentGroup:
                 print(f"Script requires repair (or loop exit) after iteration {i+1} (is_valid={is_valid}). Error: {error_traceback}")
                 if error_traceback:
                     # --- Phase 5: Step 5 (LLM Proposes Repair - was Step 6a) ---
-                print("Loop Step D (Attempt Repair): Attempting repair with LLMCore.")
-                # propose_repair_diff takes traceback and context_data.
-                # The current_patch_candidate at this point is the one that failed (either initial or polished).
-                repair_diff_script_or_new_script = self.llm_agent.propose_repair_diff(error_traceback, context_data)
-                if repair_diff_script_or_new_script:
-                    print(f"LLMCore proposed a repair/new script.")
-                    self.current_patch_candidate = repair_diff_script_or_new_script # This becomes the candidate for the next iteration
-                else:
-                    print("LLMCore could not propose a repair. Trying DiffusionCore re-denoise (if applicable).")
-                    # --- Phase 5: Step 6b (Diffusion Re-Denoises - was Step 6b) ---
-                    # re_denoise_spans expects the patch that failed and affected_spans.
-                    # This part is tricky as 'affected_spans' needs to come from validation_payload.
-                    # And the patch is a script string.
-                    affected_spans = validation_payload.get("affected_spans", []) if isinstance(validation_payload, dict) else []
-                    if affected_spans: # Only call if there are specific spans
-                         print("Loop Step E (Re-Denoise): Attempting re-denoise with DiffusionCore.")
-                         self.current_patch_candidate = self.diffusion_agent.re_denoise_spans(self.current_patch_candidate, affected_spans, context_data)
-                    else:
-                        print("No specific affected spans for DiffusionCore re-denoise, or LLM repair failed. Aborting iteration if no progress.")
-                        # If no repair from LLM and no specific spans for Diffusion, we might be stuck.
-                        # End the loop or try a more general re-denoise if that's an option.
+                    print("Loop Step D (Attempt Repair): Attempting repair with LLMCore.")
+
+                    # Ensure context_data for repair includes the script that just failed
+                    context_data_for_repair = context_data.copy()
+                    context_data_for_repair['current_patch_candidate_DEBUG'] = self.current_patch_candidate # Add the failing script for LLM to see
+
+                    target_file_str = context_data.get("phase_target_file")
+
+                    # --- Attempt Heuristic Fixes (New Step before LLM repair) ---
+                    heuristically_fixed_script: Optional[str] = None
+                    if target_file_str and error_traceback: # Ensure necessary info is available
+                        print("Loop Step D.1 (Heuristic Fix Attempt): Attempting heuristic fixes via Validator.")
+                        heuristically_fixed_script = self.validator.attempt_heuristic_fixes(
+                            error_traceback,
+                            self.current_patch_candidate, # The script that just failed (after polish)
+                            target_file_str
+                        )
+
+                    if heuristically_fixed_script:
+                        print("CollaborativeAgentGroup: Validator proposed a heuristic fix. Updating current_patch_candidate and restarting iteration for re-validation.")
+                        # Add a history entry for the heuristic attempt itself.
+                        # The outcome of this attempt will be recorded in the next iteration's main validation.
+                        # Use previous style score as a placeholder, or a specific marker.
+                        previous_style_score = self.patch_history[-1][2] if self.patch_history else 0.0
+                        self.patch_history.append((
+                            heuristically_fixed_script, # The script *after* heuristic fix
+                            "pending_revalidation",     # Validation status
+                            previous_style_score,       # Placeholder score
+                            "Heuristic fix applied, pending re-validation" # Traceback
+                        ))
+                        self.current_patch_candidate = heuristically_fixed_script
+                        continue # Restart the loop to re-evaluate the heuristically fixed script from the top
+
+                    # If no heuristic fix was applied or successful, proceed to LLM-based repair
+                    # This 'if' condition is implicitly met if 'continue' was not hit.
+                    # The 'is_valid' and 'error_traceback' are from the original failure (or failed polish)
+                    # that triggered this repair block.
+                    print("Loop Step D.2 (LLM Repair Attempt): No heuristic fix applied or taken. Attempting LLM repair.")
+                    llm_proposed_fix_script = self.llm_agent.propose_repair_diff(error_traceback, context_data_for_repair)
+
+                        if llm_proposed_fix_script:
+                            print(f"LLMCore proposed a fix script (len: {len(llm_proposed_fix_script)}).")
+                            print("Loop Step E (Diffusion Re-Denoise/Merge): Processing LLM's proposed fix script.")
+                            merged_fixed_script = self.diffusion_agent.re_denoise_spans(
+                                failed_patch_script=self.current_patch_candidate, # Script before LLM proposal
+                                proposed_fix_script=llm_proposed_fix_script,
+                                context_data=context_data_for_repair
+                            )
+
+                            if merged_fixed_script:
+                                print(f"DiffusionCore processed the fix. Resulting script len: {len(merged_fixed_script)}.")
+                                self.current_patch_candidate = merged_fixed_script
+                            else:
+                                print("DiffusionCore did not return a script after processing LLM's fix. Breaking repair loop.")
+                                break
+                        else:
+                            print("LLMCore could not propose a repair. Breaking repair loop.")
+                            break
+                    elif not error_traceback and not is_valid: # e.g. heuristic fix removed error but still not valid for other reasons
+                        print("Loop Step D.3 (Skipping LLM Repair): No error traceback, but script still not valid. Cannot proceed with LLM repair. Breaking loop.")
                         break
-            else: # No error_traceback from validation (e.g. style score too low but otherwise valid)
-                print("Loop Step D/E (No Repair Path): Validation failed without a traceback (e.g. style issue), or no repair proposed. No further repair attempts in this iteration.")
+
+            else: # No error_traceback from validation (e.g. style score too low but otherwise valid, or duplicate without specific repair path)
+                print("Loop Step D/E (No Repair Path): Validation failed without an actionable traceback, or duplicate guard triggered generic error. No further repair attempts in this iteration.")
                 # If style is the only issue, and we don't have a specific re-denoise for style, we might break.
                 # Or, if a previous version was good enough, that might be selected later.
                 break # Break if no clear path to repair/improve
 
-            if i == max_iterations - 1:
-                print("Max iterations reached. Could not produce a valid and satisfactory script.")
-                # Fallback: return the best script from history based on validity and score.
+            if i == self.max_repair_attempts - 1 and not is_valid: # Check is_valid for the last attempt
+                print(f"Max repair attempts ({self.max_repair_attempts}) reached. Could not produce a valid and satisfactory script.")
+                # Log the last error that prevented success
+                last_error_for_failure = error_traceback if error_traceback else "Unknown error after max repair attempts."
+
+                # Fallback: Check if any script in history was valid and had a decent score
+                # This logic is already present for returning best from history if loop finishes
+                # But here we explicitly raise PhaseFailure
+
+                # Find best from history before failing
                 best_historical_script = None
                 best_historical_score = -1.0
                 was_valid_in_history = False
@@ -315,91 +499,228 @@ class CollaborativeAgentGroup:
                         best_historical_script = p_hist
                         best_historical_score = s_hist
 
-                if best_historical_script:
-                    print(f"Returning best script from history (Valid: {was_valid_in_history}, Score: {best_historical_score:.2f}).")
-                    return best_historical_script
-                return None # No suitable script found after all iterations
+                if best_historical_script: # This check is actually done after the loop by existing logic
+                    print(f"Best historical script was (Valid: {was_valid_in_history}, Score: {best_historical_score:.2f}), but phase still failed on last attempt.")
 
-        print("Exited refinement loop. No suitable script generated.")
-        return None # Should ideally return the best effort from history if loop finishes. Covered by above.
+                raise PhaseFailure(f"Failed to validate/repair patch after {self.max_repair_attempts} attempts. Last error: {last_error_for_failure}")
+
+        # After loop, if we exited due to success (is_valid became True and returned), this part is skipped.
+        # If loop finishes due to max_iterations and no valid patch was found and returned within the loop:
+        print("Exited refinement loop. Selecting best script from history or returning None.")
+        best_historical_script = None
+        best_historical_score = -1.0
+        was_valid_in_history = False
+        for p_hist, v_hist, s_hist, _tb_hist in self.patch_history:
+            if v_hist and s_hist > best_historical_score:
+                best_historical_script = p_hist
+                best_historical_score = s_hist
+                was_valid_in_history = True
+            elif not was_valid_in_history and s_hist > best_historical_score:
+                best_historical_script = p_hist
+                best_historical_score = s_hist
+
+        if best_historical_script:
+            print(f"Returning best script from history (Valid: {was_valid_in_history}, Score: {best_historical_score:.2f}).")
+            return best_historical_script
+
+        # If no script in history was ever good (e.g. all failed initial validation, no repairs worked)
+        # and loop finished without returning a valid one.
+        # This case should ideally be covered by the PhaseFailure exception if max_repair_attempts is the sole reason for exiting without success.
+        # However, if the loop breaks for other reasons (e.g., no repair path found before max_attempts), this is the final fallback.
+        if not self.patch_history or not any(h[1] for h in self.patch_history) : # if no history or no valid patch in history
+             # Ensure error_traceback is defined; it might not be if the loop was never fully entered or broke very early.
+             final_error_msg = error_traceback if 'error_traceback' in locals() and error_traceback else "No successful patch and no specific error traceback recorded."
+             raise PhaseFailure(f"No valid patch could be generated after loop. Last error: {final_error_msg}")
+
+        return None # Should be unreachable if PhaseFailure is raised or a script is returned.
 
 
     def generate_patch_preview(self) -> str:
-        """Placeholder: Generates a preview of the current patch candidate."""
-        if self.current_patch_candidate:
-            # In a real scenario, this would format the patch (e.g., as a diff)
-            return f"Preview of current patch candidate: {str(self.current_patch_candidate)[:200]}..."
-        return "Patch preview not yet implemented. No current patch candidate."
+        """
+        Generates a preview of the current patch candidate, including a diff
+        against the original file content.
+        """
+        if not self._current_run_context_data or not self.current_patch_candidate:
+            return "Preview not available: No active run context or patch candidate."
+
+        target_file_str = self._current_run_context_data.get("phase_target_file")
+        digester = self._current_run_context_data.get("repository_digester")
+
+        if not target_file_str:
+            return "Preview not available: Target file not specified in run context."
+        if not digester:
+            return "Preview not available: RepositoryDigester not available in run context."
+
+        # Ensure target_file_str is treated as relative to the project root for digester.
+        # This depends on how target_file_str is stored (abs vs rel).
+        # Assuming target_file_str is relative to project_root for digester.get_file_content.
+        # If target_file_str could be absolute, digester.get_file_content should handle it,
+        # or we need to make it relative here.
+        # For diff display, the name part is usually sufficient.
+        target_file_display_name = Path(target_file_str).name
+
+
+        original_content = digester.get_file_content(Path(target_file_str))
+        original_content_for_diff = original_content if original_content is not None else ""
+
+        diff_text: str
+        modified_content: Optional[str] = None
+
+        if not isinstance(self.current_patch_candidate, str):
+            diff_text = f"Error: Patch candidate is not a string (type: {type(self.current_patch_candidate)}). Cannot generate diff."
+        else:
+            try:
+                modified_content = apply_libcst_codemod_script(
+                    original_content_for_diff,
+                    self.current_patch_candidate
+                )
+
+                diff_lines = list(difflib.unified_diff(
+                    original_content_for_diff.splitlines(keepends=True),
+                    modified_content.splitlines(keepends=True),
+                    fromfile=f"a/{target_file_display_name}",
+                    tofile=f"b/{target_file_display_name}"
+                ))
+                if diff_lines:
+                    diff_text = "".join(diff_lines)
+                else:
+                    diff_text = "No textual changes produced by the patch script."
+
+            except PatchApplicationError as pae:
+                diff_text = f"Error applying patch script for diff generation: {pae}"
+            except Exception as e: # Catch any other unexpected errors during diff generation
+                diff_text = f"Unexpected error during diff generation: {e}"
+
+        script_snippet = self.current_patch_candidate[:1000] if isinstance(self.current_patch_candidate, str) else str(self.current_patch_candidate)[:1000]
+        script_ellipsis = '...' if isinstance(self.current_patch_candidate, str) and len(self.current_patch_candidate) > 1000 else ''
+
+        preview_parts = [
+            "Patch Preview:",
+            "---------------------",
+            f"Target File: {target_file_str}",
+            "\nApplied LibCST Script (first 1000 chars):",
+            f"{script_snippet}{script_ellipsis}",
+            "\nGenerated Diff:",
+            "---------------------",
+            diff_text
+        ]
+        return "\n".join(preview_parts)
 
     def abort_and_rollback(self) -> None:
-        """Placeholder: Aborts the current operation and rolls back any changes."""
-        print("CollaborativeAgentGroup.abort_and_rollback called. Rolling back (placeholder).")
+        """Placeholder: Aborts the current operation and conceptually rolls back changes."""
+        patch_status_info = "No active patch candidate."
+        if self.current_patch_candidate and isinstance(self.current_patch_candidate, str):
+            patch_status_info = f"Current patch candidate (script) length: {len(self.current_patch_candidate)}."
+        elif self.current_patch_candidate:
+            patch_status_info = f"Current patch candidate type: {type(self.current_patch_candidate)}."
+
+        print(f"CollaborativeAgentGroup: Abort and Rollback called. {patch_status_info}")
+        print("  (Mock: No file operations to roll back at this stage as scripts are not yet applied.)")
+
+        # Reset internal state related to the current run
         self.current_patch_candidate = None
         self.patch_history = []
-        # Actual rollback logic would depend on how changes are staged/applied.
+        self._current_run_context_data = None # Clear the context of the aborted run
+
+        print("  Internal state (patch candidate, history, context) has been reset.")
+        # In a real scenario, this might involve:
+        # - Deleting temporary files
+        # - Reverting any applied changes in a sandbox environment
+        # - Signaling to other components that the phase was aborted
         pass
 
 # Example Usage (Conceptual - requires mock objects for Phase, Digester etc.)
 if __name__ == '__main__':
+    from src.utils.config_loader import load_app_config # For __main__
+    from src.validator.validator import Validator # For __main__
+
     print("\n--- CollaborativeAgentGroup Example Usage (Conceptual) ---")
+
+    app_cfg_main = load_app_config()
+    app_cfg_main["general"]["verbose"] = True
+    if not app_cfg_main["general"].get("project_root"):
+        app_cfg_main["general"]["project_root"] = str(Path.cwd())
+
 
     # Mock Phase (replace with actual Phase import and instantiation if available)
     class MockPhase:
-        def __init__(self, op_name, target, params=None):
+        def __init__(self, op_name, target, params=None, description="Mock phase description"):
             self.operation_name = op_name
             self.target_file = target
             self.parameters = params if params else {}
+            self.description = description
+
 
     # Mock Digester (replace with actual Digester import and instantiation)
     class MockDigester:
-        def get_project_overview(self): return {"files": 2, "language": "python"}
+        def __init__(self, app_config_param): # Mock accepts app_config
+            self.app_config = app_config_param
+            self.repo_path = Path(app_config_param.get("general",{}).get("project_root", "."))
+            self.verbose = app_config_param.get("general",{}).get("verbose", False)
+            if self.verbose: print(f"MockDigester initialized for CollaborativeAgentGroup main, repo_path: {self.repo_path}")
+
+        def get_project_overview(self): return {"files": 2, "language": "python", "mock_overview": True}
         def get_file_content(self, path: Path): return f"# Content of {path}\npass" if path else None
+        def get_code_snippets_for_phase(self, phase_ctx_param: Any) -> Dict[str, str]:
+            return {"mock_snippet.py": "def mock_func(): pass"}
+        def get_pdg_slice_for_phase(self, phase_ctx_param: Any) -> Dict[str, Any]:
+            return {"nodes": [], "edges": [], "info": "Mock PDG"}
+        def _get_module_qname_from_path(self, file_path: Path, project_root: Path) -> str:
+            return file_path.stem # Simplified for mock
 
-    # Mock validator and scorer
-    def mock_validator(patch, digester, phase_ctx):
-        print(f"MockValidator: Validating patch: {patch}")
-        if patch.get("value") and "ERROR" in patch["value"]:
-            return False, {"reason": "Contains ERROR string"}, "Traceback: Something went wrong due to ERROR"
-        if patch.get("path") == "/src/invalid.py":
-            return False, {"reason": "Invalid path"}, "Traceback: InvalidPathError"
-        return True, {"lines_changed": 1}, None
+    # Mock validator and scorer (Validator itself will be refactored later)
+    mock_validator_instance = Validator(app_config=app_cfg_main) # Pass app_config
 
-    def mock_score_style(patch, style_profile):
-        print(f"MockScoreStyle: Scoring patch: {patch} with profile: {style_profile}")
-        if patch.get("value") and "bad_style" in patch["value"]:
+    def mock_validator_handle(modified_code: str, target_file: Path, digester_param: Any, project_root_param: Path) -> Tuple[bool, Optional[str], Optional[str]]:
+        if "ERROR" in modified_code:
+            return False, "Contains ERROR string", "Traceback: Something went wrong due to ERROR"
+        if target_file.name == "invalid.py":
+            return False, "Invalid path", "Traceback: InvalidPathError"
+        return True, "Validated by mock", None
+
+    def mock_score_style(patch_script: Any, style_profile_param: Dict[str, Any]) -> float:
+        if isinstance(patch_script, str) and "bad_style" in patch_script:
             return 0.2
         return 0.85
 
     # Setup
-    mock_llm_config = {"other_common_context": {"api_key": "llm_mock_key"}}
-    mock_diffusion_config = {"other_common_context": {"model_strength": 0.7}}
     mock_style_profile = {"line_length": 88, "indent_style": "space"}
-    mock_naming_db_path = Path("mock_naming_db.json")
+    mock_naming_db_path = Path(app_cfg_main["general"]["project_root"]) / "mock_naming_db.json" # Relative to project root
 
     # Create dummy naming db file
+    mock_naming_db_path.parent.mkdir(parents=True, exist_ok=True)
     with open(mock_naming_db_path, "w") as f:
-        f.write('{"function_prefix": "get_"}')
+        json.dump({"function_prefix": "get_"}, f)
+
+    mock_digester_for_cag = MockDigester(app_config_param=app_cfg_main)
 
     agent_group = CollaborativeAgentGroup(
-        llm_config=mock_llm_config,
-        diffusion_config=mock_diffusion_config,
+        app_config=app_cfg_main,
+        digester=mock_digester_for_cag, # type: ignore
         style_profile=mock_style_profile,
-        naming_conventions_db_path=mock_naming_db_path
+        naming_conventions_db_path=mock_naming_db_path,
+        validator_instance=mock_validator_instance
     )
 
     mock_phase_ctx = MockPhase(op_name="add_function", target="src/example.py", params={"function_name": "my_func"})
-    mock_digester_instance = MockDigester()
 
     print("\nStarting agent_group.run...")
-    final_patch_result = agent_group.run(
-        phase_ctx=mock_phase_ctx,
-        digester=mock_digester_instance,
-        validator_handle=mock_validator,
-        score_style_handle=mock_score_style
-    )
+    try:
+        final_patch_script_result, final_patch_source_info = agent_group.run(
+            phase_ctx=mock_phase_ctx,
+            digester=mock_digester_for_cag, # type: ignore
+            validator_handle=mock_validator_handle, # type: ignore
+            score_style_handle=mock_score_style
+        )
+        print(f"\nAgent group run completed. Final patch script: '{str(final_patch_script_result)[:100]}...', Source: {final_patch_source_info}")
+        if final_patch_script_result : print(f"Patch preview: {agent_group.generate_patch_preview()}")
 
-    print(f"\nAgent group run completed. Final patch: {final_patch_result}")
-    print(f"Patch preview: {agent_group.generate_patch_preview()}")
+    except PhaseFailure as pf:
+        print(f"CollaborativeAgentGroup Main: PhaseFailure encountered: {pf}")
+    except Exception as e:
+        print(f"CollaborativeAgentGroup Main: Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
 
     # Example of a patch that might fail validation then get repaired (conceptually)
     print("\n--- Example with failing patch ---")

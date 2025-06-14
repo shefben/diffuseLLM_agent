@@ -1,177 +1,228 @@
 from pathlib import Path
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional, List # Added List
+import json # Add json import for dumping dicts in prompt
+import sqlite3 # Added for polish_patch naming conventions
+import ast # For validating polished script syntax
+import re # For parsing LLM scaffold output (already present)
+
+# Attempt to import the new LLM interfacer function
+try:
+    from src.profiler.llm_interfacer import get_llm_code_fix_suggestion, get_llm_cst_scaffold, get_llm_polished_cst_script
+    from src.utils.config_loader import DEFAULT_APP_CONFIG # For default model paths
+except ImportError:
+    get_llm_code_fix_suggestion = None
+    get_llm_cst_scaffold = None
+    get_llm_polished_cst_script = None
+    DEFAULT_APP_CONFIG = {"models": {"agent_llm_gguf": "./models/placeholder_llm_agent.gguf"}} # Basic fallback
+    print("LLMCore Warning: Failed to import one or more LLM interfacer functions or DEFAULT_APP_CONFIG. Related LLM capabilities will be disabled or use basic fallbacks.")
+
 
 class LLMCore:
-    def __init__(self, style_profile: Dict[str, Any], naming_conventions_db_path: Path, config: Optional[Dict[str, Any]] = None):
+    def __init__(self,
+                 app_config: Dict[str, Any],
+                 style_profile: Dict[str, Any],
+                 naming_conventions_db_path: Path
+                 ):
         """
         Initializes the LLMCore.
         Args:
+            app_config: The main application configuration dictionary.
             style_profile: Dictionary containing style profile information.
             naming_conventions_db_path: Path to the naming conventions database.
-            config: Optional dictionary for LLM core specific configurations.
         """
+        self.app_config = app_config
         self.style_profile = style_profile
         self.naming_conventions_db_path = naming_conventions_db_path
-        self.config = config if config else {}
-        print(f"LLMCore initialized with style_profile, naming_conventions_db_path: {naming_conventions_db_path}, config: {self.config}")
+
+        self.verbose = self.app_config.get("general", {}).get("verbose", False)
+
+        default_agent_llm_path = DEFAULT_APP_CONFIG.get("models", {}).get("agent_llm_gguf", "./models/placeholder_llm_agent.gguf")
+        self.llm_model_path = self.app_config.get("models", {}).get("agent_llm_gguf", default_agent_llm_path)
+
+        if self.verbose:
+            print(f"LLMCore initialized. Verbose: {self.verbose}, Model Path: {self.llm_model_path}")
+            print(f"  Style profile keys: {list(self.style_profile.keys())}")
+            print(f"  Naming conventions DB: {self.naming_conventions_db_path}")
 
     def generate_scaffold_patch(self, context_data: Dict[str, Any]) -> Tuple[Optional[str], Optional[List[str]]]:
         """
-        Generates a scaffold patch (LibCST edit script string) and an edit summary.
+        Generates a LibCST scaffold script and an edit summary using an LLM.
         Args:
             context_data: Comprehensive context data dictionary.
         Returns:
-            A tuple containing the mock LibCST script string (or None) and an edit summary list (or None).
+            A tuple (cst_script_str, edit_summary_list), or (None, None) on failure.
         """
-        print(f"LLMCore.generate_scaffold_patch called. Context keys: {list(context_data.keys())}")
+        if self.verbose: print(f"LLMCore.generate_scaffold_patch called. Context keys: {list(context_data.keys())}")
 
-        # Extract relevant information from context_data
-        phase_description = context_data.get("phase_description", "No phase description provided.")
-        target_file = context_data.get("phase_target_file", "No target file specified.")
+        if get_llm_cst_scaffold is None or not self.llm_model_path:
+            print("LLMCore Error: get_llm_cst_scaffold is not available or llm_model_path not configured. Cannot generate scaffold.")
+            return None, None
+
+        llm_params = self.app_config.get("llm_params", {})
+        # General verbosity for LLMCore's own prints is self.verbose
+        # llm_interfacer_verbose is for the get_llm_... function's internal logging
+        llm_interfacer_verbose = self.app_config.get("general", {}).get("verbose_llm_calls", self.verbose)
+
+
+        phase_description = context_data.get("phase_description", "N/A")
+        target_file = str(context_data.get("phase_target_file", "N/A")) # Ensure string for prompt
         parameters = context_data.get("phase_parameters", {})
-        code_snippets = context_data.get("retrieved_code_snippets", {"info": "No snippets retrieved."})
+        code_snippets = context_data.get("retrieved_code_snippets", {})
         style_profile = context_data.get("style_profile", {})
 
-        # Construct a detailed prompt string
-        prompt = f"""[LLM TASK: Generate LibCST Python Edit Script and Edit Summary]
+        # Refined Prompt for LibCST script and delimited edit summary
+        prompt = f"""[TASK]
+You are an expert Python programmer specializing in code generation using LibCST.
+Your goal is to generate a Python script that defines a LibCST VisitorBasedCodemodCommand or MatcherDecoratableCommand class.
+This script will be used to perform a specific code modification as described in the phase details.
+For complex logic or sections that will be filled in later (e.g., by another AI model), use placeholders like '__HOLE_0__', '__HOLE_1__', etc., in the generated *code within the LibCST command's methods*.
 
-Objective:
-Generate a Python script using LibCST that performs a specific code modification.
-The script should define a VisitorBasedCodemodCommand class to implement the change.
-For complex logic or sections that require further refinement (e.g., by a diffusion model),
-use placeholders like '__HOLE_0__', '__HOLE_1__', etc., in the generated code within the LibCST script.
+[OUTPUT FORMAT]
+Provide your response as two distinct parts, separated by a specific delimiter:
+1.  The LibCST Python script.
+2.  An edit summary list enclosed in XML-like tags.
 
-Output Format:
-1.  A Python string variable containing the complete LibCST script.
-2.  A Python list of strings variable named "edit_summary", where each string describes a high-level change.
-    Example: edit_summary = ["ADD_DECORATOR @transactional to func:process_payment line 33 in payment_service.py", "REPLACE_BODY func:get_data in data_utils.py with placeholder __HOLE_0__"]
+Example:
+```python
+# LibCST Script part
+import libcst as cst
+from libcst.codemod import VisitorBasedCodemodCommand, CodemodContext
 
-Task Details:
-----------------
-Phase Description: {phase_description}
+class AddCommentCommand(VisitorBasedCodemodCommand):
+    # ... (rest of the class definition) ...
+    def leave_FunctionDef(self, original_node, updated_node):
+        # ... logic using placeholders like self.new_code_with_hole = "__HOLE_0__" ...
+        return updated_node # ... with changes ...
+```
+# SCRIPT_END_EDIT_SUMMARY_START
+# - ADD_FUNCTION: new_dummy_function in module/file.py
+# - INSERT_PLACEHOLDER: __HOLE_0__ for core logic in new_dummy_function
+# EDIT_SUMMARY_END
+
+[PHASE DETAILS]
+Description: {phase_description}
 Target File: {target_file}
-Phase Parameters: {json.dumps(parameters, indent=2)}
+Parameters: {json.dumps(parameters, indent=2)}
 
+[CONTEXTUAL INFORMATION]
 Relevant Code Snippets:
--------------------------
 {json.dumps(code_snippets, indent=2)}
 
-Style Profile (guidelines for generated code within the CST script, if applicable, and for the modification itself):
----------------------------------------------------------------------------------------------------------------
-Indent Width: {style_profile.get('indent_size', style_profile.get('tab_width', 4))}
-Quote Style: {style_profile.get('quote_style', 'double')}
-(Other relevant style elements could be included here)
+Style Profile (for generated code within the CST script, if applicable, and for the modification itself):
+Indent Width: {style_profile.get('indent_size', style_profile.get('tab_width', DEFAULT_APP_CONFIG.get('style_profile_defaults', {}).get('indent_size', 4)))}
+Quote Style: {style_profile.get('quote_style', DEFAULT_APP_CONFIG.get('style_profile_defaults', {}).get('quote_style', 'double'))}
 
-Instructions for LibCST script:
--------------------------------
-- Ensure all necessary LibCST imports are included (e.g., libcst as cst, libcst.matchers as m, VisitorBasedCodemodCommand).
-- The command should be parameterizable via its __init__ method if details from 'Phase Parameters' are needed.
-- Use placeholders like '__HOLE_0__' for parts of the new code that are complex or require later expansion.
-- The script should be executable and define at least one class inheriting from VisitorBasedCodemodCommand.
-
-Begin Script and Summary:
+[INSTRUCTIONS]
+- Ensure the script is syntactically correct Python and uses LibCST correctly.
+- The class should be parameterizable via its __init__ if details from 'Phase Parameters' are needed.
+- Use placeholders like '__HOLE_0__' for complex logic within the generated code segments in the CST script.
+- Ensure the edit summary is concise and uses the specified format.
 """
-        print("\n--- LLMCore: Constructed Prompt for Scaffold Generation ---")
-        print(prompt)
-        print("--- End of Prompt ---\n")
+        if llm_params.get("verbose_prompts", self.verbose): # Control verbosity of prompt logging
+            print("\n--- LLMCore: Constructed Prompt for Scaffold Generation ---")
+            print(prompt)
+            print("--- End of Prompt ---\n")
+        else:
+            if self.verbose: print("\n--- LLMCore: Constructed Prompt for Scaffold Generation (summary shown) ---")
+            if self.verbose: print(prompt[:300] + "...")
+            if self.verbose: print("--- End of Prompt Summary ---\n")
 
-        # Mock LLM Interaction
-        print("LLMCore: Using MOCK LLM response for scaffold generation.")
+        scaffold_model_path = self.llm_model_path
+        scaffold_n_gpu_layers = llm_params.get("n_gpu_layers_default", DEFAULT_APP_CONFIG["llm_params"]["n_gpu_layers_default"])
+        scaffold_n_ctx = llm_params.get("n_ctx_default", DEFAULT_APP_CONFIG["llm_params"]["n_ctx_default"])
+        scaffold_max_tokens = llm_params.get("agent_scaffold_max_tokens", DEFAULT_APP_CONFIG["llm_params"]["agent_scaffold_max_tokens"])
+        scaffold_temp = llm_params.get("agent_scaffold_temp", llm_params.get("temperature_default", DEFAULT_APP_CONFIG["llm_params"]["temperature_default"]))
 
-        # Example: If phase is to add a function (could be inferred from phase_description or parameters)
-        func_name_param = parameters.get("function_name", "new_mock_function")
+        raw_llm_output = get_llm_cst_scaffold(
+            model_path=scaffold_model_path,
+            prompt=prompt,
+            verbose=llm_interfacer_verbose, # For the interfacer function's logging
+            n_gpu_layers=scaffold_n_gpu_layers,
+            n_ctx=scaffold_n_ctx,
+            max_tokens_for_scaffold=scaffold_max_tokens,
+            temperature=scaffold_temp
+        )
 
-        mock_cst_script_str = f'''
-import libcst as cst
-import libcst.matchers as m
-from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand
+        if raw_llm_output is None:
+            print("LLMCore Error: get_llm_cst_scaffold returned None. Failed to generate scaffold from LLM.")
+            return None, None
 
-class AddFunctionWithPlaceholderCommand(VisitorBasedCodemodCommand):
-    DESCRIPTION: str = "Adds a new function with a placeholder body, using a parameter for the function name."
+        # Parse the raw output
+        script_marker = "# SCRIPT_END_EDIT_SUMMARY_START"
+        summary_start_marker = "# EDIT_SUMMARY_START" # Redundant if script_marker is primary
+        summary_end_marker = "# EDIT_SUMMARY_END"
 
-    def __init__(self, context: CodemodContext, function_name: str, placeholder_content: str):
-        super().__init__(context)
-        self.function_name = function_name
-        self.placeholder_content = placeholder_content # e.g., "__HOLE_0__"
+        extracted_cst_script_str: Optional[str] = None
+        extracted_edit_summary_list: Optional[List[str]] = None
 
-    def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
-        new_function_code = f"""
-def {self.function_name}():
-    # {self.placeholder_content}
-    pass
-"""
-        new_function_def = cst.parse_statement(new_function_code)
-
-        # Example: Add to the end of the module
-        # More sophisticated logic might insert it relative to other elements.
-        return updated_node.with_changes(body=list(updated_node.body) + [new_function_def])
-
-# How to instantiate (example):
-# cmd_context = CodemodContext()
-# command_instance = AddFunctionWithPlaceholderCommand(cmd_context, function_name="{func_name_param}", placeholder_content="__HOLE_0__ # Business logic for {func_name_param}")
-'''
-
-        mock_edit_summary_list = [
-            f"ADD_FUNCTION name:{func_name_param} in file:{target_file}",
-            f"INSERT_PLACEHOLDER __HOLE_0__ in {func_name_param}"
-        ]
-
-        # Handle a hypothetical 'modify_class' operation
-        if "modify_class" in phase_description.lower() or parameters.get("operation_type") == "modify_class":
-            class_name_param = parameters.get("class_name", "ExistingMockClass")
-            method_name_param = parameters.get("method_name", "new_method_in_class")
-            mock_cst_script_str = f'''
-import libcst as cst
-import libcst.matchers as m
-from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand
-
-class ModifyClassAddMethodCommand(VisitorBasedCodemodCommand):
-    DESCRIPTION: str = "Adds a new method with a placeholder to an existing class."
-
-    def __init__(self, context: CodemodContext, class_name: str, method_name: str, placeholder_content: str):
-        super().__init__(context)
-        self.class_name = class_name
-        self.method_name = method_name
-        self.placeholder_content = placeholder_content
-
-    @m.call_if_inside(m.ClassDef(name=m.Name(value=lambda val: val == self.class_name)))
-    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.ClassDef:
-        new_method_code = f"""
-    def {self.method_name}(self):
-        # {self.placeholder_content}
-        return None
-"""
-        # WARNING: cst.parse_statement expects a statement. A method def is part of a ClassDef body.
-        # This direct parsing and appending might need refinement for correct indentation and structure.
-        # A safer way is to construct CST nodes directly or use a more complex parsing logic.
-        # For this mock, we'll assume a simplified approach that might need fixing in a real scenario.
         try:
-            # This is not ideal, parsing a full class just to get a method, then extracting.
-            temp_class_def = cst.parse_module(f"class Temp:\\n{new_method_code.strip()}").body[0]
-            if isinstance(temp_class_def, cst.ClassDef) and temp_class_def.body.body:
-                new_method_node = temp_class_def.body.body[0]
-                # Ensure it's a FunctionDef before adding
-                if isinstance(new_method_node, cst.FunctionDef):
-                    # Add to existing methods
-                    updated_body_elements = list(updated_node.body.body) + [new_method_node]
-                    return updated_node.with_changes(body=updated_node.body.with_changes(body=updated_body_elements))
-        except Exception as e:
-            print(f"Mock LLM: Error constructing class method node: {e}")
+            if script_marker in raw_llm_output:
+                parts = raw_llm_output.split(script_marker, 1)
+                extracted_cst_script_str = parts[0].strip()
 
-        return updated_node # Return original if modification failed
+                summary_part = parts[1]
+                # Summary part might still contain the start marker if it was also a stop token
+                if summary_start_marker in summary_part:
+                     summary_part = summary_part.split(summary_start_marker,1)[1]
 
-# How to instantiate (example):
-# cmd_context = CodemodContext()
-# command_instance = ModifyClassAddMethodCommand(cmd_context, class_name="{class_name_param}", method_name="{method_name_param}", placeholder_content="__HOLE_CLASS_METHOD_0__")
-'''
-            mock_edit_summary_list = [
-                f"MODIFY_CLASS name:{class_name_param} in file:{target_file}",
-                f"ADD_METHOD name:{method_name_param} to class:{class_name_param}",
-                f"INSERT_PLACEHOLDER __HOLE_CLASS_METHOD_0__ in {class_name_param}.{method_name_param}"
-            ]
+                if summary_end_marker in summary_part:
+                    summary_part = summary_part.split(summary_end_marker, 1)[0]
 
-        # Simulate returning the script and summary
-        return mock_cst_script_str, mock_edit_summary_list
+                extracted_edit_summary_list = [
+                    line.strip() for line in summary_part.strip().splitlines()
+                    if line.strip() and line.strip().startswith("- ") # Ensure lines are actual summary items
+                ]
+                # Clean up "- " prefix
+                extracted_edit_summary_list = [line[2:] for line in extracted_edit_summary_list]
+
+            else: # Fallback if markers are not perfectly produced
+                print("LLMCore Warning: Script/summary delimiter not found in LLM output. Attempting heuristic parsing.")
+                # Attempt to find Python code block for script
+                code_block_match = re.search(r"```python\n(.*?)\n```", raw_llm_output, re.DOTALL)
+                if code_block_match:
+                    extracted_cst_script_str = code_block_match.group(1).strip()
+                else: # Assume the whole thing might be the script if no markers
+                    extracted_cst_script_str = raw_llm_output.strip()
+
+                # For summary, if no markers, it's hard to get. Maybe it's after the script.
+                # This part is highly unreliable without markers.
+                # For now, if no markers, summary might be None or extracted based on other heuristics.
+                # Let's assume for now if markers are missing, summary extraction is skipped or results in empty.
+                if extracted_cst_script_str and len(raw_llm_output) > len(extracted_cst_script_str):
+                    potential_summary_part = raw_llm_output[len(extracted_cst_script_str):].strip()
+                    if potential_summary_part.startswith("#"): # Common for comments
+                         extracted_edit_summary_list = [
+                            line.strip()[2:] for line in potential_summary_part.splitlines()
+                            if line.strip().startswith("# - ")
+                         ]
+
+
+            if not extracted_cst_script_str:
+                print("LLMCore Error: Could not extract LibCST script from LLM output.")
+                if self.verbose: print(f"LLM Raw Output for script extraction failure:\n{raw_llm_output}")
+                return None, None
+
+            if not extracted_edit_summary_list: # Default to a generic summary if none parsed
+                print("LLMCore Warning: Could not extract edit summary from LLM output, or it was empty.")
+                extracted_edit_summary_list = [f"GENERIC_EDIT_APPLIED to {target_file}"]
+
+
+            # Basic validation of the script
+            try:
+                ast.parse(extracted_cst_script_str)
+                if self.verbose: print(f"LLMCore Info: Extracted CST script is valid Python syntax. Length: {len(extracted_cst_script_str)}")
+            except SyntaxError as e_syn:
+                print(f"LLMCore Error: Extracted CST script has syntax errors: {e_syn}")
+                if self.verbose: print(f"Problematic CST script:\n{extracted_cst_script_str}")
+                return None, None
+
+            print(f"LLMCore Info: Successfully generated scaffold. Script length: {len(extracted_cst_script_str)}, Summary items: {len(extracted_edit_summary_list)}")
+            return extracted_cst_script_str, extracted_edit_summary_list
+
+        except Exception as e_parse:
+            print(f"LLMCore Error: Failed to parse LLM output for scaffold: {e_parse}")
+            if self.verbose: print(f"LLM Raw Output for parsing failure:\n{raw_llm_output}")
+            return None, None
 
     def polish_patch(self, completed_patch_script: Optional[str], context_data: Dict[str, Any]) -> Optional[str]:
         """
@@ -182,17 +233,38 @@ class ModifyClassAddMethodCommand(VisitorBasedCodemodCommand):
         Returns:
             The polished LibCST script string.
         """
-        print(f"LLMCore.polish_patch called. Context keys: {list(context_data.keys())}")
+        if self.verbose: print(f"LLMCore.polish_patch called. Context keys: {list(context_data.keys())}")
 
         if not completed_patch_script:
-            print("LLMCore.polish_patch Warning: Received None or empty completed_patch_script. Returning as is.")
+            if self.verbose: print("LLMCore.polish_patch Warning: Received None or empty completed_patch_script. Returning as is.")
             return completed_patch_script
 
+        llm_params = self.app_config.get("llm_params", {})
+        llm_interfacer_verbose = self.app_config.get("general", {}).get("verbose_llm_calls", self.verbose)
+
         # Extract relevant information from context_data
-        style_profile = context_data.get("style_profile", {})
-        naming_conventions_db_path = context_data.get("naming_conventions_db_path") # Path object
-        # repository_digester = context_data.get("repository_digester") # Digester instance
-        # target_file = context_data.get("phase_target_file")
+        style_profile = context_data.get("style_profile", self.style_profile) # Use instance style_profile as fallback
+        naming_conventions_db_path = context_data.get("naming_conventions_db_path", self.naming_conventions_db_path) # Use instance path as fallback
+
+        active_naming_conventions_str = "Naming conventions database not available or no active rules found."
+        if naming_conventions_db_path and naming_conventions_db_path.exists():
+            try:
+                conn = sqlite3.connect(str(naming_conventions_db_path))
+                cursor = conn.cursor()
+                cursor.execute("SELECT identifier_type, convention_name FROM naming_rules WHERE is_active = TRUE")
+                rules = cursor.fetchall()
+                conn.close()
+                if rules:
+                    formatted_rules = [f"  - {identifier_type.capitalize()}: {convention_name}" for identifier_type, convention_name in rules]
+                    active_naming_conventions_str = "Active Naming Conventions (guideline for script's own identifiers):\n" + "\n".join(formatted_rules)
+                    active_naming_conventions_str += "\n(If specific conventions are not listed, use standard Python best practices.)"
+                else:
+                    active_naming_conventions_str = "No active naming conventions found in the database. Use standard Python best practices."
+            except sqlite3.Error as e_sqlite:
+                active_naming_conventions_str = f"Error accessing naming conventions DB: {e_sqlite}. Use standard Python best practices."
+        elif naming_conventions_db_path: # Path provided but does not exist
+             active_naming_conventions_str = f"Naming conventions DB not found at {naming_conventions_db_path}. Use standard Python best practices."
+
 
         prompt = f"""[LLM TASK: Polish LibCST Python Edit Script]
 
@@ -227,35 +299,97 @@ Instructions for Polishing:
 
 Begin Polished Script:
 """
-        print("\n--- LLMCore: Constructed Prompt for Polishing Pass ---")
-        print(prompt[:1000] + "..." if len(prompt) > 1000 else prompt) # Print snippet if too long
-        print("--- End of Polishing Prompt ---\n")
+        # This prompt is complex, so verbose printing is more likely useful
+        if llm_params.get("verbose_prompts", self.verbose):
+            print("\n--- LLMCore: Constructed Prompt for Polishing Pass ---")
+            print(prompt)
+            print("--- End of Polishing Prompt ---\n")
+        else:
+            if self.verbose: print("\n--- LLMCore: Constructed Prompt for Polishing Pass (summary shown) ---")
+            if self.verbose: print(prompt[:500] + "...")
+            if self.verbose: print("--- End of Polishing Prompt Summary ---\n")
 
-        # Mock LLM Interaction
-        print("LLMCore: Using MOCK LLM response for polishing.")
+        if get_llm_polished_cst_script is None:
+            if self.verbose: print("LLMCore Warning: get_llm_polished_cst_script not available. Skipping real LLM polishing.")
+            return completed_patch_script
 
-        polished_script = "# Script polished by mock LLM (LLMCore.polish_patch)\n" + completed_patch_script
+        polishing_model_path = self.llm_model_path # Uses the main agent LLM
+        if not polishing_model_path: # Should be caught by __init__ or earlier checks
+            print("LLMCore Warning: No model path configured for polishing. Skipping real LLM polishing.")
+            return completed_patch_script
 
-        # Simulate identifier harmonization (very superficial mock)
-        # Example: if the scaffold/expansion used a generic name like "placeholder_var" or "temp_method_name"
-        # This would typically require parsing the script, identifying symbols, and applying rules.
-        if "placeholder_content" in polished_script and "placeholder_content =" not in polished_script : # Avoid replacing variable assignment
-             polished_script = polished_script.replace("placeholder_content", "polished_placeholder_content_var")
-             print("  Mock Polish: Replaced 'placeholder_content' with 'polished_placeholder_content_var'")
+        # Parameters for the call to get_llm_polished_cst_script
+        polish_n_gpu_layers = llm_params.get("n_gpu_layers_default", DEFAULT_APP_CONFIG["llm_params"]["n_gpu_layers_default"])
+        polish_n_ctx = llm_params.get("n_ctx_default", DEFAULT_APP_CONFIG["llm_params"]["n_ctx_default"])
+        polish_max_tokens = llm_params.get("agent_polish_max_tokens", DEFAULT_APP_CONFIG["llm_params"]["agent_polish_max_tokens"])
+        polish_temp = llm_params.get("agent_polish_temp", llm_params.get("temperature_default", DEFAULT_APP_CONFIG["llm_params"]["temperature_default"]))
 
-        # Simulate adding a missing import (very superficial mock)
-        if "VisitorBasedCodemodCommand" in polished_script and "from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand" not in polished_script:
-            if "import libcst.matchers as m" in polished_script: # find a line to insert after
-                 polished_script = polished_script.replace(
-                    "import libcst.matchers as m",
-                    "import libcst.matchers as m\nfrom libcst.codemod import CodemodContext, VisitorBasedCodemodCommand"
-                )
-            else: # prepend
-                 polished_script = "from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand\n" + polished_script
-            print("  Mock Polish: Added 'from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand'")
+        # Re-construct the prompt for polishing with potentially updated context_data values
+        # (style_profile and naming_conventions_db_path are now correctly sourced before this point)
+        prompt = f"""[TASK DESCRIPTION]
+You are an expert Python programmer specializing in reviewing and polishing LibCST (Concrete Syntax Tree) refactoring scripts.
+Your goal is to refine the provided LibCST script for clarity, correctness, and adherence to coding conventions.
 
+[INPUT LibCST SCRIPT TO POLISH]
+```python
+{completed_patch_script}
+```
 
-        print(f"LLMCore: Polishing complete. Returning script (len: {len(polished_script)}).")
+[CONTEXTUAL INFORMATION FOR POLISHING]
+1.  **Style Profile (for the script's own code, if applicable, and for generated code):**
+    ```json
+    {json.dumps(style_profile, indent=2)}
+    ```
+2.  **Naming Conventions (guidance for identifier naming within the LibCST script itself):**
+    {active_naming_conventions_str}
+
+3.  **Target File for the Original Codemod Operation:** {context_data.get("phase_target_file", "N/A")}
+4.  **Phase Parameters for the Original Codemod Operation:**
+    ```json
+    {json.dumps(context_data.get("phase_parameters", {}), indent=2)}
+    ```
+
+[POLISHING INSTRUCTIONS]
+1.  **Harmonize Identifier Style:** Review variable names, function names, and class names *within the LibCST script itself*. Ensure they are consistent and follow standard Python conventions (e.g., snake_case for functions and variables, CamelCase for classes).
+2.  **Ensure Necessary Imports:** Check if the script uses Python modules that require imports (e.g., `typing.List`, `collections.defaultdict`). If such imports are obviously missing from the top of the script, add them. Alternatively, if you are unsure about global import scope, list them in a comment block: `# REQUIRED_IMPORTS_START\n# import os\n# import typing\n# REQUIRED_IMPORTS_END`.
+3.  **Review and Repair Obvious Issues:** Correct any clear type mismatches, syntax errors, or minor logical flaws *within the LibCST script's own logic*. This does NOT mean altering the intended refactoring behavior of the script on the target codebase.
+4.  **Do NOT alter placeholders like `__HOLE_0__`, `__HOLE_1__`, etc.** These are intentional and will be filled by another process.
+5.  **Output ONLY the complete, polished Python LibCST script string.** Do not add any explanations, apologies, or markdown formatting before or after the script block.
+
+[POLISHED LibCST SCRIPT]
+```python
+"""
+
+        llm_output_string = get_llm_polished_cst_script(
+            model_path=polishing_model_path,
+            prompt=prompt,
+            verbose=llm_interfacer_verbose,
+            n_gpu_layers=polish_n_gpu_layers,
+            n_ctx=polish_n_ctx,
+            max_tokens_for_polished_script=polish_max_tokens,
+            temperature=polish_temp
+        )
+
+        if not llm_output_string: # Handles None or empty string
+            if self.verbose: print("LLMCore Warning: LLM polishing returned no content. Proceeding with the unpolished script.")
+            return completed_patch_script
+
+        # LLM might sometimes include the closing ``` in its output.
+        if llm_output_string.endswith("```"):
+            llm_output_string = llm_output_string[:-3].rstrip()
+
+        polished_script = llm_output_string
+
+        # Basic validation of the polished script
+        try:
+            ast.parse(polished_script)
+            if self.verbose: print(f"LLMCore: Polished script is valid Python syntax. Length: {len(polished_script)}.")
+        except SyntaxError as e_syn:
+            print(f"LLMCore Error: Polished script has syntax errors: {e_syn}. Returning original script.")
+            if llm_interfacer_verbose: print(f"Problematic polished script:\n{polished_script}")
+            return completed_patch_script
+
+        if self.verbose: print(f"LLMCore: Polishing complete. Returning script (len: {len(polished_script)}).")
         return polished_script
 
     def propose_repair_diff(self, traceback_str: str, context_data: Dict[str, Any]) -> Optional[str]: # Return type changed to Optional[str] for script
@@ -267,43 +401,136 @@ Begin Polished Script:
         Returns:
             A mock repair script string (or None).
         """
-        print(f"LLMCore.propose_repair_diff called with traceback: '{traceback_str}'. Context keys: {list(context_data.keys())}")
+        if self.verbose: print(f"LLMCore.propose_repair_diff called with traceback: '{traceback_str}'. Context keys: {list(context_data.keys())}")
+
+        llm_params = self.app_config.get("llm_params", {})
+        llm_interfacer_verbose = self.app_config.get("general", {}).get("verbose_llm_calls", self.verbose)
 
         if "DUPLICATE_DETECTED: REUSE_EXISTING_HELPER" in traceback_str:
-            print("LLMCore: Received DUPLICATE_DETECTED. Attempting to generate a patch that reuses existing helper.")
-            target_file = context_data.get("phase_target_file", "unknown_target.py")
-            original_planned_func_name = context_data.get("phase_parameters", {}).get("function_name", "original_planned_function")
+            if self.verbose: print("LLMCore: Received DUPLICATE_DETECTED. Generating LibCST script to comment out previous attempt.")
 
-            mock_reuse_script = f'''# Mock repair for DUPLICATE_DETECTED from LLMCore.
-# Original intent might have been to create: {original_planned_func_name} in {target_file}
-# This script should ideally modify the call site to use 'existing_helper_function_abc'
-# For now, it's just a placeholder script.
+            entity_name_str = context_data.get("phase_parameters", {}).get("function_name") or \
+                              context_data.get("phase_parameters", {}).get("class_name") or \
+                              "unknown_entity"
+            current_failed_script_content = str(context_data.get('current_patch_candidate', '# Original script could not be retrieved from context.'))
+
+            header_comment_text = f"Original script commented out due to DUPLICATE_DETECTED for entity: {entity_name_str}.\nPlease refactor the original logic to use the existing helper or rename the entity."
+
+            script_lines_to_embed = current_failed_script_content.splitlines()
+
+            empty_line_calls_str_list = []
+            # Header comments
+            for line_content in header_comment_text.split('\n'):
+                escaped_line = line_content.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
+                empty_line_calls_str_list.append(f'cst.EmptyLine(comment=cst.Comment(f"# {escaped_line}"))')
+
+            empty_line_calls_str_list.append('cst.EmptyLine()') # Blank line for separation
+
+            # --- Start of commented-out original script ---
+            empty_line_calls_str_list.append('cst.EmptyLine(comment=cst.Comment("# --- Start of commented-out original script ---"))')
+            for line_content in script_lines_to_embed:
+                escaped_line = line_content.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
+                empty_line_calls_str_list.append(f'cst.EmptyLine(comment=cst.Comment(f"# {escaped_line}"))')
+            # --- End of commented-out original script ---
+            empty_line_calls_str_list.append('cst.EmptyLine(comment=cst.Comment("# --- End of commented-out original script ---"))')
+
+            empty_line_calls_str_list.append('cst.EmptyLine()') # Blank line for separation
+
+            # TODO comments for actionable next steps
+            todo_comments = [
+                "# TODO: Replace the logic above (now commented out) by importing and",
+                "# TODO: calling the existing helper function/method that was detected as a duplicate.",
+                "# TODO: Example: from existing_module import existing_helper",
+                "# TODO: result = existing_helper_placeholder_function(args_if_known)"
+            ]
+            for comment_line in todo_comments:
+                escaped_comment_line = comment_line.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
+                empty_line_calls_str_list.append(f'cst.EmptyLine(comment=cst.Comment(f"{escaped_comment_line}"))') # No extra # prefix needed here for cst.Comment
+
+            empty_line_calls_str_list.append('cst.EmptyLine()') # Blank line
+
+            # Placeholder function call
+            empty_line_calls_str_list.append('cst.EmptyLine(comment=cst.Comment(f"# Placeholder call (remove or replace):"))')
+            empty_line_calls_str_list.append('cst.Expr(value=cst.Call(func=cst.Name("existing_helper_placeholder_function")))');
+
+            new_body_elements_initializer_str = "[\n            " + ",\n            ".join(empty_line_calls_str_list) + "\n        ]"
+
+            generated_repair_script = f"""
 import libcst as cst
-class ReuseHelperInsteadCommand(cst.VisitorBasedCodemodCommand):
-    DESCRIPTION = "Replaces a new function call with a call to an existing helper."
-    def __init__(self, context): super().__init__(context)
-    def leave_Module(self, original_node, updated_node):
-        # In a real scenario, this would find where '{original_planned_func_name}' was supposed to be called
-        # and replace it with 'existing_helper_function_abc()'.
-        # For this mock, we just add a comment indicating the intent.
-        comment = cst.Comment("# LLMCore: Code modified to use existing_helper_function_abc() instead of new {original_planned_func_name}().")
-        new_body = list(updated_node.body) + [cst.EmptyLine(comment=comment)]
-        return updated_node.with_changes(body=new_body)
-# Instantiation: ReuseHelperInsteadCommand(CodemodContext())
-'''
-            return mock_reuse_script
+from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand
 
-        elif "SyntaxError" in traceback_str:
-            print("LLMCore: Received SyntaxError. Proposing a generic syntax fix.")
-            mock_syntax_repair_script = f'''# Mock repair for SyntaxError in previous script by LLMCore.
-import libcst as cst
-class MinimalValidCommand(cst.VisitorBasedCodemodCommand):
-    DESCRIPTION = "Minimal valid command as a fallback syntax repair."
-    def leave_Module(self, original_node, updated_node):
-        return updated_node.with_changes(body=[cst.parse_statement("# Syntax error repaired with minimal valid script from LLMCore")])
-# Instantiation: MinimalValidCommand(CodemodContext())
-'''
-            return mock_syntax_repair_script
+class ReplaceContentWithCommentedOutScriptCommand(VisitorBasedCodemodCommand):
+    DESCRIPTION = "Replaces the module's content with a pre-defined commented-out script and header due to a duplicate entity error."
 
-        print("LLMCore.propose_repair_diff: No specific repair logic for this traceback. Returning None.")
-        return None
+    # No __init__ needed if content is embedded directly or not parameterized further
+
+    def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
+        # This list of cst.EmptyLine objects will form the new body of the module.
+        # Each string passed to cst.Comment() will be prefixed with a '#' by LibCST.
+        new_body_elements = {new_body_elements_initializer_str}
+
+        return updated_node.with_changes(body=new_body_elements, header=[], footer=[])
+
+# To ensure the Patcher can find this class by a known name if needed.
+COMMAND_CLASS_NAME = "ReplaceContentWithCommentedOutScriptCommand"
+"""
+            if self.verbose: print(f"LLMCore: Generated repair LibCST script for DUPLICATE_DETECTED (length: {len(generated_repair_script)}).")
+            return generated_repair_script.strip()
+
+        # Generic error handling using LLM if model path is configured
+        # Use the specific repair_llm_gguf if defined, else fallback to agent_llm_gguf
+        repair_model_path = self.app_config.get("models", {}).get("repair_llm_gguf", self.llm_model_path)
+
+        if not repair_model_path or get_llm_code_fix_suggestion is None:
+            if self.verbose: print("LLMCore Warning: LLM repair model path not configured or get_llm_code_fix_suggestion not available. Falling back to generic mock fix for other errors.")
+            if "SyntaxError" in traceback_str:
+                if self.verbose: print("LLMCore: Proposing a generic syntax fix (fallback).")
+                return f"# Mock syntax repair for: {traceback_str[:100]}\nimport libcst as cst\nclass MinimalSyntaxFix(cst.VisitorBasedCodemodCommand):\n    pass"
+            return f"# LLM model path not configured. Generic mock repair for: {traceback_str[:100]}"
+
+        if self.verbose: print(f"LLMCore: Attempting LLM-based repair for traceback: {traceback_str[:200]}... using model {repair_model_path}")
+
+        current_failed_script_from_context = context_data.get('current_patch_candidate')
+        if isinstance(current_failed_script_from_context, str) and current_failed_script_from_context.strip():
+            current_failed_script = current_failed_script_from_context
+        elif current_failed_script_from_context is not None:
+            current_failed_script = str(current_failed_script_from_context)
+            if not current_failed_script.strip():
+                 current_failed_script = "# Original script was empty or whitespace."
+        else:
+            current_failed_script = "# Original script was not provided in context_data['current_patch_candidate']."
+            if self.verbose: print("LLMCore Warning: 'current_patch_candidate' not found or is None in context_data for repair.")
+
+        phase_description = context_data.get("phase_description", "N/A")
+        target_file = context_data.get("phase_target_file")
+
+        additional_llm_context = {
+            "style_profile": context_data.get("style_profile", self.style_profile),
+            "code_snippets": context_data.get("retrieved_code_snippets")
+        }
+
+        repair_n_gpu_layers = llm_params.get("agent_repair_n_gpu_layers", llm_params.get("n_gpu_layers_default", DEFAULT_APP_CONFIG["llm_params"]["n_gpu_layers_default"]))
+        repair_n_ctx = llm_params.get("agent_repair_n_ctx", llm_params.get("n_ctx_default", DEFAULT_APP_CONFIG["llm_params"]["n_ctx_default"]))
+        repair_max_tokens = llm_params.get("agent_repair_max_tokens", DEFAULT_APP_CONFIG["llm_params"]["agent_repair_max_tokens"])
+        repair_temp = llm_params.get("agent_repair_temp", llm_params.get("temperature_default", DEFAULT_APP_CONFIG["llm_params"]["temperature_default"]))
+
+        suggested_fix_script = get_llm_code_fix_suggestion(
+            model_path=repair_model_path,
+            original_code_script=current_failed_script,
+            error_traceback=traceback_str,
+            phase_description=phase_description,
+            target_file=target_file,
+            additional_context=additional_llm_context,
+            n_gpu_layers=repair_n_gpu_layers,
+            n_ctx=repair_n_ctx,
+            max_tokens=repair_max_tokens,
+            temperature=repair_temp,
+            verbose=llm_interfacer_verbose
+        )
+
+        if suggested_fix_script:
+            if self.verbose: print(f"LLMCore: LLM suggested a fix script (len: {len(suggested_fix_script)}).")
+        else:
+            if self.verbose: print("LLMCore: LLM did not return a suggestion. Returning None.")
+
+        return suggested_fix_script

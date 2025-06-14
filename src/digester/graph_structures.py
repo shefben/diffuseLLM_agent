@@ -16,7 +16,8 @@ ControlDependenceGraph = Dict[NodeID, Set[NodeID]]
 # For Data Dependencies (more complex, placeholder for now):
 # Might map a variable instance (e.g., var_name@line:col) to a set of
 # definition sites (var_name_def@line:col) it depends on, or vice-versa.
-DataDependenceGraph = Dict[NodeID, Set[NodeID]] # Placeholder structure
+# Represents data dependencies: maps a 'use' NodeID (e.g., a variable being used) to a set of 'definition' NodeID's (sites where the variable was defined) that it depends on.
+DataDependenceGraph = Dict[NodeID, Set[NodeID]]
 
 # Combined PDG for a file or project might aggregate these.
 # For now, these are separate concepts.

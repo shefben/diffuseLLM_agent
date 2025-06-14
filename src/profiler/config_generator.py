@@ -79,7 +79,14 @@ def generate_black_config_in_pyproject(
         # 3. target-version (example, not yet in our UnifiedStyleProfile)
         # if unified_profile.get("python_version"):
         #     pyproject_data["tool"]["black"]["target-version"] = [unified_profile["python_version"]]
-        # For now, this is not set from the profile.
+        target_version_profile = unified_profile.get("target_python_version")
+        if target_version_profile:
+            if isinstance(target_version_profile, str):
+                # Ensure it's a list of strings, e.g., "py39" -> ["py39"]
+                pyproject_data["tool"]["black"]["target-version"] = [target_version_profile]
+            elif isinstance(target_version_profile, list) and all(isinstance(item, str) for item in target_version_profile):
+                pyproject_data["tool"]["black"]["target-version"] = target_version_profile
+            # Else, if it's some other type or malformed list, skip for now or add warning
 
         # Ensure parent directory exists (though for root pyproject.toml, it's usually not an issue)
         pyproject_path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,6 +172,13 @@ def get_active_naming_convention(cursor: sqlite3.Cursor, identifier_type: str) -
     row = cursor.fetchone()
     return row[0] if row else None
 
+# NOTE: This function currently maps line_length, docstring_style (to D rules),
+# preferred_quotes (to Q rules), and naming conventions (to N rules)
+# from the unified_profile to the Ruff configuration.
+# Other Ruff rule categories (e.g., for import styles, bugbear checks)
+# are not automatically configured from the current UnifiedStyleProfile structure,
+# as the profile doesn't yet capture those specific style preferences.
+# Ruff's default selections or a user-defined base 'select' list will apply for those.
 def generate_ruff_config_in_pyproject(
     unified_profile: Dict[str, Any],
     pyproject_path: Path = DEFAULT_PYPROJECT_PATH,
@@ -190,8 +204,13 @@ def generate_ruff_config_in_pyproject(
         ruff_config = pyproject_data["tool"]["ruff"]
         if "lint" not in ruff_config: ruff_config["lint"] = {}
         if "format" not in ruff_config: ruff_config["format"] = {}
-        # Ensure select and ignore lists exist and are mutable (sets for easy add/remove unique)
-        current_select: Set[str] = set(ruff_config["lint"].get("select", ["E", "F", "W"])) # Start with a base
+
+        # Initialize current_select based on existing config or as empty set
+        if "select" in ruff_config["lint"]:
+            current_select: Set[str] = set(ruff_config["lint"]["select"])
+        else:
+            current_select: Set[str] = set() # Use Ruff's defaults if nothing explicitly selected
+
         current_ignore: Set[str] = set(ruff_config["lint"].get("ignore", []))
 
 
@@ -271,12 +290,18 @@ def generate_ruff_config_in_pyproject(
 
 
         # Update select and ignore in ruff_config
-        ruff_config["lint"]["select"] = sorted(list(current_select))
-        current_ignore.update(rules_to_potentially_ignore)
+        current_ignore.update(rules_to_potentially_ignore) # Add any new ignores from naming
+
+        if current_select: # If there are explicit selections
+            ruff_config["lint"]["select"] = sorted(list(current_select))
+        elif "select" in ruff_config["lint"]: # If select became empty, remove the key to use Ruff defaults
+            ruff_config["lint"].pop("select", None)
+        # If current_select started empty and remained empty, "select" key is not added.
+
         if current_ignore: # Only write ignore if not empty
             ruff_config["lint"]["ignore"] = sorted(list(current_ignore))
-        elif "ignore" in ruff_config["lint"] and not current_ignore: # If it became empty, remove key
-             del ruff_config["lint"]["ignore"]
+        elif "ignore" in ruff_config["lint"]: # If it became empty, remove key
+             ruff_config["lint"].pop("ignore", None)
 
 
         # ... (existing pyproject.toml writing logic - keep as is) ...

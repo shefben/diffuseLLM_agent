@@ -5,9 +5,16 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple, Union, Optional
 from dataclasses import dataclass
 import math # For floor
+import json # Added import
 
-# Add import for the new AI fingerprinting function
-from .llm_interfacer import get_ai_style_fingerprint_for_sample # Assuming relative import if in same package
+# Imports for the new AI fingerprinting orchestration
+from .llm_interfacer import (
+    collect_deterministic_stats,
+    get_deepseek_draft_fingerprint,
+    get_divot5_refined_output,
+    get_deepseek_polished_json
+)
+# Removed: from .llm_interfacer import get_ai_style_fingerprint_for_sample
 
 # Modify CodeSample to store the AI fingerprint dictionary
 @dataclass
@@ -153,30 +160,99 @@ class StyleSampler:
 
 
         for name, type_val, snippet, start, end in raw_code_elements_to_fingerprint:
-            # AI fingerprinting call
-            ai_fp_dict = None
-            error_msg = None
+            ai_fingerprint_result: Dict[str, Any] = {"validation_status": "unknown", "error": None}
+            error_message_for_sample: Optional[str] = None
+
             try:
-                ai_fp_dict = get_ai_style_fingerprint_for_sample(
-                    snippet,
-                    deepseek_model_path=self.deepseek_model_path,
-                    divot5_model_path=self.divot5_model_path,
-                    deepseek_n_gpu_layers=self.deepseek_n_gpu_layers,
-                    deepseek_verbose=self.deepseek_verbose,
-                    divot5_device=self.divot5_device,
-                    divot5_num_denoising_steps=self.divot5_num_denoising_steps
+                # 1. Deterministic Stats
+                deterministic_stats_str = collect_deterministic_stats(snippet)
+
+                # 2. DeepSeek Draft Fingerprint
+                draft_fp = get_deepseek_draft_fingerprint(
+                    deterministic_stats_str,
+                    model_path=self.deepseek_model_path,
+                    n_gpu_layers=self.deepseek_n_gpu_layers,
+                    verbose=self.deepseek_verbose
                 )
-                if ai_fp_dict.get("validation_status") != "passed":
-                    error_msg = f"AI fingerprinting validation failed: {ai_fp_dict.get('validation_status')}, errors: {ai_fp_dict.get('validation_errors', ai_fp_dict.get('details'))}"
-            except Exception as e_fp:
-                error_msg = f"Exception during AI fingerprinting: {e_fp}"
+
+                if draft_fp.get("error"):
+                    error_message_for_sample = f"DeepSeek draft failed: {draft_fp['error']}"
+                    ai_fingerprint_result.update(draft_fp)
+                    ai_fingerprint_result["validation_status"] = "failed_deepseek_draft"
+                else:
+                    # 3. DivoT5 Refinement
+                    draft_fp_for_divot5 = {k: v for k, v in draft_fp.items() if k != "error" and v is not None}
+                    # Fallback for polish: use raw draft_fp if DivoT5 fails or if raw_llm_output not part of draft_fp
+                    raw_llm_output_for_json_polish = draft_fp.get("raw_llm_output_for_json_polish", json.dumps(draft_fp_for_divot5))
+
+                    refined_output_kvs_str = get_divot5_refined_output(
+                        code_snippet=snippet,
+                        raw_fingerprint_dict=draft_fp_for_divot5,
+                        model_path=self.divot5_model_path,
+                        num_denoising_steps=self.divot5_num_denoising_steps,
+                        device=self.divot5_device,
+                        verbose=self.deepseek_verbose
+                    )
+
+                    string_to_polish_for_json = refined_output_kvs_str if refined_output_kvs_str else raw_llm_output_for_json_polish
+
+                    # 4. DeepSeek JSON Polish
+                    polished_json_str = None
+                    if string_to_polish_for_json: # Ensure there's something to polish
+                        polished_json_str = get_deepseek_polished_json(
+                            cleaned_key_value_string=string_to_polish_for_json,
+                            model_path=self.deepseek_model_path,
+                            n_gpu_layers=self.deepseek_n_gpu_layers,
+                            verbose=self.deepseek_verbose
+                        )
+
+                    if polished_json_str:
+                        try:
+                            parsed_json = json.loads(polished_json_str)
+                            expected_keys = {"indent", "quotes", "linelen", "snake_pct", "camel_pct", "screaming_pct", "docstyle"}
+                            if isinstance(parsed_json, dict) and expected_keys.issubset(parsed_json.keys()):
+                                ai_fingerprint_result.update(parsed_json)
+                                ai_fingerprint_result["validation_status"] = "passed"
+                                ai_fingerprint_result["_raw_draft_fp"] = draft_fp
+                                ai_fingerprint_result["_raw_refined_kvs"] = refined_output_kvs_str
+                                ai_fingerprint_result["_raw_polished_json"] = polished_json_str
+                            else:
+                                error_message_for_sample = "Polished JSON lacks expected structure or keys."
+                                ai_fingerprint_result.update(draft_fp)
+                                ai_fingerprint_result["error"] = (draft_fp.get("error") or "") + " | Additionally: " + error_message_for_sample
+                                ai_fingerprint_result["validation_status"] = "failed_json_validation"
+                                ai_fingerprint_result["_raw_polished_json_FAILURE"] = polished_json_str
+                        except json.JSONDecodeError as je:
+                            error_message_for_sample = f"Failed to parse polished JSON: {je}"
+                            ai_fingerprint_result.update(draft_fp)
+                            ai_fingerprint_result["error"] = (draft_fp.get("error") or "") + " | Additionally: " + error_message_for_sample
+                            ai_fingerprint_result["validation_status"] = "failed_json_parsing"
+                            ai_fingerprint_result["_raw_polished_json_FAILURE"] = polished_json_str
+                    else:
+                        error_message_for_sample = "JSON polishing by LLM failed or no input."
+                        if not string_to_polish_for_json: error_message_for_sample = "No valid string (draft/refined) to polish for JSON."
+                        elif refined_output_kvs_str is None and draft_fp_for_divot5: error_message_for_sample += " (DivoT5 refinement also failed)."
+
+                        ai_fingerprint_result.update(draft_fp)
+                        ai_fingerprint_result["error"] = (draft_fp.get("error") or "") + " | Additionally: " + error_message_for_sample
+                        ai_fingerprint_result["validation_status"] = "failed_json_polishing"
+
+            except Exception as e_orchestration:
+                error_message_for_sample = f"Orchestration exception in AI fingerprinting: {e_orchestration}"
+                ai_fingerprint_result["error"] = error_message_for_sample
+                ai_fingerprint_result["validation_status"] = "failed_orchestration"
 
             elements_in_file.append(CodeSample(
-                file_path=file_path, item_name=name, item_type=type_val,
-                code_snippet=snippet, start_line=start, end_line=end,
-                ai_fingerprint=ai_fp_dict, error_while_fingerprinting=error_msg,
-                file_size_kb=current_file_size_kb, # Add collected metadata
-                mod_timestamp=current_mod_timestamp  # Add collected metadata
+                file_path=file_path,
+                item_name=name,
+                item_type=type_val,
+                code_snippet=snippet,
+                start_line=start,
+                end_line=end,
+                ai_fingerprint=ai_fingerprint_result,
+                error_while_fingerprinting=error_message_for_sample if ai_fingerprint_result.get("validation_status") != "passed" else None,
+                file_size_kb=current_file_size_kb,
+                mod_timestamp=current_mod_timestamp
             ))
 
         return elements_in_file

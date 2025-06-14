@@ -7,21 +7,7 @@ from typing import Dict, Any, Optional, Tuple, List, Set
 
 # Assuming NAMING_CONVENTIONS_REGEX and is_identifier_matching_convention are importable
 # Adjust path based on final project structure.
-# For now, assume they might be moved or accessible.
-# from ..profiler.naming_conventions import NAMING_CONVENTIONS_REGEX, is_identifier_matching_convention
-# Placeholder for now if direct import is tricky in subtask:
-NAMING_CONVENTIONS_REGEX_PLACEHOLDER = {
-    "SNAKE_CASE": r"^[a-z_][a-z0-9_]*$",
-    "PASCAL_CASE": r"^[A-Z][a-zA-Z0-9]*$",
-    "CAMEL_CASE": r"^[a-z]+[A-Za-z0-9_]*$",
-    "UPPER_SNAKE_CASE": r"^[A-Z_][A-Z0-9_]*$",
-    "TEST_SNAKE_CASE": r"^test_[a-z_][a-z0-9_]*$",
-    "TEST_PASCAL_CASE": r"^Test[A-Z][a-zA-Z0-9]*$",
-}
-def is_identifier_matching_convention_placeholder(identifier: str, convention_name: str) -> bool:
-    if convention_name not in NAMING_CONVENTIONS_REGEX_PLACEHOLDER: return False
-    return bool(re.fullmatch(NAMING_CONVENTIONS_REGEX_PLACEHOLDER[convention_name], identifier))
-# END Placeholder
+from src.profiler.naming_conventions import NAMING_CONVENTIONS_REGEX, is_identifier_matching_convention
 
 # --- Name Conversion Helpers ---
 def to_snake_case(name: str) -> str:
@@ -62,7 +48,7 @@ class IdentifierRenamingTransformer(cst.CSTTransformer):
         # For collision avoidance (simplified): track renames in current processing unit (module)
         # This doesn't handle cross-file or complex shadowing.
         self.renamed_in_module: Dict[str, str] = {}
-        # TODO: More sophisticated scope handling using self.get_metadata(ScopeProvider, node)
+        # TODO: Implement full scope-aware renaming for variables and parameters in leave_Name using ScopeProvider. Currently, only function and class names are renamed.
 
     def _get_target_convention(self, identifier_type: str) -> Optional[Tuple[str, str]]:
         return self.active_rules.get(identifier_type)
@@ -89,8 +75,7 @@ class IdentifierRenamingTransformer(cst.CSTTransformer):
         current_name = original_node.value
 
         # Use the placeholder or imported version of is_identifier_matching_convention
-        # For subtask, using placeholder:
-        if not is_identifier_matching_convention_placeholder(current_name, target_convention_name):
+        if not is_identifier_matching_convention(current_name, target_convention_name): # MODIFIED
             # Check if it matches a dunder pattern, if so, usually leave it.
             if re.fullmatch(r"__([a-zA-Z0-9_]+)__", current_name):
                 return updated_node
@@ -114,7 +99,7 @@ class IdentifierRenamingTransformer(cst.CSTTransformer):
         target_convention_name, target_regex = target_conv_info
         current_name = original_node.value
 
-        if not is_identifier_matching_convention_placeholder(current_name, target_convention_name):
+        if not is_identifier_matching_convention(current_name, target_convention_name): # MODIFIED
             new_name = self._convert_name(current_name, target_convention_name)
             if new_name != current_name:
                 print(f"Renaming class: '{current_name}' -> '{new_name}' (to {target_convention_name})")
