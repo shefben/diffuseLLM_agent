@@ -445,33 +445,62 @@ class CommitBuilder:
         changelog_text = self.generate_changelog_entry(spec, diff_summary)
         if self.verbose: print(f"CommitBuilder: Generated changelog (length {len(changelog_text)} chars).")
 
-        # --- Determine Output Base Directory ---
+        # --- Construct Full Commit Message ---
+        full_commit_message = f"""{commit_title}
+
+{changelog_text}
+
+---
+Validator Results:
+{validator_results_summary}
+---
+Patch Source: {patch_source if patch_source else 'Unknown'}
+"""
+        if self.verbose: print(f"CommitBuilder: Constructed full commit message (length {len(full_commit_message)} chars).")
+
+        # --- Call submit_via_git ---
+        if self.verbose: print("CommitBuilder: Attempting Git submission...")
+        git_submission_successful = self.submit_via_git(
+            branch_name=branch_name,
+            full_commit_message=full_commit_message,
+            formatted_content_map=formatted_content_map, # Ensure this map has project-relative Path keys
+            project_root=project_root
+        )
+
+        # --- Determine Output Base Directory & Save Patch Artifacts (Always) ---
         output_base_dir: Path
         if self.output_base_dir_config:
             output_base_dir = Path(self.output_base_dir_config)
         else:
             output_base_dir = project_root / ".autopatches" # Default if not in config
 
-        # --- Save Patch to Filesystem ---
-        if self.verbose: print(f"CommitBuilder: Initiating save to filesystem. Base dir: {output_base_dir}, Patch set name: {branch_name}")
-
-        saved_patch_dir = self.save_patch_to_filesystem(
+        if self.verbose: print(f"CommitBuilder: Initiating save of patch artifacts to filesystem. Base dir: {output_base_dir}, Patch set name: {branch_name}")
+        saved_artifact_path = self.save_patch_to_filesystem(
             output_base_dir_param=output_base_dir,
             patch_set_name=branch_name,
             formatted_content_map=formatted_content_map,
-            changelog_entry=changelog_text,
+            changelog_entry=changelog_text, # Could also pass full_commit_message or parts if preferred for changelog file
             spec=spec,
             commit_title=commit_title,
             validator_results_summary=validator_results_summary,
-            patch_source=patch_source # Pass through
+            patch_source=patch_source
         )
-
-        if saved_patch_dir:
-            print(f"CommitBuilder: Patch set successfully saved to: {saved_patch_dir}")
+        if saved_artifact_path:
+            if self.verbose: print(f"CommitBuilder: Patch artifacts successfully saved to: {saved_artifact_path}")
         else:
-            print(f"CommitBuilder: Failed to save patch set '{branch_name}'.")
+            # This is a warning because the primary goal might be Git submission.
+            # However, if saving artifacts is critical, this could influence the overall success.
+            print(f"CommitBuilder Warning: Failed to save patch artifacts for '{branch_name}'.")
 
-        return saved_patch_dir
+
+        # --- Conditional Return Value ---
+        if not git_submission_successful:
+            print(f"CommitBuilder Error: Git submission failed for branch '{branch_name}'. Patch artifacts might be at {saved_artifact_path if saved_artifact_path else 'N/A'}.")
+            return None # Signal overall failure to PhasePlanner
+
+        # If Git submission was successful, return the path to the saved artifacts
+        # (which could be None if artifact saving failed, but Git was primary goal)
+        return saved_artifact_path
 
 if __name__ == '__main__':
     print("--- CommitBuilder Example Usage (Conceptual) ---")
