@@ -41,8 +41,9 @@ class SignatureTrie:
             signature_str: The canonical signature string to search for.
 
         Returns:
-            A list of FQNs associated with the signature. Returns an empty list
-            if the signature is not found or if it's a prefix but not a complete signature.
+            List[str]: A list of FQNs associated with the signature. Returns an empty list
+            if the signature is not found or if it's a prefix but not a complete signature
+            (i.e., the node reached by the signature string does not mark the end of any stored signature).
         """
         node = self.root
         for char in signature_str:
@@ -50,12 +51,12 @@ class SignatureTrie:
                 return [] # Signature not found
             node = node.children[char]
 
-        # Return list from the set for a consistent return type
-        # For duplicate guard, we need a boolean indicating presence.
-        print(f"SignatureTrie: Searching for signature: {signature_str}")
-
-        # Original logic modified to return boolean
-        return bool(node.function_fqns)
+        # If node.function_fqns is not empty, it means this node marks the end of one or more signatures.
+        # Otherwise, it's just a prefix or not a valid end.
+        if node.function_fqns:
+            return list(node.function_fqns)
+        else:
+            return []
 
     def starts_with(self, prefix_str: str) -> bool:
         """
@@ -248,17 +249,21 @@ if __name__ == '__main__':
     trie.insert(sig2, fqn2)
     trie.insert(sig3, fqn3)
 
-    print(f"Search for '{sig1}': {trie.search(sig1)}")
-    # Expected: sorted list like ['module_a.MyClass.my_func', 'module_b.my_func_alias']
+    search_sig1_result = trie.search(sig1)
+    print(f"Search for '{sig1}': {sorted(search_sig1_result)}") # Sort for consistent test output
+    assert sorted(search_sig1_result) == sorted([fqn1_a, fqn1_b])
 
-    print(f"Search for '{sig2}': {trie.search(sig2)}")
-    # Expected: ['module_a.MyClass.my_other_func']
+    search_sig2_result = trie.search(sig2)
+    print(f"Search for '{sig2}': {search_sig2_result}")
+    assert search_sig2_result == [fqn2]
 
-    print(f"Search for 'my_func(int,str)': {trie.search('my_func(int,str)')}") # Prefix, not full sig
-    # Expected: [] (because function_fqns set would be empty if it's only a prefix)
+    search_prefix_result = trie.search('my_func(int,str)') # Prefix, not full sig
+    print(f"Search for 'my_func(int,str)': {search_prefix_result}")
+    assert search_prefix_result == []
 
-    print(f"Search for 'non_existent_sig': {trie.search('non_existent_sig')}")
-    # Expected: []
+    search_non_existent_result = trie.search('non_existent_sig')
+    print(f"Search for 'non_existent_sig': {search_non_existent_result}")
+    assert search_non_existent_result == []
 
     print(f"Starts with 'my_func(int,s': {trie.starts_with('my_func(int,s')}") # True
     print(f"Starts with 'my_func(int,x': {trie.starts_with('my_func(int,x')}") # False
@@ -266,7 +271,9 @@ if __name__ == '__main__':
 
     # Test empty signature string
     trie.insert("", "module_root_func_no_sig_name")
-    print(f"Search for empty signature '': {trie.search('')}")
+    search_empty_sig_result = trie.search('')
+    print(f"Search for empty signature '': {search_empty_sig_result}")
+    assert search_empty_sig_result == ["module_root_func_no_sig_name"]
     print(f"Starts with empty signature '': {trie.starts_with('')}") # True (root node exists)
 
     # Test search on a prefix node that is not an end of a word

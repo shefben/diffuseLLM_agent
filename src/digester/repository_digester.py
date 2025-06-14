@@ -7,6 +7,20 @@ import sys
 import os
 import re # For CallGraphVisitor._resolve_callee_fqn
 from collections import defaultdict
+import collections # Added for deque in get_call_graph_slice
+
+# Watchdog imports
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileModifiedEvent, FileCreatedEvent, FileDeletedEvent, FileMovedEvent
+except ImportError:
+    Observer = None # type: ignore
+    FileSystemEventHandler = None # type: ignore
+    FileModifiedEvent = None # type: ignore
+    FileCreatedEvent = None # type: ignore
+    FileDeletedEvent = None # type: ignore
+    FileMovedEvent = None # type: ignore
+    print("Warning: watchdog library not found. File system event monitoring will be disabled.")
 
 # SentenceTransformer and numpy imports
 try:
@@ -73,6 +87,70 @@ class ParsedFileResult:
     treesitter_error_message: Optional[str] = None
     type_info: Optional[Dict[str, Any]] = None
     extracted_symbols: List[Dict[str, Any]] = field(default_factory=list)
+
+
+if FileSystemEventHandler: # Only define if watchdog was imported
+    class DigesterFileSystemEventHandler(FileSystemEventHandler): # type: ignore
+        def __init__(self, digester_instance: 'RepositoryDigester'):
+            super().__init__()
+            self.digester_instance = digester_instance
+            self._ignore_dirs = {".venv", "venv", ".git", "__pycache__", "node_modules", ".env", "env"} # Common dirs to ignore events from
+
+        def _is_relevant_path(self, path_str: str) -> bool:
+            p = Path(path_str)
+            if not p.name.endswith(".py"):
+                return False
+            try:
+                # Check if any part of the path relative to repo root is in ignore_dirs
+                # This assumes digester_instance.repo_path is available and absolute
+                relative_to_repo = p.relative_to(self.digester_instance.repo_path)
+                if any(part in self._ignore_dirs for part in relative_to_repo.parts[:-1]): # Check parent directories
+                    return False
+            except ValueError: # Path is not under repo_path, or other issue
+                return False # Should not happen if watchdog is watching repo_path
+            return True
+
+        def dispatch(self, event):
+            # Filter non-.py files and events from ignored directories before specific handlers are called
+            if event.is_directory: # Ignore directory events
+                return
+
+            # For moved events, check both src and dest if applicable
+            # Only dispatch further if at least one of the paths is relevant
+            if isinstance(event, FileMovedEvent): # type: ignore
+                if not self._is_relevant_path(event.src_path) and not self._is_relevant_path(event.dest_path):
+                    return
+            elif not self._is_relevant_path(event.src_path): # For other events, check src_path
+                return
+
+            # If relevant, call the original dispatch to route to on_modified etc.
+            super().dispatch(event)
+
+
+        def on_created(self, event: FileCreatedEvent): # type: ignore
+            # is_relevant_path check is implicitly handled by dispatch now
+            if not event.is_directory: # Redundant check, but safe
+                if self.digester_instance.verbose: print(f"Watchdog: Detected creation: {event.src_path}")
+                self.digester_instance.handle_file_event("created", Path(event.src_path))
+
+        def on_modified(self, event: FileModifiedEvent): # type: ignore
+            if not event.is_directory:
+                if self.digester_instance.verbose: print(f"Watchdog: Detected modification: {event.src_path}")
+                self.digester_instance.handle_file_event("modified", Path(event.src_path))
+
+        def on_deleted(self, event: FileDeletedEvent): # type: ignore
+            if not event.is_directory:
+                if self.digester_instance.verbose: print(f"Watchdog: Detected deletion: {event.src_path}")
+                self.digester_instance.handle_file_event("deleted", Path(event.src_path))
+
+        def on_moved(self, event: FileMovedEvent): # type: ignore
+            if not event.is_directory:
+                if self.digester_instance.verbose: print(f"Watchdog: Detected move: {event.src_path} to {event.dest_path}")
+                self.digester_instance.handle_file_event("moved", Path(event.src_path), Path(event.dest_path))
+else: # Fallback if FileSystemEventHandler is None
+    class DigesterFileSystemEventHandler: # type: ignore
+            def __init__(self, digester_instance: 'RepositoryDigester'): pass
+
 
 class SymbolAndSignatureExtractorVisitor(ast.NodeVisitor): # Renamed
     def __init__(self, module_qname: str, file_path_str: str,
@@ -1063,6 +1141,8 @@ class RepositoryDigester:
         self.project_control_dependence_graph: ControlDependenceGraph = {}
         self.project_data_dependence_graph: DataDependenceGraph = defaultdict(set)
         self.signature_trie = SignatureTrie()
+        self.fqn_to_symbol_map: Dict[NodeID, Dict[str, Any]] = {}
+        self.observer: Optional[Observer] = None # For watchdog
 
         self._faiss_dirty_flag: bool = False # Initialize FAISS dirty flag
 
@@ -1530,6 +1610,24 @@ class RepositoryDigester:
                 if parsed_result.source_code:
                     self._build_data_dependencies_for_file(py_file, parsed_result)
 
+            # Populate fqn_to_symbol_map for the current file
+            if parsed_result.extracted_symbols:
+                for symbol_dict in parsed_result.extracted_symbols:
+                    fqn = symbol_dict.get('fqn')
+                    if fqn:
+                        symbol_node_id = NodeID(fqn)
+                        details = {
+                            'fqn': fqn,
+                            'file_path': str(symbol_dict.get('file_path')), # Ensure str
+                            'start_line': symbol_dict.get('start_line'),
+                            'end_line': symbol_dict.get('end_line'),
+                            'item_type': symbol_dict.get('item_type'),
+                        }
+                        if 'signature_str' in symbol_dict: # Only add if present
+                            details['signature_str'] = symbol_dict['signature_str']
+                        self.fqn_to_symbol_map[symbol_node_id] = details
+
+
         # --- NEW: Embedding Generation for all collected symbols ---
         if self.embedding_model and np:
             print("RepositoryDigester: Starting embedding generation...")
@@ -1684,7 +1782,7 @@ class RepositoryDigester:
                 else:
                     self.faiss_index = None
                 self.faiss_id_to_metadata = []
-        elif not all_embeddings_list:
+        elif not embeddings_to_rebuild_list:
             print("RepositoryDigester: No embeddings found to rebuild FAISS index.")
 
 
@@ -1693,6 +1791,22 @@ class RepositoryDigester:
         print(f"RepositoryDigester: Clearing data for file: {file_id_str_to_match}")
 
         old_parsed_result = self.digested_files.get(file_path)
+
+        # Clear from fqn_to_symbol_map
+        if old_parsed_result and old_parsed_result.extracted_symbols:
+            for symbol_info in old_parsed_result.extracted_symbols:
+                if 'fqn' in symbol_info:
+                    symbol_node_id = NodeID(symbol_info['fqn'])
+                    if symbol_node_id in self.fqn_to_symbol_map:
+                        try:
+                            del self.fqn_to_symbol_map[symbol_node_id]
+                            if self.verbose: print(f"    Digester: Removed FQN '{symbol_info['fqn']}' from fqn_to_symbol_map.")
+                        except KeyError: # Should not happen if check `in` is done
+                            if self.verbose: print(f"    Digester Warning: FQN '{symbol_info['fqn']}' was in keys but not deleted from fqn_to_symbol_map.")
+                    elif self.verbose:
+                         print(f"    Digester Info: FQN '{symbol_info['fqn']}' not found in fqn_to_symbol_map for removal.")
+
+
         if old_parsed_result and hasattr(old_parsed_result, 'extracted_symbols') and old_parsed_result.extracted_symbols and hasattr(self, 'signature_trie'):
             if self.verbose: print(f"  Digester: Clearing signatures from trie for file: {file_id_str_to_match}")
             for symbol_info in old_parsed_result.extracted_symbols:
@@ -1747,6 +1861,23 @@ class RepositoryDigester:
 
         parsed_result = self.parse_file(file_path)
         self.digested_files[file_path] = parsed_result
+
+        # Populate fqn_to_symbol_map for the new/updated file's symbols
+        if parsed_result.extracted_symbols:
+            for symbol_dict in parsed_result.extracted_symbols:
+                if 'fqn' in symbol_dict:
+                    symbol_node_id = NodeID(symbol_dict['fqn'])
+                    self.fqn_to_symbol_map[symbol_node_id] = {
+                        'fqn': symbol_dict['fqn'],
+                        'file_path': str(symbol_dict.get('file_path')), # Ensure str
+                        'start_line': symbol_dict.get('start_line'),
+                        'end_line': symbol_dict.get('end_line'),
+                        'item_type': symbol_dict.get('item_type'),
+                    }
+                    if 'signature_str' in symbol_dict: # Only add if present
+                        details['signature_str'] = symbol_dict['signature_str']
+                    self.fqn_to_symbol_map[symbol_node_id] = details
+            if self.verbose: print(f"  Digester: Updated fqn_to_symbol_map for {file_path.name} with {len(parsed_result.extracted_symbols)} symbols.")
 
         if parsed_result.source_code and (parsed_result.libcst_module or parsed_result.treesitter_tree):
             py_ast_for_graphs: Optional[ast.Module] = None
@@ -2237,6 +2368,137 @@ class RepositoryDigester:
 
             print(f"RepositoryDigester Warning: File content not found for {abs_file_path}. It might not be a tracked Python file or wasn't digested.")
             return None
+
+    def start_watchdog_observer(self) -> None:
+        if not Observer or not FileSystemEventHandler: # Check if watchdog is available
+            print("RepositoryDigester: Watchdog components not available. Cannot start observer.")
+            return
+
+        if self.observer and self.observer.is_alive():
+            if self.verbose: print("RepositoryDigester: Watchdog observer is already running.")
+            return
+
+        event_handler = DigesterFileSystemEventHandler(self)
+        self.observer = Observer()
+        self.observer.schedule(event_handler, str(self.repo_path), recursive=True)
+
+        try:
+            self.observer.start()
+            if self.verbose: print(f"RepositoryDigester: Watchdog observer started on {self.repo_path}.")
+        except Exception as e:
+            print(f"RepositoryDigester Error: Failed to start watchdog observer: {e}")
+            self.observer = None # Ensure observer is None if start fails
+
+    def stop_watchdog_observer(self) -> None:
+        if not Observer: # Check if watchdog is available
+            return
+
+        if self.observer and self.observer.is_alive():
+            try:
+                self.observer.stop()
+                self.observer.join(timeout=5) # Add a timeout to join
+                if self.observer.is_alive():
+                    print("RepositoryDigester Warning: Watchdog observer thread did not join in time.")
+                else:
+                     if self.verbose: print("RepositoryDigester: Watchdog observer stopped.")
+            except Exception as e:
+                print(f"RepositoryDigester Error: Exception while stopping watchdog observer: {e}")
+            finally:
+                self.observer = None
+        elif self.verbose:
+            print("RepositoryDigester: Watchdog observer is not running or not initialized.")
+
+    def get_call_graph_slice(self, target_fqn_str: str, depth: int = 1, include_reverse: bool = True) -> Dict[str, Any]:
+        """
+        Retrieves a slice of the call graph around a target FQN.
+
+        Args:
+            target_fqn_str: The Fully Qualified Name (FQN) of the target function/method.
+            depth: The maximum depth for outgoing and incoming calls to explore.
+            include_reverse: Whether to include incoming calls (callers) to the nodes in the slice.
+
+        Returns:
+            A dictionary containing 'nodes' and 'edges' of the call graph slice, and 'info'.
+            Nodes include details from fqn_to_symbol_map if available.
+        """
+        target_node_id = NodeID(target_fqn_str)
+        slice_nodes: Dict[NodeID, Dict[str, Any]] = {}
+        slice_edges: List[Dict[str, Any]] = []
+
+        # Use collections.deque for efficient queue operations
+        queue = collections.deque([(target_node_id, 0)])
+        visited_fqns = {target_node_id}
+        info_parts = [f"Call graph slice for {target_fqn_str} (depth {depth}, reverse {include_reverse}):"]
+
+        edge_set = set() # To avoid duplicate edges
+
+        while queue:
+            current_node_id, current_d = queue.popleft()
+
+            # Process current_node_id (add to slice_nodes if not already)
+            if current_node_id not in slice_nodes:
+                details = self.fqn_to_symbol_map.get(current_node_id)
+                if details:
+                    slice_nodes[current_node_id] = details.copy()
+                else:
+                    slice_nodes[current_node_id] = {
+                        "fqn": str(current_node_id),
+                        "item_type": "external_symbol", # Or determine if it's a known lib
+                        "file_path": "N/A",
+                        "start_line": 0,
+                        "external": True
+                    }
+
+            if current_d < depth:
+                # Explore Outgoing Calls
+                if current_node_id in self.project_call_graph:
+                    for callee_node_id in self.project_call_graph[current_node_id]:
+                        if callee_node_id not in slice_nodes:
+                            callee_details = self.fqn_to_symbol_map.get(callee_node_id)
+                            if callee_details:
+                                slice_nodes[callee_node_id] = callee_details.copy()
+                            else:
+                                slice_nodes[callee_node_id] = {
+                                    "fqn": str(callee_node_id), "item_type": "external_symbol",
+                                    "file_path": "N/A", "start_line": 0, "external": True
+                                }
+
+                        edge = (str(current_node_id), str(callee_node_id))
+                        if edge not in edge_set:
+                            slice_edges.append({"from": str(current_node_id), "to": str(callee_node_id), "type": "calls"})
+                            edge_set.add(edge)
+
+                        if callee_node_id not in visited_fqns:
+                            visited_fqns.add(callee_node_id)
+                            queue.append((callee_node_id, current_d + 1))
+
+                # Explore Incoming Calls (if include_reverse)
+                if include_reverse:
+                    for caller_node_id, callees_set in self.project_call_graph.items():
+                        if current_node_id in callees_set: # caller_node_id calls current_node_id
+                            if caller_node_id not in slice_nodes:
+                                caller_details = self.fqn_to_symbol_map.get(caller_node_id)
+                                if caller_details:
+                                    slice_nodes[caller_node_id] = caller_details.copy()
+                                else:
+                                    slice_nodes[caller_node_id] = {
+                                        "fqn": str(caller_node_id), "item_type": "external_symbol",
+                                        "file_path": "N/A", "start_line": 0, "external": True
+                                    }
+
+                            edge = (str(caller_node_id), str(current_node_id))
+                            if edge not in edge_set:
+                                slice_edges.append({"from": str(caller_node_id), "to": str(current_node_id), "type": "calls"})
+                                edge_set.add(edge)
+
+                            if caller_node_id not in visited_fqns:
+                                visited_fqns.add(caller_node_id)
+                                queue.append((caller_node_id, current_d + 1))
+
+        final_nodes_list = list(slice_nodes.values())
+        info_parts.append(f"Found {len(final_nodes_list)} nodes and {len(slice_edges)} edges.")
+
+        return {"nodes": final_nodes_list, "edges": slice_edges, "info": " ".join(info_parts)}
 
 
 if __name__ == '__main__':
