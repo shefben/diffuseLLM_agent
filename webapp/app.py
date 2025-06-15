@@ -1,12 +1,11 @@
 from flask import Flask, render_template, request
 import sys
 from pathlib import Path
+import json  # For json.dumps as a fallback for displaying objects
 
 # Add project root to sys.path to allow imports from src
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
-
-import json  # For json.dumps as a fallback for displaying objects
 
 # Conditional imports for project modules, handle if not found during early setup
 try:
@@ -15,14 +14,24 @@ try:
     from src.planner.phase_planner import PhasePlanner
     from src.planner.spec_model import Spec
     from src.profiler.orchestrator import run_phase1_style_profiling_pipeline
+    from src.utils.memory_logger import load_success_memory
 except ImportError as e:
     print(
         f"Error importing project modules in webapp/app.py: {e}. Ensure PROJECT_ROOT is correct and src modules are accessible."
     )
-    load_app_config = lambda *a, **k: {"error": "load_app_config failed"}
-    RepositoryDigester = lambda *a, **k: {"error": "RepositoryDigester failed"}  # type: ignore
-    PhasePlanner = lambda *a, **k: {"error": "PhasePlanner failed"}  # type: ignore
-    run_phase1_style_profiling_pipeline = lambda *a, **k: {"error": "profiling failed"}  # type: ignore
+
+    def load_app_config(*_a, **_k):
+        return {"error": "load_app_config failed"}
+
+    def RepositoryDigester(*_a, **_k):  # type: ignore
+        return {"error": "RepositoryDigester failed"}
+
+    def PhasePlanner(*_a, **_k):  # type: ignore
+        return {"error": "PhasePlanner failed"}
+
+    def run_phase1_style_profiling_pipeline(*_a, **_k):  # type: ignore
+        return {"error": "profiling failed"}
+
     Spec = dict  # Placeholder type
 
 app = Flask(__name__)
@@ -172,6 +181,23 @@ def index():
         plan_data=None,
         error_message=None,
     )
+
+
+@app.route("/memory")
+def view_memory():
+    """Display recent success memory entries."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
+        data_dir = project_root / data_dir
+    entries = load_success_memory(data_dir)
+    recent_entries = entries[-20:]
+    return render_template("memory.html", entries=recent_entries)
 
 
 if __name__ == "__main__":

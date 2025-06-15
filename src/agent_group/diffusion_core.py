@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import re
 import textwrap  # Added for intelligent indentation
 
@@ -80,6 +80,7 @@ class DiffusionCore:
 
         infill_model_path: Optional[str] = None
         can_infill = False
+        llm_infill_available = False
 
         if infill_type == "gguf":
             infill_model_path = self.app_config.get("models", {}).get(
@@ -89,6 +90,7 @@ class DiffusionCore:
                 ),
             )
             can_infill = get_llm_code_infill is not None and bool(infill_model_path)
+            llm_infill_available = can_infill
             if not can_infill and self.verbose:
                 if get_llm_code_infill is None:
                     print(
@@ -102,6 +104,7 @@ class DiffusionCore:
                 DEFAULT_APP_CONFIG["models"]["divot5_infill_model_dir"],
             )
             can_infill = get_divot5_code_infill is not None and bool(infill_model_path)
+            llm_infill_available = can_infill
             if not can_infill and self.verbose:
                 if get_divot5_code_infill is None:
                     print("DiffusionCore Info: get_divot5_code_infill not available.")
@@ -339,7 +342,7 @@ Provide only the code snippet to replace `{hole_marker}`:"""
                 f"  Verbose: Proposed fix script (preview): {proposed_script_preview}"
             )
         else:
-            print(f"DiffusionCore.re_denoise_spans called.")
+            print("DiffusionCore.re_denoise_spans called.")
 
         if proposed_fix_script and proposed_fix_script.startswith(
             "# Original script commented out due to DUPLICATE_DETECTED"
