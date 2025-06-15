@@ -5,10 +5,10 @@ from typing import (
     Tuple,
     Callable,
     Optional,
-    List,
-)  # Added List
+)
 from pathlib import Path
 import difflib  # Added for diff generation
+import json
 
 # Local imports
 from .exceptions import PhaseFailure  # New import
@@ -146,7 +146,7 @@ class CollaborativeAgentGroup:
             # Node is the annotation node itself if category is 'return_annotation'
             # Node is ast.arg if category is parameter-related.
             annotation_node = None
-            if category_hint.endswith("return_annotation"):
+            if hint_category.endswith("return_annotation"):
                 annotation_node = node  # node is the annotation itself
             elif hasattr(node, "annotation") and node.annotation:
                 annotation_node = node.annotation
@@ -165,7 +165,7 @@ class CollaborativeAgentGroup:
                 ):  # Attempt to unparse more complex annotations
                     try:
                         return ast.unparse(annotation_node)
-                    except:
+                    except Exception:
                         pass  # Fall through if unparse fails
                 # For older Pythons or complex types not handled by unparse if simple,
                 # a more basic representation might be needed, or just default to Any.
