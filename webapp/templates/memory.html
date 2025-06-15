@@ -15,12 +15,13 @@
     <div class="container">
         <h1>Recent Successful Patches</h1>
         <table>
-            <tr><th>Timestamp</th><th>Issue</th><th>Patch Source</th></tr>
+            <tr><th>Timestamp</th><th>Issue</th><th>Patch Source</th><th>Diff Summary</th></tr>
             {% for e in entries %}
             <tr>
                 <td>{{ e.timestamp_utc }}</td>
                 <td>{{ e.spec_issue_description }}</td>
                 <td>{{ e.patch_source }}</td>
+                <td><pre>{{ e.successful_diff_summary[:120] }}</pre></td>
             </tr>
             {% endfor %}
         </table>
