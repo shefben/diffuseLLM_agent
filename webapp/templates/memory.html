@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Success Memory</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { border: 1px solid #ddd; padding: 8px; }
+        th { background-color: #eee; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Recent Successful Patches</h1>
+        <table>
+            <tr><th>Timestamp</th><th>Issue</th><th>Patch Source</th><th>Diff Summary</th></tr>
+            {% for e in entries %}
+            <tr>
+                <td>{{ e.timestamp_utc }}</td>
+                <td>{{ e.spec_issue_description }}</td>
+                <td>{{ e.patch_source }}</td>
+                <td><pre>{{ e.successful_diff_summary[:120] }}</pre></td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+</body>
+</html>
