@@ -1911,8 +1911,22 @@ class RepositoryDigester:
 
         old_parsed_result = self.digested_files.get(file_path)
 
-        # Clear from fqn_to_symbol_map
+        module_qname = self._get_module_qname_from_path(file_path, self.repo_path)
+        module_node_id = NodeID(module_qname)
+
+        # Clear project_module_imports
+        if module_node_id in self.project_module_imports:
+            del self.project_module_imports[module_node_id]
+            if self.verbose: print(f"  Cleared module imports for {module_qname}.")
+
+        # Clear project_symbol_imports
+        if module_node_id in self.project_symbol_imports:
+            del self.project_symbol_imports[module_node_id]
+            if self.verbose: print(f"  Cleared symbol imports for {module_qname}.")
+
+        # Clear from fqn_to_symbol_map, signature_trie, and project_inheritance_graph
         if old_parsed_result and old_parsed_result.extracted_symbols:
+            cleared_classes_count_for_inheritance = 0
             for symbol_info in old_parsed_result.extracted_symbols:
                 if 'fqn' in symbol_info:
                     symbol_node_id = NodeID(symbol_info['fqn'])
@@ -1925,11 +1939,34 @@ class RepositoryDigester:
                     elif self.verbose:
                          print(f"    Digester Info: FQN '{symbol_info['fqn']}' not found in fqn_to_symbol_map for removal.")
 
+                # Clear from signature_trie (existing logic, combined into this loop)
+                if hasattr(self, 'signature_trie'): # Check if signature_trie exists
+                    signature_to_delete = symbol_info.get("signature_str")
+                    fqn_of_symbol_for_trie = symbol_info.get("fqn") # fqn is already retrieved above
+                    item_type_for_trie = symbol_info.get("item_type", "")
+                    if item_type_for_trie.endswith("_code") and ("function_code" in item_type_for_trie or "method_code" in item_type_for_trie):
+                        if signature_to_delete and fqn_of_symbol_for_trie:
+                            deleted_from_trie = self.signature_trie.delete(signature_to_delete, fqn_of_symbol_for_trie)
+                            if self.verbose and deleted_from_trie:
+                                print(f"    Digester: Deleted signature '{signature_to_delete}' for FQN '{fqn_of_symbol_for_trie}' from trie.")
 
-        if old_parsed_result and hasattr(old_parsed_result, 'extracted_symbols') and old_parsed_result.extracted_symbols and hasattr(self, 'signature_trie'):
-            if self.verbose: print(f"  Digester: Clearing signatures from trie for file: {file_id_str_to_match}")
-            for symbol_info in old_parsed_result.extracted_symbols:
-                signature_to_delete = symbol_info.get("signature_str")
+                # Clear from project_inheritance_graph (new logic)
+                if symbol_info.get("item_type") == "class_code":
+                    class_fqn_for_inheritance = symbol_info.get("fqn")
+                    if class_fqn_for_inheritance:
+                        class_node_id_for_inheritance = NodeID(class_fqn_for_inheritance)
+                        if class_node_id_for_inheritance in self.project_inheritance_graph:
+                            del self.project_inheritance_graph[class_node_id_for_inheritance]
+                            cleared_classes_count_for_inheritance += 1
+
+            if self.verbose and cleared_classes_count_for_inheritance > 0:
+                print(f"  Cleared inheritance graph entries for {cleared_classes_count_for_inheritance} classes from {module_qname}.")
+
+        # This block for clearing signature_trie separately is now redundant due to above integration
+        # if old_parsed_result and hasattr(old_parsed_result, 'extracted_symbols') and old_parsed_result.extracted_symbols and hasattr(self, 'signature_trie'):
+        #     if self.verbose: print(f"  Digester: Clearing signatures from trie for file: {file_id_str_to_match}")
+        #     for symbol_info in old_parsed_result.extracted_symbols:
+        #         signature_to_delete = symbol_info.get("signature_str")
                 fqn_of_symbol = symbol_info.get("fqn")
                 item_type = symbol_info.get("item_type", "")
 
@@ -1945,10 +1982,12 @@ class RepositoryDigester:
                                 # or if it was already pruned due to another FQN removal.
                                 print(f"    Digester Info: Signature '{signature_to_delete}' for FQN '{fqn_of_symbol}' not found for direct removal or already pruned.")
                     elif self.verbose:
-                        print(f"    Digester Info: Symbol {fqn_of_symbol} of type {item_type} missing signature_str for trie deletion.")
-        elif self.verbose:
-            print(f"  Digester: No symbols or signature trie found for {file_id_str_to_match}, skipping signature cleanup.")
-
+                        # This print was part of the old block, now covered by general trie deletion log if verbose
+                        # print(f"    Digester Info: Symbol {fqn_of_symbol} of type {item_type} missing signature_str for trie deletion.")
+        # The verbose message for no symbols/trie for cleanup will be implicitly handled if the main loop isn't entered or if trie isn't present.
+        # else: # This was part of the separate signature_trie block
+        #    if self.verbose:
+        #        print(f"  Digester: No symbols or signature trie found for {file_id_str_to_match}, skipping signature cleanup.")
 
         graphs_to_clean = [
             self.project_call_graph,
@@ -1969,7 +2008,13 @@ class RepositoryDigester:
 
         if file_path in self.digested_files:
             del self.digested_files[file_path]
-            print(f"  Removed {file_id_str_to_match} from digested_files.")
+            if self.verbose: print(f"  Removed {file_id_str_to_match} from digested_files cache.")
+
+        # TODO: The current cleanup for new KG structures (imports, inheritance) primarily removes
+        # entries where the current file is the 'source' (e.g., the importer, the derived class).
+        # A more thorough cleanup would also update other entries that might refer to entities
+        # from this file (e.g., remove this module from the import lists of other modules that imported it).
+        # For now, a full re-digest or re-parse of affected files handles this more broadly.
 
         print(f"RepositoryDigester: Data clearing for {file_id_str_to_match} completed (FAISS will be rebuilt after all changes).")
 
@@ -2619,16 +2664,106 @@ class RepositoryDigester:
 
         return {"nodes": final_nodes_list, "edges": slice_edges, "info": " ".join(info_parts)}
 
+    def get_imported_modules(self, module_fqn_str: str) -> Set[str]:
+        """Retrieves a set of FQN strings of modules directly imported by the given module."""
+        module_node_id = NodeID(module_fqn_str)
+        if module_node_id in self.project_module_imports:
+            # Convert NodeID objects in the set to strings for the return type
+            return {str(imported_module_nid) for imported_module_nid in self.project_module_imports[module_node_id]}
+        return set()
+
+    def get_imported_symbols_from_module(
+        self,
+        importing_module_fqn_str: str,
+        source_module_fqn_str: str
+    ) -> Set[str]:
+        """Retrieves a set of symbol names imported by 'importing_module' from 'source_module'."""
+        importing_module_node_id = NodeID(importing_module_fqn_str)
+        source_module_node_id = NodeID(source_module_fqn_str)
+
+        if importing_module_node_id in self.project_symbol_imports:
+            if source_module_node_id in self.project_symbol_imports[importing_module_node_id]:
+                return self.project_symbol_imports[importing_module_node_id][source_module_node_id].copy() # Return a copy
+        return set()
+
+    def get_all_symbol_imports_for_module(self, importing_module_fqn_str: str) -> Dict[str, Set[str]]:
+        """
+        Retrieves all 'from X import Y' style imports for a given module.
+        Returns a dict where keys are source module FQN strings and values are sets of imported symbol names.
+        """
+        importing_module_node_id = NodeID(importing_module_fqn_str)
+        results: Dict[str, Set[str]] = {}
+
+        if importing_module_node_id in self.project_symbol_imports:
+            for source_module_node_id, symbol_set in self.project_symbol_imports[importing_module_node_id].items():
+                results[str(source_module_node_id)] = symbol_set.copy() # Return a copy of the set
+        return results
+
+    def get_base_classes(self, derived_class_fqn_str: str) -> List[str]:
+        """
+        Retrieves a list of FQN strings of direct base classes for the given derived class.
+        The order in the list reflects the MRO as defined in the source.
+        """
+        derived_class_node_id = NodeID(derived_class_fqn_str)
+        if derived_class_node_id in self.project_inheritance_graph:
+            # Convert NodeID objects in the list to strings for the return type
+            return [str(base_class_nid) for base_class_nid in self.project_inheritance_graph[derived_class_node_id]]
+        return []
+
+    def get_derived_classes(self, base_class_fqn_str: str) -> Set[str]:
+        """Retrieves a set of FQN strings of classes that directly inherit from the given base class."""
+        base_class_node_id_to_find = NodeID(base_class_fqn_str)
+        derived_classes_fqns: Set[str] = set()
+
+        for derived_class_nid, base_class_nid_list in self.project_inheritance_graph.items():
+            if base_class_node_id_to_find in base_class_nid_list:
+                derived_classes_fqns.add(str(derived_class_nid))
+        return derived_classes_fqns
+
 
 if __name__ == '__main__':
     from src.utils.config_loader import load_app_config # Import for __main__
 
     current_script_dir = Path(__file__).parent
     dummy_repo = current_script_dir / "_temp_dummy_repo_for_digester_"
+    if dummy_repo.exists(): # Clean up before creating new files
+        import shutil
+        shutil.rmtree(dummy_repo)
     dummy_repo.mkdir(exist_ok=True)
-    (dummy_repo / "file1.py").write_text("def foo(x: int) -> str:\n    return str(x)\n")
-    (dummy_repo / "subdir").mkdir(exist_ok=True)
-    (dummy_repo / "subdir" / "file2.py").write_text("class Bar:\n    y: list[str] = []\n")
+
+    # Create subdir for subdir.file2
+    subdir_path = dummy_repo / "subdir"
+    subdir_path.mkdir(exist_ok=True)
+
+    # Updated dummy file contents
+    file1_content = """
+# file1.py
+import os
+from subdir.file2 import Bar # Import Bar
+
+class ParentA: pass
+class ChildA(ParentA, Bar): # ChildA inherits ParentA and Bar
+    def foo(self, x: int) -> str:
+        return str(x)
+
+def standalone_func():
+    local_bar = Bar()
+    return os.getcwd()
+"""
+    (dummy_repo / "file1.py").write_text(file1_content)
+
+    file2_content = """
+# subdir/file2.py
+class GrandParentB: pass
+class Bar(GrandParentB): # Bar inherits GrandParentB
+    y: list[str] = []
+    def __init__(self):
+        self.z = 10
+
+class AnotherInFile2: pass
+"""
+    (subdir_path / "file2.py").write_text(file2_content)
+
     (dummy_repo / "tests").mkdir(exist_ok=True)
     (dummy_repo / "tests" / "test_file.py").write_text("assert True")
 
@@ -2649,9 +2784,48 @@ if __name__ == '__main__':
     print("\nDigested file results (summary):")
     for file_path, result in digester.digested_files.items():
         print(f"  {file_path.name}:")
-        print(f"    LibCST Error: {result.libcst_error}")
-        print(f"    TreeSitter Has Errors: {result.treesitter_has_errors}")
-        print(f"    Type Info: {result.type_info}")
+        # print(f"    LibCST Error: {result.libcst_error}") # Too verbose for this demo
+        # print(f"    TreeSitter Has Errors: {result.treesitter_has_errors}")
+        # print(f"    Type Info: {result.type_info}") # Also verbose
+        print(f"    Extracted symbols: {len(result.extracted_symbols)}")
+
+
+    print("\n--- Knowledge Graph Queries ---")
+    # Derive FQNs using the digester's own method for consistency
+    file1_module_fqn = RepositoryDigester._get_module_qname_from_path(dummy_repo / "file1.py", dummy_repo)
+    file2_module_fqn = RepositoryDigester._get_module_qname_from_path(dummy_repo / "subdir" / "file2.py", dummy_repo)
+
+    # Module Imports
+    imported_modules = digester.get_imported_modules(file1_module_fqn)
+    print(f"\nModules imported by '{file1_module_fqn}': {imported_modules}")
+
+    symbols_from_file2 = digester.get_imported_symbols_from_module(file1_module_fqn, file2_module_fqn)
+    print(f"Symbols imported by '{file1_module_fqn}' from '{file2_module_fqn}': {symbols_from_file2}")
+
+    all_sym_imports = digester.get_all_symbol_imports_for_module(file1_module_fqn)
+    print(f"All symbol imports for '{file1_module_fqn}': {all_sym_imports}")
+
+    # Class Inheritance
+    child_a_fqn = f"{file1_module_fqn}.ChildA"
+    base_classes_of_child_a = digester.get_base_classes(child_a_fqn)
+    print(f"\nBase classes of '{child_a_fqn}': {base_classes_of_child_a}")
+
+    # Note: The FQN for Bar as a base class might be 'subdir.file2.Bar' or just 'Bar'
+    # depending on how ast.unparse resolves it in the context of file1.py.
+    # For demonstration, we'll query for Bar's known FQN.
+    bar_fqn = f"{file2_module_fqn}.Bar"
+    derived_from_bar = digester.get_derived_classes(bar_fqn)
+    print(f"Classes deriving from '{bar_fqn}': {derived_from_bar}")
+
+    grandparent_b_fqn = f"{file2_module_fqn}.GrandParentB"
+    derived_from_gpb = digester.get_derived_classes(grandparent_b_fqn)
+    print(f"Classes deriving from '{grandparent_b_fqn}': {derived_from_gpb}")
+
+    # Example of a class with no known derived classes in this dummy repo
+    parent_a_fqn = f"{file1_module_fqn}.ParentA"
+    derived_from_parent_a = digester.get_derived_classes(parent_a_fqn)
+    print(f"Classes deriving from '{parent_a_fqn}': {derived_from_parent_a}")
+
 
     paths_to_remove_main = []
     if str(dummy_repo.resolve()) in sys.path and str(dummy_repo.resolve()) not in original_sys_path_main :
