@@ -1,61 +1,60 @@
 # diffuseLLM_agent
-The project delivers a self-contained Python assistant that becomes an expert on any Python codebase you point it at.
 
-The assistant is a self-hosted Python toolchain whose only mission is to make a codebase evolve safely, quickly, and stylistically consistent—without asking a human to micromanage the details.
-At startup it turns every file in the repo into a rich, queryable knowledge graph that captures functions, classes, inferred types, call relationships, data-flow edges, docstrings, style conventions, and embeddings.
-From that moment on, the tool lives beside the code: when a developer phrases a feature request or bug report in plain English, the system translates the request into an exact spec, plans the modification, generates minimal patches that reuse existing helpers, validates them, auto-repairs small mistakes, and finally produces a ready-to-merge pull request.
-It achieves this on commodity hardware by combining three pillars:
+**diffuseLLM_agent** is a self‑hosted Python assistant that learns your project’s style and automatically generates validated patches. It couples a lightweight diffusion model with an ≤8B parameter LLM to keep resource usage modest while still producing high‑quality code.
 
-Static analysis and indexing that off-load structural reasoning away from neural models.
+At startup the assistant parses the entire repository, builds graphs of functions and types, infers naming conventions, and creates embeddings for fast retrieval. When you submit an issue through the web interface or a YAML spec on the command line, the system plans a sequence of refactor operations, generates a patch cooperatively between the LLM and diffusion models, validates it with Ruff, Pyright and tests, and finally logs the result for continuous learning.
 
-A tiny diffusion model that polishes human language into machine-friendly specs and performs global code denoising when big refactors are required.
+## Project Phases
 
-A compact (< 8 B) LLM that handles local edits and high-level planning while obeying project style through grammar constraints and retrieval-augmented context.
+1. **Style Profiling** – Sample files to learn indentation, quoting, identifier casing and docstring style. Generates `.black.toml`, `ruff.toml`, and `naming_conventions.db`.
+2. **Repository Digestion** – Build call graphs and embeddings using Tree‑sitter, LibCST and MiniLM, stored in a FAISS index with a signature trie for duplicate detection.
+3. **Spec Normalisation** – Clean free‑text issues into YAML specs using a diffusion pipeline backed by Tiny‑T5.
+4. **Planning** – Search a grammar of refactor operations and score candidates with a small LLM informed by the style fingerprint.
+5. **Agent Collaboration** – LLM and diffusion cores iteratively scaffold, expand and polish patches while sharing validation errors for auto‑repair.
+6. **Validation** – Ruff, Pyright and scoped pytest runs confirm patches are safe before committing.
+7. **Commit Builder** – Format and land the patch locally or via pull request with a changelog.
+8. **Active Learning** – Log successful patches, train a classifier to choose the best core, and fine‑tune LoRA adapters on the collected diffs.
 
-The end goal is an always-on teammate that understands the project like a senior developer, writes code indistinguishable from hand-written style, never duplicates functionality, and guarantees each change compiles, type-checks, lint-checks, and passes tests before it reaches the main branch.
+## Installation
 
-Phase 1 – Style and convention profiler
+See [docs/INSTALLATION.md](docs/INSTALLATION.md) for detailed setup instructions. In short:
 
-• Scan representative files, mine formatter and linter diffs, cluster docstrings and identifiers, then store a “style fingerprint” and commit Black/Ruff config files.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-Phase 2 – Repository digestion and incremental knowledge store
+Some features depend on optional packages such as `transformers` and GPU‑enabled `torch`.
 
-• Parse every module with Tree-sitter and LibCST, build call and program-dependence graphs, infer types, embed symbols with MiniLM, add them to a two-tier FAISS index, create a signature trie, and set up a watchdog for live updates.
+## Quick Start
 
-Phase 3 – Spec normalization with LoRA-compressed diffusion
+1. **Profile the repository**
+   ```bash
+   python3 scripts/profile_style.py /path/to/project
+   ```
+2. **Launch the assistant with the web UI**
+   ```bash
+   python3 scripts/launch_assistant.py /path/to/project
+   ```
+   Visit <http://localhost:5001> to submit an issue and apply the generated patch.
 
-• Feed raw user text plus nearby symbol names into a lightweight diffusion model that emits a canonical YAML spec defining targets, operations, and acceptance criteria.
+For more detailed workflows—including active learning and fine‑tuning—see the [Usage Guide](docs/HOW_TO_USE.md).
 
-Phase 4 – Planner layer driven by a symbolic grammar and small LLM scorer
+## Helper Scripts
 
-• Enumerate legal action sequences with a task grammar, score them with a ≤ 4 B LLM that sees the style fingerprint and graph stats, and cache successful mappings for reuse.
+- `profile_style.py` – build the style fingerprint and config files
+- `launch_assistant.py` – initialize all phases and start the web interface
+- `start_webui.py` – start only the Flask app when components are already initialized
+- `run_assistant.py` – run the planner on a YAML spec without the web UI
+- `active_learning_loop.py` – periodically fine‑tune models based on success memory
+- `prepare_finetune_data.py` – convert logged patches into a fine‑tuning dataset
+- `finetune_lora.py` – run LoRA training on the prepared dataset
+- `train_core_predictor.py` – update the classifier that selects between the LLM and diffusion cores
 
-Phase 5 – Twin-core Agent Groups for each phase
+## Further Reading
 
-• Broadcast phase context to an LLM-Coder and a Code-Diffusion editor running in parallel; accept the first validated patch or merge their best hunks if both differ; block duplicated helpers via signature-similarity checks.
+- [docs/FINE_TUNING.md](docs/FINE_TUNING.md) – Details on preparing training data and fine‑tuning models
+- [docs/CORE_PREDICTOR_TRAINING.md](docs/CORE_PREDICTOR_TRAINING.md) – How to train the core selection classifier
 
-Phase 6 – Validator and auto-repair loop
-
-• Run Ruff, Pyright, Black diff check, and only the PDG-impacted tests; allow up to three self-repairs per Agent Group, applying trivial lint fixes locally before reinvoking the models.
-
-Phase 7 – Commit and pull-request builder
-
-• Re-format the final diff, generate a changelog, open a pull request or local commit, and attach both the motivating YAML spec and validator transcript.
-
-Phase 8 – Active learning and continuous refinement
-
-• Log which core’s patch shipped, retrain a selector to pick winners earlier, embed every accepted diff into a “success memory,” and periodically fine-tune LoRA adapters on that memory to align even tighter with project idioms.
-
-## Running the Assistant
-
-Several helper scripts simplify common workflows:
-
-- `scripts/profile_style.py`: generate a style fingerprint and config files for a repository.
-- `scripts/run_assistant.py`: run the planner on a YAML spec against a project.
-- `scripts/start_webui.py`: launch the Flask dashboard after profiling and digesting the codebase.
-- `scripts/active_learning_loop.py`: periodically fine-tune LoRA adapters and retrain the `CorePredictor` using `success_memory.jsonl`.
-- `scripts/launch_assistant.py`: run the full initialization sequence and start the web interface (optionally with active learning).
-
-The web UI now lets you generate patches directly and trigger dataset creation for fine-tuning. Use the "Apply Patch" button after entering an issue and check the success memory page for results.
-
-The web UI exposes endpoints to submit issue text and inspect logged patches.
+The project aims to deliver an always‑on teammate that evolves your code safely and in line with your established conventions.
