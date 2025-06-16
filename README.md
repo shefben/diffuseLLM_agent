@@ -54,6 +54,7 @@ Several helper scripts simplify common workflows:
 - `scripts/run_assistant.py`: run the planner on a YAML spec against a project.
 - `scripts/start_webui.py`: launch the Flask dashboard after profiling and digesting the codebase.
 - `scripts/active_learning_loop.py`: periodically fine-tune LoRA adapters and retrain the `CorePredictor` using `success_memory.jsonl`.
+- `scripts/launch_assistant.py`: run the full initialization sequence and start the web interface (optionally with active learning).
 
 The web UI now lets you generate patches directly and trigger dataset creation for fine-tuning. Use the "Apply Patch" button after entering an issue and check the success memory page for results.
 
