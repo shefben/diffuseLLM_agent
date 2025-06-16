@@ -1,8 +1,18 @@
 # diffuseLLM_agent
 
-**diffuseLLM_agent** is a self‑hosted Python assistant that learns your project’s style and automatically generates validated patches. It couples a lightweight diffusion model with an ≤8B parameter LLM to keep resource usage modest while still producing high‑quality code.
+**diffuseLLM_agent** is a self‑hosted Python assistant that learns your project’s style and automatically generates validated patches. It couples a lightweight diffusion model with an ≤8 B parameter LLM to keep resource usage modest while still producing high‑quality code. A small scoring model guides planning so the most promising patch strategy is tried first.
 
 At startup the assistant parses the entire repository, builds graphs of functions and types, infers naming conventions, and creates embeddings for fast retrieval. When you submit an issue through the web interface or a YAML spec on the command line, the system plans a sequence of refactor operations, generates a patch cooperatively between the LLM and diffusion models, validates it with Ruff, Pyright and tests, and finally logs the result for continuous learning.
+
+## Models
+
+The assistant relies on three cooperating models:
+
+1. **LLMCore** – a general purpose code LLM (≤8 B parameters) that drafts and polishes patches.
+2. **DiffusionCore** – a lightweight diffusion model that expands LLM scaffolds and re‑denoises failing regions.
+3. **Scorer model** – a small LLM used during planning to rank candidate refactor sequences.
+
+Paths to each model are configured in `config.yaml` or via command‑line arguments.
 
 ## Project Phases
 
@@ -38,6 +48,7 @@ Some features depend on optional packages such as `transformers` and GPU‑enabl
    python3 scripts/launch_assistant.py /path/to/project
    ```
    Visit <http://localhost:5001> to submit an issue and apply the generated patch.
+   Model paths are read from `config.yaml`; update this file if your LLM, scorer, or diffusion checkpoints live elsewhere.
 
 For more detailed workflows—including active learning and fine‑tuning—see the [Usage Guide](docs/HOW_TO_USE.md).
 
