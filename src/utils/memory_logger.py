@@ -19,6 +19,7 @@ def log_successful_patch(
     diff_summary: str,
     successful_script_str: str,
     patch_source: Optional[str],
+    predicted_core: Optional[str] = None,
     verbose: bool = False,
     embedding_model: Optional["SentenceTransformer"] = None,
 ) -> bool:
@@ -31,6 +32,7 @@ def log_successful_patch(
         diff_summary: A string summary of the diff (e.g., from difflib).
         successful_script_str: The LibCST script string that was successful.
         patch_source: Information about which agent component generated the patch.
+        predicted_core: The core ("LLMCore" or "DiffusionCore") predicted to succeed.
         verbose: If True, prints success/failure messages.
 
     Returns:
@@ -58,6 +60,7 @@ def log_successful_patch(
         "successful_diff_summary": diff_summary,
         "successful_script": successful_script_str,
         "patch_source": patch_source if patch_source else "Unknown",
+        "predicted_core": predicted_core,
     }
 
     # Embed diff and script using a SentenceTransformer if provided

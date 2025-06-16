@@ -18,10 +18,14 @@
 <body>
     <div class="container">
         <h1>AI Code Agent: Issue Submission</h1>
-        <form method="POST">
+        <form method="POST" action="/">
             <label for="issue_text">Describe the issue or feature request:</label><br>
             <textarea name="issue_text" id="issue_text" rows="10"></textarea><br>
             <input type="submit" value="Generate Plan">
+        </form>
+        <form method="POST" action="/apply_patch" style="margin-top:10px;">
+            <input type="hidden" name="issue_text" id="issue_text_hidden">
+            <input type="submit" value="Apply Patch">
         </form>
 
         {% if error_message %}
@@ -54,7 +58,15 @@
 
         <div style="margin-top: 20px;">
             <a href="/memory">View Success Memory</a>
+            |
+            <a href="/prepare_dataset">Build Fine-tune Dataset</a>
         </div>
     </div>
+    <script>
+        const issueField = document.getElementById('issue_text');
+        const hiddenField = document.getElementById('issue_text_hidden');
+        const applyForm = document.forms[1];
+        applyForm.addEventListener('submit', () => { hiddenField.value = issueField.value; });
+    </script>
 </body>
 </html>

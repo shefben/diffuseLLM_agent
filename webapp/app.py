@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, redirect, url_for
 import sys
 from pathlib import Path
 import json  # For json.dumps as a fallback for displaying objects
@@ -15,6 +15,7 @@ try:
     from src.planner.spec_model import Spec
     from src.profiler.orchestrator import run_phase1_style_profiling_pipeline
     from src.utils.memory_logger import load_success_memory
+    from src.learning.ft_dataset import build_finetune_dataset
 except ImportError as e:
     print(
         f"Error importing project modules in webapp/app.py: {e}. Ensure PROJECT_ROOT is correct and src modules are accessible."
@@ -31,6 +32,9 @@ except ImportError as e:
 
     def run_phase1_style_profiling_pipeline(*_a, **_k):  # type: ignore
         return {"error": "profiling failed"}
+
+    def build_finetune_dataset(*_a, **_k):  # type: ignore
+        return False
 
     Spec = dict  # Placeholder type
 
@@ -198,6 +202,49 @@ def view_memory():
     entries = load_success_memory(data_dir)
     recent_entries = entries[-20:]
     return render_template("memory.html", entries=recent_entries)
+
+
+@app.route("/apply_patch", methods=["POST"])
+def apply_patch_route():
+    """Run full patch generation for an issue and redirect to memory."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    issue_text = request.form.get("issue_text", "")
+    if not issue_text:
+        return redirect(url_for("index"))
+
+    spec_obj = phase_planner_global.spec_normalizer.normalise_request(issue_text)
+    if spec_obj is None or isinstance(spec_obj, dict) and "error" in spec_obj:
+        return render_template(
+            "index.html",
+            submitted_issue=issue_text,
+            spec_data=None,
+            plan_data=None,
+            error_message="Spec normalization failed",
+        )
+
+    phase_planner_global.plan_phases(spec_obj)
+    return redirect(url_for("view_memory"))
+
+
+@app.route("/prepare_dataset")
+def prepare_dataset_route():
+    """Generate a fine-tuning dataset from success memory."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
+        data_dir = project_root / data_dir
+
+    output_path = data_dir / "finetune_dataset.jsonl"
+    ok = build_finetune_dataset(data_dir, output_path, verbose=True)
+    message = f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+    return render_template("dataset.html", message=message)
 
 
 if __name__ == "__main__":

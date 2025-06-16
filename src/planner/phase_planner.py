@@ -958,6 +958,7 @@ Score:"""
                                     diff_summary=diff_summary,
                                     successful_script_str=validated_patch_script,
                                     patch_source=patch_source,
+                                    predicted_core=predicted_core,
                                     verbose=self.verbose,
                                 )
                                 if log_success:

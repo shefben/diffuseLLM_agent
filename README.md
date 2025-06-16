@@ -55,4 +55,6 @@ Several helper scripts simplify common workflows:
 - `scripts/start_webui.py`: launch the Flask dashboard after profiling and digesting the codebase.
 - `scripts/active_learning_loop.py`: periodically fine-tune LoRA adapters and retrain the `CorePredictor` using `success_memory.jsonl`.
 
+The web UI now lets you generate patches directly and trigger dataset creation for fine-tuning. Use the "Apply Patch" button after entering an issue and check the success memory page for results.
+
 The web UI exposes endpoints to submit issue text and inspect logged patches.
