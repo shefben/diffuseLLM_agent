@@ -45,3 +45,14 @@ Phase 7 – Commit and pull-request builder
 Phase 8 – Active learning and continuous refinement
 
 • Log which core’s patch shipped, retrain a selector to pick winners earlier, embed every accepted diff into a “success memory,” and periodically fine-tune LoRA adapters on that memory to align even tighter with project idioms.
+
+## Running the Assistant
+
+Several helper scripts simplify common workflows:
+
+- `scripts/profile_style.py`: generate a style fingerprint and config files for a repository.
+- `scripts/run_assistant.py`: run the planner on a YAML spec against a project.
+- `scripts/start_webui.py`: launch the Flask dashboard after profiling and digesting the codebase.
+- `scripts/active_learning_loop.py`: periodically fine-tune LoRA adapters and retrain the `CorePredictor` using `success_memory.jsonl`.
+
+The web UI exposes endpoints to submit issue text and inspect logged patches.
