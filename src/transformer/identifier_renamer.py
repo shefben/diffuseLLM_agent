@@ -66,7 +66,7 @@ class IdentifierRenamingTransformer(cst.CSTTransformer):
         # For collision avoidance (simplified): track renames in current processing unit (module)
         # This doesn't handle cross-file or complex shadowing.
         self.renamed_in_module: Dict[str, str] = {}
-        # TODO: Implement full scope-aware renaming for variables and parameters in leave_Name using ScopeProvider. Currently, only function and class names are renamed.
+        self.scope_renames: Dict[cst.metadata.Scope, Dict[str, str]] = {}
 
     def _get_target_convention(self, identifier_type: str) -> Optional[Tuple[str, str]]:
         return self.active_rules.get(identifier_type)
@@ -140,11 +140,20 @@ class IdentifierRenamingTransformer(cst.CSTTransformer):
         self, original_node: cst.Name, updated_node: cst.Name
     ) -> cst.BaseExpression:
         parent = self.get_metadata(ParentNodeProvider, original_node, None)
+        scope = self.get_metadata(ScopeProvider, original_node, None)
+
         identifier_type = None
-        if isinstance(parent, cst.Param):
+        if isinstance(parent, cst.Param) or isinstance(parent, cst.AssignTarget):
             identifier_type = "variable"
-        elif isinstance(parent, cst.AssignTarget):
-            identifier_type = "variable"
+
+        # Determine if this Name needs renaming based on stored mapping
+        if (
+            scope
+            and scope in self.scope_renames
+            and original_node.value in self.scope_renames[scope]
+        ):
+            new_name = self.scope_renames[scope][original_node.value]
+            return updated_node.with_changes(value=new_name)
 
         if identifier_type:
             target_conv = self._get_target_convention(identifier_type)
@@ -156,6 +165,10 @@ class IdentifierRenamingTransformer(cst.CSTTransformer):
                 ):
                     new_name = self._convert_name(current_name, target_conv_name)
                     if new_name != current_name:
+                        if scope:
+                            self.scope_renames.setdefault(scope, {})[current_name] = (
+                                new_name
+                            )
                         self.renamed_in_module[current_name] = new_name
                         return updated_node.with_changes(value=new_name)
         return updated_node

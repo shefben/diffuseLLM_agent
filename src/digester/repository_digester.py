@@ -230,9 +230,9 @@ class SymbolAndSignatureExtractorVisitor(ast.NodeVisitor):  # Renamed
         self.module_qname: str = module_qname
         self.file_path_str: str = file_path_str
         self.source_code_lines: List[str] = source_code_lines
-        self.symbols_for_embedding: List[Dict[str, Any]] = (
-            []
-        )  # Renamed from self.symbols
+        self.symbols_for_embedding: List[
+            Dict[str, Any]
+        ] = []  # Renamed from self.symbols
         self.current_class_name: Optional[str] = None  # FQN of current class context
         self.type_info_map_for_resolver = (
             type_info_map_for_resolver if type_info_map_for_resolver else {}
@@ -1655,8 +1655,7 @@ class RepositoryDigester:
                 "RepositoryDigester Warning: No embedding_model_name provided. Embedding generation disabled."
             )
 
-        # FAISS Index Initialization (depends on successful model loading)
-        # TODO: Implement multi-level FAISS caching (RAM cache + on-disk main index) for very large repos if IndexFlatL2 RAM usage becomes an issue.
+        # FAISS Index Initialization (uses in-memory index with optional on-disk cache)
         self.faiss_index: Optional[faiss.Index] = None
         self.faiss_id_to_metadata: List[Dict[str, Any]] = []
         self.faiss_index_path: Optional[Path] = None
@@ -2549,9 +2548,7 @@ class RepositoryDigester:
         embeddings_to_rebuild_list: List[NumpyNdarray] = []  # type: ignore
         metadata_to_rebuild_list: List[Dict[str, Any]] = []
 
-        for (
-            parsed_result
-        ) in (
+        for parsed_result in (
             self.digested_files.values()
         ):  # Iterate through all currently digested files
             if parsed_result and parsed_result.extracted_symbols:
@@ -2574,9 +2571,7 @@ class RepositoryDigester:
             try:
                 embeddings_2d_array_rebuild = np.vstack(
                     embeddings_to_rebuild_list
-                ).astype(
-                    np.float32
-                )  # type: ignore
+                ).astype(np.float32)  # type: ignore
                 self.faiss_index.add(embeddings_2d_array_rebuild)  # type: ignore
                 self.faiss_id_to_metadata = (
                     metadata_to_rebuild_list  # Replace with new full list

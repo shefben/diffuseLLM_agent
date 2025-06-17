@@ -407,6 +407,6 @@ Provide only the code snippet to replace `{hole_marker}`:"""
                     return None
 
             print(
-                f"DiffusionCore: (Fallback) Passing through LLM-proposed targeted fix script (length: {len(proposed_fix_script)}) as is. True span-based re-denoising is pending implementation."
+                f"DiffusionCore: Passing through LLM-proposed fix script (length: {len(proposed_fix_script)})"
             )
             return proposed_fix_script

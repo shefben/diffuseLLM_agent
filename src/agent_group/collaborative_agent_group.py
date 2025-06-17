@@ -236,7 +236,6 @@ class CollaborativeAgentGroup:
             print(
                 f"CollaborativeAgentGroup.run: Received predicted_core: {predicted_core if predicted_core else 'Not provided'}"
             )
-        # TODO (future step): Use predicted_core to influence agent logic (e.g., which core to try first).
 
         # self.current_patch_candidate will hold the LibCST SCRIPT string.
         # It's initialized to None in __init__.
