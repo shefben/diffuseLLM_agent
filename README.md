@@ -19,7 +19,7 @@ Command‑line arguments act as overrides when needed.
 
 1. **Style Profiling** – Sample files to learn indentation, quoting, identifier casing and docstring style. Generates `.black.toml`, `ruff.toml`, and `naming_conventions.db`.
 2. **Repository Digestion** – Build call graphs and embeddings using Tree‑sitter, LibCST and MiniLM, stored in a FAISS index with a signature trie for duplicate detection.
-   A lightweight knowledge graph is populated with call relations that can be queried during planning.
+   A lightweight knowledge graph is populated with call relations that can be queried during planning. The `/query_graph` web endpoint lets you explore these relations interactively.
 3. **Spec Normalisation** – Clean free‑text issues into YAML specs using a diffusion pipeline backed by Tiny‑T5.
 4. **Planning** – Search a grammar of refactor operations and score candidates with a small LLM informed by the style fingerprint.
 5. **Agent Collaboration** – LLM and diffusion cores iteratively scaffold, expand and polish patches while sharing validation errors for auto‑repair.

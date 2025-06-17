@@ -318,6 +318,25 @@ def prepare_dataset_route():
     return render_template("dataset.html", message=message)
 
 
+@app.route("/query_graph", methods=["GET"])
+def query_graph_route():
+    """Query the knowledge graph and display results."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    src = request.args.get("src", "")
+    relation = request.args.get("relation") or None
+    depth = int(request.args.get("depth", "1"))
+
+    result = {}
+    if src:
+        result = digester_global.query_knowledge_paths(src, relation, depth)
+
+    return render_template(
+        "graph.html", query_src=src, query_relation=relation, depth=depth, result=result
+    )
+
+
 if __name__ == "__main__":
     import argparse
 
