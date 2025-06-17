@@ -23,9 +23,10 @@
             <textarea name="issue_text" id="issue_text" rows="10"></textarea><br>
             <input type="submit" value="Generate Plan">
         </form>
-        <form method="POST" action="/apply_patch" style="margin-top:10px;">
+        <form method="POST" action="/apply_plan" style="margin-top:10px;">
             <input type="hidden" name="issue_text" id="issue_text_hidden">
-            <input type="submit" value="Apply Patch">
+            <input type="hidden" name="plan_json" id="plan_json_hidden">
+            <input type="submit" value="Approve Plan & Run">
         </form>
 
         {% if error_message %}
@@ -52,7 +53,7 @@
         {% if plan_data %}
         <div class="results-section">
             <h2>Generated Plan (Phases):</h2>
-            <pre>{{ plan_data }}</pre>
+            <textarea id="plan_editor" rows="10" style="width:98%;">{{ plan_data }}</textarea>
         </div>
         {% endif %}
 
@@ -65,8 +66,13 @@
     <script>
         const issueField = document.getElementById('issue_text');
         const hiddenField = document.getElementById('issue_text_hidden');
+        const planHidden = document.getElementById('plan_json_hidden');
         const applyForm = document.forms[1];
-        applyForm.addEventListener('submit', () => { hiddenField.value = issueField.value; });
+        applyForm.addEventListener('submit', () => {
+            hiddenField.value = issueField.value;
+            const planEditor = document.getElementById('plan_editor');
+            if (planEditor) planHidden.value = planEditor.value;
+        });
     </script>
 </body>
 </html>

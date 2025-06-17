@@ -19,6 +19,7 @@ Command‑line arguments act as overrides when needed.
 
 1. **Style Profiling** – Sample files to learn indentation, quoting, identifier casing and docstring style. Generates `.black.toml`, `ruff.toml`, and `naming_conventions.db`.
 2. **Repository Digestion** – Build call graphs and embeddings using Tree‑sitter, LibCST and MiniLM, stored in a FAISS index with a signature trie for duplicate detection.
+   A lightweight knowledge graph is populated with call relations that can be queried during planning.
 3. **Spec Normalisation** – Clean free‑text issues into YAML specs using a diffusion pipeline backed by Tiny‑T5.
 4. **Planning** – Search a grammar of refactor operations and score candidates with a small LLM informed by the style fingerprint.
 5. **Agent Collaboration** – LLM and diffusion cores iteratively scaffold, expand and polish patches while sharing validation errors for auto‑repair.
@@ -48,7 +49,7 @@ Some features depend on optional packages such as `transformers` and GPU‑enabl
    ```bash
    python3 scripts/launch_assistant.py /path/to/project
    ```
-   Visit <http://localhost:5001> to submit an issue and apply the generated patch.
+   Visit <http://localhost:5001> to submit an issue, review the generated plan, and approve or edit it before execution.
    Model paths and training parameters are read from `config.yaml`, so command‑line flags are optional.
 
 For more detailed workflows—including active learning and fine‑tuning—see the [Usage Guide](docs/HOW_TO_USE.md).

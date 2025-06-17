@@ -371,7 +371,12 @@ class PhasePlanner:
                 "target_file": current_op_spec_item.get(
                     "target_file"
                 ),  # Inherit target_file
-                "parameters": {"edit_description": generic_edit_desc},
+                "parameters": self._infer_parameters_for_alternative(
+                    "generic_code_edit",
+                    current_op_spec_item,
+                    spec,
+                    {"edit_description": generic_edit_desc},
+                ),
             }
             alternative_ops.append(generic_code_edit_op_spec_item)
             if self.verbose:
@@ -411,6 +416,19 @@ class PhasePlanner:
 
         return best_plan
 
+    def generate_plan_from_goal(self, goal_text: str) -> Tuple[Spec, List[Phase]]:
+        """High level entry point: normalize raw goal text and generate a plan."""
+        spec_obj = self.spec_normalizer.normalise_request(goal_text)
+        if spec_obj is None:
+            raise ValueError("SpecNormalizer failed to create a Spec from goal text")
+
+        if not spec_obj.operations:
+            # crude fallback: propose a generic code edit
+            spec_obj.operations.append({"name": "generic_code_edit", "parameters": {"edit_description": goal_text[:120]}})
+
+        plan_list = self.generate_plan_from_spec(spec_obj)
+        return spec_obj, plan_list
+
     def _get_spec_cache_key(self, spec: Spec) -> str:
         # Ensure Spec model is Pydantic v2 compatible for model_dump_json if that's used.
         # Fallback to dict if model_dump_json is not available (e.g. placeholder Spec)
@@ -422,6 +440,21 @@ class PhasePlanner:
                 sort_keys=True,
             )
         return hashlib.md5(spec_json_str.encode("utf-8")).hexdigest()
+
+    def _infer_parameters_for_alternative(
+        self,
+        alt_op_name: str,
+        original_op_spec: Dict[str, Any],
+        spec: "Spec",
+        base_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Heuristic parameter inference for alternative operations."""
+        params = base_params.copy() if base_params else {}
+        if alt_op_name == "generic_code_edit":
+            target_file = original_op_spec.get("target_file")
+            if target_file:
+                params.setdefault("target_file", target_file)
+        return params
 
     def _get_graph_statistics(self) -> Dict[str, Any]:
         # Initialize stats with defaults

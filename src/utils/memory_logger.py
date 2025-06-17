@@ -20,6 +20,7 @@ def log_successful_patch(
     successful_script_str: str,
     patch_source: Optional[str],
     predicted_core: Optional[str] = None,
+    user_rating: Optional[int] = None,
     verbose: bool = False,
     embedding_model: Optional["SentenceTransformer"] = None,
 ) -> bool:
@@ -61,6 +62,7 @@ def log_successful_patch(
         "successful_script": successful_script_str,
         "patch_source": patch_source if patch_source else "Unknown",
         "predicted_core": predicted_core,
+        "user_rating": user_rating,
     }
 
     # Embed diff and script using a SentenceTransformer if provided

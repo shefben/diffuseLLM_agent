@@ -15,13 +15,30 @@
     <div class="container">
         <h1>Recent Successful Patches</h1>
         <table>
-            <tr><th>Timestamp</th><th>Issue</th><th>Patch Source</th><th>Diff Summary</th></tr>
+            <tr><th>Timestamp</th><th>Issue</th><th>Patch Source</th><th>Diff Summary</th><th>Rating</th></tr>
             {% for e in entries %}
             <tr>
                 <td>{{ e.timestamp_utc }}</td>
                 <td>{{ e.spec_issue_description }}</td>
                 <td>{{ e.patch_source }}</td>
                 <td><pre>{{ e.successful_diff_summary[:120] }}</pre></td>
+                <td>
+                    {% if e.user_rating is not none %}
+                        {{ e.user_rating }}
+                    {% else %}
+                        <form method="POST" action="/feedback">
+                            <input type="hidden" name="timestamp" value="{{ e.timestamp_utc }}">
+                            <select name="rating">
+                                <option value="1">1</option>
+                                <option value="2">2</option>
+                                <option value="3">3</option>
+                                <option value="4">4</option>
+                                <option value="5">5</option>
+                            </select>
+                            <input type="submit" value="Submit">
+                        </form>
+                    {% endif %}
+                </td>
             </tr>
             {% endfor %}
         </table>

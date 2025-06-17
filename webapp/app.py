@@ -12,6 +12,7 @@ try:
     from src.utils.config_loader import load_app_config
     from src.digester.repository_digester import RepositoryDigester
     from src.planner.phase_planner import PhasePlanner
+    from src.planner.phase_model import Phase
     from src.planner.spec_model import Spec
     from src.profiler.orchestrator import run_phase1_style_profiling_pipeline
     from src.utils.memory_logger import load_success_memory
@@ -37,6 +38,7 @@ except ImportError as e:
         return False
 
     Spec = dict  # Placeholder type
+    Phase = dict  # Placeholder type
 
 app = Flask(__name__)
 
@@ -225,6 +227,75 @@ def apply_patch_route():
         )
 
     phase_planner_global.plan_phases(spec_obj)
+    return redirect(url_for("view_memory"))
+
+
+@app.route("/apply_plan", methods=["POST"])
+def apply_plan_route():
+    """Execute a user-approved plan represented as JSON."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    issue_text = request.form.get("issue_text", "")
+    plan_json = request.form.get("plan_json", "")
+    if not issue_text or not plan_json:
+        return redirect(url_for("index"))
+
+    spec_obj = phase_planner_global.spec_normalizer.normalise_request(issue_text)
+    if spec_obj is None or isinstance(spec_obj, dict) and "error" in spec_obj:
+        return render_template(
+            "index.html",
+            submitted_issue=issue_text,
+            spec_data=None,
+            plan_data=None,
+            error_message="Spec normalization failed",
+        )
+
+    try:
+        plan_list_dicts = json.loads(plan_json)
+        custom_plan = [Phase(**p) for p in plan_list_dicts]
+    except Exception as e:
+        return render_template(
+            "index.html",
+            submitted_issue=issue_text,
+            spec_data=None,
+            plan_data=plan_json,
+            error_message=f"Invalid plan JSON: {e}",
+        )
+
+    cache_key = phase_planner_global._get_spec_cache_key(spec_obj)
+    phase_planner_global.plan_cache[cache_key] = custom_plan
+    phase_planner_global.plan_phases(spec_obj)
+    return redirect(url_for("view_memory"))
+
+
+@app.route("/feedback", methods=["POST"])
+def feedback_route():
+    if not initialized:
+        return "Application not initialized", 503
+
+    timestamp = request.form.get("timestamp")
+    rating = request.form.get("rating")
+    if not timestamp or not rating:
+        return redirect(url_for("view_memory"))
+
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
+        data_dir = project_root / data_dir
+
+    entries = load_success_memory(data_dir)
+    for entry in entries:
+        if entry.get("timestamp_utc") == timestamp:
+            entry["user_rating"] = int(rating)
+
+    log_path = data_dir / "success_memory.jsonl"
+    with open(log_path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
     return redirect(url_for("view_memory"))
 
 
