@@ -21,7 +21,7 @@ Command‑line arguments act as overrides when needed.
 2. **Repository Digestion** – Build call graphs and embeddings using Tree‑sitter, LibCST and MiniLM, stored in a FAISS index with a signature trie for duplicate detection.
    A lightweight knowledge graph is populated with call relations that can be queried during planning. The `/query_graph` web endpoint lets you explore these relations interactively.
 3. **Spec Normalisation** – Clean free‑text issues into YAML specs using a diffusion pipeline backed by Tiny‑T5.
-4. **Generative Planning** – The planner uses an LLM to propose refactor operations from scratch, infers parameters for alternatives, and scores candidate sequences using a small LLM guided by the style fingerprint.
+4. **Generative Planning** – The planner automatically calls an LLM to propose refactor operations from scratch whenever you submit an issue.  These operations are merged with any extracted from the spec, parameters are inferred for alternatives, and a small LLM scorer ranks candidate sequences using the style fingerprint.
 5. **Agent Collaboration** – LLM and diffusion cores iteratively scaffold, expand and polish patches while sharing validation errors for auto‑repair.
 6. **Validation** – Ruff, Pyright and scoped pytest runs confirm patches are safe before committing.
 7. **Commit Builder** – Format and land the patch locally or via pull request with a changelog.

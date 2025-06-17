@@ -492,22 +492,34 @@ class PhasePlanner:
         if spec_obj is None:
             raise ValueError("SpecNormalizer failed to create a Spec from goal text")
 
-        if not spec_obj.operations:
-            spec_obj.operations = propose_refactor_operations(
-                goal_text, model_path=self.operations_llm_path, verbose=self.verbose
-            )
+        llm_ops = propose_refactor_operations(
+            goal_text, model_path=self.operations_llm_path, verbose=self.verbose
+        )
 
-        if not spec_obj.operations:
-            spec_obj.operations = self._extract_operations_from_goal(goal_text)
+        if not llm_ops:
+            llm_ops = self._extract_operations_from_goal(goal_text)
 
-        if not spec_obj.operations:
-            # final fallback
-            spec_obj.operations.append(
+        existing_ops = spec_obj.operations or []
+
+        combined_ops: list[dict] = []
+        seen_keys: set[tuple[str | None, str | None]] = set()
+        for op in existing_ops + llm_ops:
+            name = op.get("name")
+            target = op.get("target_file")
+            key = (str(name), str(target))
+            if key not in seen_keys:
+                combined_ops.append(op)
+                seen_keys.add(key)
+
+        if not combined_ops:
+            combined_ops.append(
                 {
                     "name": "generic_code_edit",
                     "parameters": {"edit_description": goal_text[:120]},
                 }
             )
+
+        spec_obj.operations = combined_ops
 
         plan_list = self.generate_plan_from_spec(spec_obj)
         return spec_obj, plan_list
