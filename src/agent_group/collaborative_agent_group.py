@@ -9,6 +9,7 @@ from typing import (
 from pathlib import Path
 import difflib  # Added for diff generation
 import json
+import subprocess
 
 # Local imports
 from .exceptions import PhaseFailure  # New import
@@ -881,13 +882,16 @@ class CollaborativeAgentGroup:
         return "\n".join(preview_parts)
 
     def abort_and_rollback(self) -> None:
-        """Placeholder: Aborts the current operation and conceptually rolls back changes."""
+        """Abort the current phase and revert working tree changes."""
+
+        repo_root = Path(
+            self.app_config.get("general", {}).get("project_root", ".")
+        ).resolve()
+
         patch_status_info = "No active patch candidate."
-        if self.current_patch_candidate and isinstance(
-            self.current_patch_candidate, str
-        ):
+        if isinstance(self.current_patch_candidate, str):
             patch_status_info = f"Current patch candidate (script) length: {len(self.current_patch_candidate)}."
-        elif self.current_patch_candidate:
+        elif self.current_patch_candidate is not None:
             patch_status_info = (
                 f"Current patch candidate type: {type(self.current_patch_candidate)}."
             )
@@ -895,21 +899,23 @@ class CollaborativeAgentGroup:
         print(
             f"CollaborativeAgentGroup: Abort and Rollback called. {patch_status_info}"
         )
-        print(
-            "  (Mock: No file operations to roll back at this stage as scripts are not yet applied.)"
-        )
 
-        # Reset internal state related to the current run
+        # Reset internal state before touching the filesystem
         self.current_patch_candidate = None
-        self.patch_history = []
-        self._current_run_context_data = None  # Clear the context of the aborted run
+        self.patch_history.clear()
+        self._current_run_context_data = None
 
-        print("  Internal state (patch candidate, history, context) has been reset.")
-        # In a real scenario, this might involve:
-        # - Deleting temporary files
-        # - Reverting any applied changes in a sandbox environment
-        # - Signaling to other components that the phase was aborted
-        pass
+        # Revert any uncommitted changes in the repository
+        try:
+            subprocess.run(["git", "reset", "--hard"], cwd=repo_root, check=False)
+            subprocess.run(["git", "clean", "-fd"], cwd=repo_root, check=False)
+            print(f"  Rolled back working tree at {repo_root}.")
+        except Exception as e:
+            print(
+                f"CollaborativeAgentGroup Warning: Failed to reset git repo at {repo_root}: {e}"
+            )
+
+        print("  Internal state cleared and repository reset.")
 
 
 # Example Usage (Conceptual - requires mock objects for Phase, Digester etc.)

@@ -346,11 +346,7 @@ class PhasePlanner:
     def _suggest_alternative_operations(
         self, current_op_spec_item: Dict[str, Any], spec: "Spec"
     ) -> List[Dict[str, Any]]:
-        """
-        Suggests alternative operations for a given operation spec item.
-        Currently, this is a placeholder and returns the original operation.
-        Future enhancements could use heuristics or an LLM to propose alternatives.
-        """
+        """Return the input operation and reasonable alternatives."""
         alternative_ops = [current_op_spec_item.copy()]
         current_op_name = current_op_spec_item.get("name")
 
@@ -423,6 +419,23 @@ class PhasePlanner:
                         print(
                             "PhasePlanner._suggest_alternative_operations: Added 'add_import' as alternative for missing decorator import."
                         )
+
+            if current_op_name in {"add_function", "modify_function_logic"}:
+                doc_alt = {
+                    "name": "update_docstring",
+                    "target_file": current_op_spec_item.get("target_file"),
+                    "parameters": self._infer_parameters_for_alternative(
+                        "update_docstring",
+                        current_op_spec_item,
+                        spec,
+                        {},
+                    ),
+                }
+                alternative_ops.append(doc_alt)
+                if self.verbose:
+                    print(
+                        "PhasePlanner._suggest_alternative_operations: Added 'update_docstring' as alternative for function operation."
+                    )
 
         return alternative_ops
 
