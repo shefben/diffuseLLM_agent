@@ -5,7 +5,7 @@
 <tr><th>Timestamp</th><th>Issue</th><th>Patch Source</th><th>Diff Summary</th><th>Rating</th></tr>
 {% for e in entries %}
 <tr>
-    <td>{{ e.timestamp_utc }}</td>
+    <td><a href="{{ url_for('memory_detail_route', index=loop.index0) }}">{{ e.timestamp_utc }}</a></td>
     <td>{{ e.spec_issue_description }}</td>
     <td>{{ e.patch_source }}</td>
     <td><pre>{{ e.successful_diff_summary[:120] }}</pre></td>

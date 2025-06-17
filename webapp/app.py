@@ -191,6 +191,23 @@ def view_memory():
     return render_template("memory.html", entries=recent_entries)
 
 
+@app.route("/memory/<int:index>")
+def memory_detail_route(index: int):
+    """Display full details for a single memory entry."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(app_config_global.get("general", {}).get("project_root", "."))
+        data_dir = project_root / data_dir
+    entries = load_success_memory(data_dir)
+    if index < 0 or index >= len(entries):
+        return redirect(url_for("view_memory"))
+    entry = entries[index]
+    return render_template("patch_detail.html", entry=entry)
+
+
 @app.route("/apply_patch", methods=["POST"])
 def apply_patch_route():
     """Run full patch generation for an issue and redirect to memory."""
@@ -301,6 +318,41 @@ def prepare_dataset_route():
     ok = build_finetune_dataset(data_dir, output_path, verbose=True)
     message = f"Dataset written to {output_path}" if ok else "Failed to build dataset"
     return render_template("dataset.html", message=message)
+
+
+@app.route("/train", methods=["GET", "POST"])
+def train_route():
+    if not initialized:
+        return "Application not initialized", 503
+
+    message = None
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(app_config_global.get("general", {}).get("project_root", "."))
+        data_dir = project_root / data_dir
+
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "Prepare Dataset":
+            output_path = data_dir / "finetune_dataset.jsonl"
+            ok = build_finetune_dataset(data_dir, output_path, verbose=True)
+            message = f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+        elif action == "Fine-tune LoRA":
+            try:
+                import subprocess
+                subprocess.run(["python3", "scripts/finetune_lora.py", "--data-dir", str(data_dir)], check=False)
+                message = "LoRA fine-tuning started"
+            except Exception as e:
+                message = f"Failed to run fine-tuning: {e}"
+        elif action == "Train Predictor":
+            try:
+                import subprocess
+                subprocess.run(["python3", "scripts/train_core_predictor.py", "--data-dir", str(data_dir)], check=False)
+                message = "Predictor training started"
+            except Exception as e:
+                message = f"Failed to train predictor: {e}"
+
+    return render_template("train.html", message=message)
 
 
 @app.route("/query_graph", methods=["GET"])

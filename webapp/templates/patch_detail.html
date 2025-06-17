@@ -1,0 +1,16 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Patch Details</h1>
+<p><strong>Timestamp:</strong> {{ entry.timestamp_utc }}</p>
+<p><strong>Issue:</strong> {{ entry.spec_issue_description }}</p>
+<p><strong>Patch Source:</strong> {{ entry.patch_source }}</p>
+<p><strong>Predicted Core:</strong> {{ entry.predicted_core }}</p>
+<h2>Diff Summary</h2>
+<pre>{{ entry.successful_diff_summary }}</pre>
+<h2>Patch Script</h2>
+<pre>{{ entry.successful_script }}</pre>
+{% if entry.user_rating is not none %}
+<p><strong>User Rating:</strong> {{ entry.user_rating }}</p>
+{% endif %}
+<a href="{{ url_for('view_memory') }}">Back to Memory</a>
+{% endblock %}
