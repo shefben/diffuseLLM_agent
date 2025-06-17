@@ -2,6 +2,8 @@ from flask import Flask, render_template, request, redirect, url_for
 import sys
 from pathlib import Path
 import json  # For json.dumps as a fallback for displaying objects
+import yaml
+from src.learning.easyedit_helper import apply_easyedit
 
 # Add project root to sys.path to allow imports from src
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -57,6 +59,7 @@ def initialize_components(
 
     app_config_global = load_app_config(config_path)
     app_config_global["general"]["project_root"] = str(project_root)
+    app_config_global["loaded_config_path"] = str(config_path or "config.yaml")
     if verbose:
         app_config_global["general"]["verbose"] = True
 
@@ -334,3 +337,57 @@ if __name__ == "__main__":
     initialize_components(args.project_root, args.config, args.verbose)
 
     app.run(debug=args.verbose, host="0.0.0.0", port=args.port)
+
+@app.route("/config", methods=["GET", "POST"])
+def config_route():
+    if not initialized:
+        return "Application not initialized", 503
+    config_path = Path(app_config_global.get("loaded_config_path", "config.yaml"))
+    if request.method == "POST":
+        new_text = request.form.get("config_text", "")
+        try:
+            yaml.safe_load(new_text)
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(new_text)
+            app_config_global.update(yaml.safe_load(new_text) or {})
+            message = "Configuration updated"
+        except Exception as e:
+            message = f"Failed to update config: {e}"
+        return render_template("config.html", config_text=new_text, message=message)
+    text = config_path.read_text(encoding="utf-8") if config_path.exists() else yaml.dump(app_config_global)
+    return render_template("config.html", config_text=text, message=None)
+
+@app.route("/chat", methods=["GET", "POST"])
+def chat_route():
+    if not initialized:
+        return "Application not initialized", 503
+    global chat_history
+    if request.method == "POST":
+        msg = request.form.get("message", "")
+        if msg:
+            chat_history.append({"role": "user", "text": msg})
+            reply = "No response"
+            try:
+                if phase_planner_global and hasattr(phase_planner_global, "llm_core"):
+                    llm_core = phase_planner_global.llm_core
+                    reply, _ = llm_core.generate_scaffold_patch({"phase_description": msg}) or ("", None)
+                    if not reply:
+                        reply = "(LLM returned empty response)"
+            except Exception as e:
+                reply = f"Error: {e}"
+            chat_history.append({"role": "assistant", "text": reply})
+    return render_template("chat.html", history=chat_history[-20:])
+
+@app.route("/easyedit", methods=["GET", "POST"])
+def easyedit_route():
+    if not initialized:
+        return "Application not initialized", 503
+    message = None
+    if request.method == "POST":
+        instr = request.form.get("instruction", "")
+        new_text = request.form.get("new_text", "")
+        model_dir = Path(app_config_global.get("models", {}).get("agent_llm_gguf", ""))
+        ok = apply_easyedit(model_dir, instr, new_text, verbose=True)
+        message = "Edit applied" if ok else "EasyEdit unavailable or failed"
+    return render_template("easyedit.html", message=message)
+
