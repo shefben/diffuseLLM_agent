@@ -4,6 +4,7 @@
 import argparse
 from pathlib import Path
 from webapp.app import initialize_components, app
+from src.utils.config_loader import load_app_config
 
 
 def main() -> None:
@@ -12,13 +13,16 @@ def main() -> None:
     parser.add_argument(
         "--config", type=Path, default=None, help="Optional config YAML"
     )
-    parser.add_argument("--port", type=int, default=5001)
+    parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
+    cfg = load_app_config(args.config)
+    port = args.port or cfg.get("webui", {}).get("port", 5001)
+
     initialize_components(args.project_root, args.config, args.verbose)
 
-    app.run(host="0.0.0.0", port=args.port, debug=args.verbose)
+    app.run(host="0.0.0.0", port=port, debug=args.verbose)
 
 
 if __name__ == "__main__":

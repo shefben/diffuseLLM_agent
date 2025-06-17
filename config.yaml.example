@@ -36,3 +36,11 @@ llm_params:
   agent_polish_max_tokens: 2048
   agent_repair_temp: 0.3
   agent_repair_max_tokens: 2048
+active_learning:
+  enabled: false
+  model_name: gpt2
+  output_dir: ./lora_adapters
+  interval: 3600
+  predictor_model: ./models/core_predictor.joblib
+webui:
+  port: 5001

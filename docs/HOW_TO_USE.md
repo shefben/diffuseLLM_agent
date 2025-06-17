@@ -21,8 +21,7 @@ python3 scripts/launch_assistant.py /path/to/your/project
 ```
 
 The script digests the repository, initializes databases, and opens a Flask web interface (default `http://localhost:5001`).
-
-If you want the assistant to run an active learning loop in the background to periodically fine-tune its models, pass `--active-learning`.
+Parameters like the port and active learning settings are loaded from `config.yaml`, so extra flags are usually unnecessary. Pass `--active-learning` to force training even if the config disables it.
 
 ## 3. Submitting Issues
 

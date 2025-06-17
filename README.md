@@ -12,7 +12,8 @@ The assistant relies on three cooperating models:
 2. **DiffusionCore** – a lightweight diffusion model that expands LLM scaffolds and re‑denoises failing regions.
 3. **Scorer model** – a small LLM used during planning to rank candidate refactor sequences.
 
-Paths to each model are configured in `config.yaml` or via command‑line arguments.
+Paths to each model and various parameters are configured in `config.yaml`.
+Command‑line arguments act as overrides when needed.
 
 ## Project Phases
 
@@ -48,7 +49,7 @@ Some features depend on optional packages such as `transformers` and GPU‑enabl
    python3 scripts/launch_assistant.py /path/to/project
    ```
    Visit <http://localhost:5001> to submit an issue and apply the generated patch.
-   Model paths are read from `config.yaml`; update this file if your LLM, scorer, or diffusion checkpoints live elsewhere.
+   Model paths and training parameters are read from `config.yaml`, so command‑line flags are optional.
 
 For more detailed workflows—including active learning and fine‑tuning—see the [Usage Guide](docs/HOW_TO_USE.md).
 
