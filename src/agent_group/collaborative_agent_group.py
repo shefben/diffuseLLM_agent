@@ -102,7 +102,7 @@ class CollaborativeAgentGroup:
         modified_code_str: Optional[str],
         target_file_path: Path,
         context_data: Dict[str, Any],
-    ) -> bool:
+    ) -> tuple[bool, Optional[str]]:
         """
         Checks if the modified code string contains any function/method signatures
         that already exist in the project's signature trie.
@@ -183,13 +183,13 @@ class CollaborativeAgentGroup:
                 # We need to check if the list is non-empty.
                 # The mock in SignatureTrie was returning bool, this needs to be aligned.
                 # Assuming search now returns List[str] as per its typical design.
-                if digester.signature_trie.search(
-                    signature_str
-                ):  # If list is not empty, a duplicate exists
+                duplicate_matches = digester.signature_trie.search(signature_str)
+                if duplicate_matches:
                     print(
                         f"DuplicateGuard: Duplicate top-level function signature found for '{module_qname}.{item_node.name}': {signature_str}"
                     )
-                    return True
+                    context_data["duplicate_fqn"] = duplicate_matches[0]
+                    return True, duplicate_matches[0]
             elif isinstance(item_node, ast.ClassDef):
                 class_name_simple = item_node.name
                 # class_fqn_prefix = f"{module_qname}.{class_name_simple}" # Full FQN not needed for prefix arg
@@ -201,16 +201,20 @@ class CollaborativeAgentGroup:
                             simple_type_resolver,
                             class_fqn_prefix_for_method_name=class_name_simple,
                         )
-                        if digester.signature_trie.search(signature_str):
+                        duplicate_method_matches = digester.signature_trie.search(
+                            signature_str
+                        )
+                        if duplicate_method_matches:
                             print(
                                 f"DuplicateGuard: Duplicate method signature found for '{module_qname}.{class_name_simple}.{method_node.name}': {signature_str}"
                             )
-                            return True
+                            context_data["duplicate_fqn"] = duplicate_method_matches[0]
+                            return True, duplicate_method_matches[0]
 
         print(
             f"DuplicateGuard: No duplicate signatures found in {target_file_path.name}."
         )
-        return False
+        return False, None
 
     def run(
         self,
@@ -421,11 +425,13 @@ class CollaborativeAgentGroup:
                 and modified_code_content_for_iteration is not None
                 and target_file_str
             ):
-                is_duplicate_detected = self._perform_duplicate_guard(
+                is_duplicate_detected, duplicate_fqn = self._perform_duplicate_guard(
                     modified_code_content_for_iteration,
                     Path(target_file_str),
                     context_data,
                 )
+                if duplicate_fqn:
+                    context_data["duplicate_fqn"] = duplicate_fqn
                 if is_duplicate_detected:
                     is_valid = False
                     error_traceback = "DUPLICATE_DETECTED: REUSE_EXISTING_HELPER"

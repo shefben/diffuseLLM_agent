@@ -552,118 +552,33 @@ Your goal is to refine the provided LibCST script for clarity, correctness, and 
         if "DUPLICATE_DETECTED: REUSE_EXISTING_HELPER" in traceback_str:
             if self.verbose:
                 print(
-                    "LLMCore: Received DUPLICATE_DETECTED. Generating LibCST script to comment out previous attempt."
+                    "LLMCore: Received DUPLICATE_DETECTED. Generating LibCST script to reuse existing helper."
                 )
 
-            entity_name_str = (
-                context_data.get("phase_parameters", {}).get("function_name")
-                or context_data.get("phase_parameters", {}).get("class_name")
-                or "unknown_entity"
-            )
-            current_failed_script_content = str(
-                context_data.get(
-                    "current_patch_candidate",
-                    "# Original script could not be retrieved from context.",
-                )
-            )
-
-            header_comment_text = f"Original script commented out due to DUPLICATE_DETECTED for entity: {entity_name_str}.\nPlease refactor the original logic to use the existing helper or rename the entity."
-
-            script_lines_to_embed = current_failed_script_content.splitlines()
-
-            empty_line_calls_str_list = []
-            # Header comments
-            for line_content in header_comment_text.split("\n"):
-                escaped_line = (
-                    line_content.replace("\\", "\\\\")
-                    .replace('"', '\\"')
-                    .replace("'", "\\'")
-                )
-                empty_line_calls_str_list.append(
-                    f'cst.EmptyLine(comment=cst.Comment(f"# {escaped_line}"))'
-                )
-
-            empty_line_calls_str_list.append(
-                "cst.EmptyLine()"
-            )  # Blank line for separation
-
-            # --- Start of commented-out original script ---
-            empty_line_calls_str_list.append(
-                'cst.EmptyLine(comment=cst.Comment("# --- Start of commented-out original script ---"))'
-            )
-            for line_content in script_lines_to_embed:
-                escaped_line = (
-                    line_content.replace("\\", "\\\\")
-                    .replace('"', '\\"')
-                    .replace("'", "\\'")
-                )
-                empty_line_calls_str_list.append(
-                    f'cst.EmptyLine(comment=cst.Comment(f"# {escaped_line}"))'
-                )
-            # --- End of commented-out original script ---
-            empty_line_calls_str_list.append(
-                'cst.EmptyLine(comment=cst.Comment("# --- End of commented-out original script ---"))'
-            )
-
-            empty_line_calls_str_list.append(
-                "cst.EmptyLine()"
-            )  # Blank line for separation
-
-            # TODO comments for actionable next steps
-            todo_comments = [
-                "# TODO: Replace the logic above (now commented out) by importing and",
-                "# TODO: calling the existing helper function/method that was detected as a duplicate.",
-                "# TODO: Example: from existing_module import existing_helper",
-                "# TODO: result = existing_helper_placeholder_function(args_if_known)",
-            ]
-            for comment_line in todo_comments:
-                escaped_comment_line = (
-                    comment_line.replace("\\", "\\\\")
-                    .replace('"', '\\"')
-                    .replace("'", "\\'")
-                )
-                empty_line_calls_str_list.append(
-                    f'cst.EmptyLine(comment=cst.Comment(f"{escaped_comment_line}"))'
-                )  # No extra # prefix needed here for cst.Comment
-
-            empty_line_calls_str_list.append("cst.EmptyLine()")  # Blank line
-
-            # Placeholder function call
-            empty_line_calls_str_list.append(
-                'cst.EmptyLine(comment=cst.Comment(f"# Placeholder call (remove or replace):"))'
-            )
-            empty_line_calls_str_list.append(
-                'cst.Expr(value=cst.Call(func=cst.Name("existing_helper_placeholder_function")))'
-            )
-
-            new_body_elements_initializer_str = (
-                "[\n            "
-                + ",\n            ".join(empty_line_calls_str_list)
-                + "\n        ]"
-            )
+            duplicate_fqn = context_data.get("duplicate_fqn", "existing.helper")
+            module_path, func_name = duplicate_fqn.rsplit(".", 1)
 
             generated_repair_script = f"""
 import libcst as cst
 from libcst.codemod import CodemodContext, VisitorBasedCodemodCommand
 
-class ReplaceContentWithCommentedOutScriptCommand(VisitorBasedCodemodCommand):
-    DESCRIPTION = "Replaces the module's content with a pre-defined commented-out script and header due to a duplicate entity error."
-
-    # No __init__ needed if content is embedded directly or not parameterized further
+class UseExistingHelperCommand(VisitorBasedCodemodCommand):
+    DESCRIPTION = "Replace duplicate code with a call to {duplicate_fqn}."
 
     def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
-        # This list of cst.EmptyLine objects will form the new body of the module.
-        # Each string passed to cst.Comment() will be prefixed with a '#' by LibCST.
-        new_body_elements = {new_body_elements_initializer_str}
+        helper_import = cst.SimpleStatementLine(body=[cst.ImportFrom(module=cst.Name('{module_path}'), names=[cst.ImportAlias(name=cst.Name('{func_name}'))])])
+        new_body = [helper_import] + list(updated_node.body)
+        return updated_node.with_changes(body=new_body)
 
-        return updated_node.with_changes(body=new_body_elements, header=[], footer=[])
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
+        call_expr = cst.parse_statement(f"return {func_name}()")
+        return updated_node.with_changes(body=cst.IndentedBlock(body=[call_expr]))
 
-# To ensure the Patcher can find this class by a known name if needed.
-COMMAND_CLASS_NAME = "ReplaceContentWithCommentedOutScriptCommand"
+COMMAND_CLASS_NAME = "UseExistingHelperCommand"
 """
             if self.verbose:
                 print(
-                    f"LLMCore: Generated repair LibCST script for DUPLICATE_DETECTED (length: {len(generated_repair_script)})."
+                    f"LLMCore: Generated repair LibCST script for duplicate helper rewrite (length: {len(generated_repair_script)})."
                 )
             return generated_repair_script.strip()
 
