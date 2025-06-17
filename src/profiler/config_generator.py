@@ -2,6 +2,8 @@ import toml  # For reading and writing pyproject.toml
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 import sqlite3  # Add sqlite3
+import json
+import argparse
 
 # Assuming UnifiedStyleProfile structure (or its dict representation) is used.
 # from .diffusion_interfacer import UnifiedStyleProfile # For type hint if needed
@@ -516,3 +518,59 @@ def generate_docstring_template_file(
     """Example {docstring_style} docstring."""
     pass
 '''
+    try:
+        template_output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(template_output_path, "w", encoding="utf-8") as f:
+            f.write(template_content)
+        print(f"Docstring template written to {template_output_path.resolve()}")
+        return True
+    except Exception as e:
+        print(f"Error writing docstring template: {e}")
+        return False
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate style configs from a style_fingerprint.json"
+    )
+    parser.add_argument(
+        "project_root",
+        type=Path,
+        help="Path to the repository root",
+    )
+    parser.add_argument(
+        "--fingerprint",
+        type=Path,
+        default=Path("style_fingerprint.json"),
+        help="Path to style fingerprint JSON",
+    )
+    parser.add_argument(
+        "--pyproject",
+        type=Path,
+        default=DEFAULT_PYPROJECT_PATH,
+        help="Path to pyproject.toml",
+    )
+    parser.add_argument(
+        "--naming-db",
+        type=Path,
+        default=Path("config") / "naming_conventions.db",
+        help="Path to naming conventions database",
+    )
+    parser.add_argument(
+        "--template-path",
+        type=Path,
+        default=DEFAULT_DOCSTRING_TEMPLATE_PATH,
+        help="Output path for docstring template",
+    )
+    args = parser.parse_args()
+
+    with open(args.fingerprint, "r", encoding="utf-8") as f:
+        profile = json.load(f)
+
+    generate_black_config_in_pyproject(profile, args.pyproject)
+    generate_ruff_config_in_pyproject(profile, args.pyproject, args.naming_db)
+    generate_docstring_template_file(profile, args.template_path)
+
+
+if __name__ == "__main__":
+    main()

@@ -61,6 +61,12 @@ class SymbolRetriever:
         self.embedding_model = self.digester.embedding_model
         self.faiss_index = self.digester.faiss_index
         self.faiss_id_to_metadata = self.digester.faiss_id_to_metadata
+        self.faiss_secondary_index = getattr(
+            self.digester, "faiss_secondary_index", None
+        )
+        self.faiss_secondary_metadata = getattr(
+            self.digester, "faiss_secondary_id_to_metadata", []
+        )
         self.np_module = np
 
         # Simple in-memory LRU cache for query results
@@ -239,6 +245,41 @@ class SymbolRetriever:
                             print(
                                 f"SymbolRetriever Warning: FAISS ID {faiss_id} out of bounds for metadata list (len {len(self.faiss_id_to_metadata)})."
                             )
+
+        # Fallback to secondary index if we have fewer results than requested
+        if (
+            len(retrieved_symbols_details) < top_k
+            and self.faiss_secondary_index is not None
+            and self.faiss_secondary_index.ntotal > 0
+        ):
+            remaining = top_k - len(retrieved_symbols_details)
+            try:
+                distances2, faiss_ids2 = self.faiss_secondary_index.search(
+                    query_embedding, remaining
+                )
+                for i in range(faiss_ids2.shape[1]):
+                    faiss_id = faiss_ids2[0, i]
+                    if faiss_id == -1:
+                        continue
+                    l2_dist = distances2[0, i]
+                    cosine_similarity = 1 - (l2_dist**2 / 2)
+                    if cosine_similarity >= similarity_threshold:
+                        if 0 <= faiss_id < len(self.faiss_secondary_metadata):
+                            metadata = self.faiss_secondary_metadata[int(faiss_id)]
+                            symbol_detail = {
+                                "fqn": metadata.get("fqn"),
+                                "item_type": metadata.get("item_type"),
+                                "file_path": metadata.get("file_path"),
+                                "start_line": metadata.get("start_line"),
+                                "end_line": metadata.get("end_line"),
+                                "similarity_score": float(cosine_similarity),
+                            }
+                            retrieved_symbols_details.append(symbol_detail)
+            except Exception as e:
+                if self.verbose:
+                    print(
+                        f"SymbolRetriever Warning: secondary FAISS search failed: {e}"
+                    )
 
         # Sort by similarity score descending before returning, if multiple results
         retrieved_symbols_details.sort(

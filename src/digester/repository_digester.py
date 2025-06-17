@@ -1660,6 +1660,10 @@ class RepositoryDigester:
         self.faiss_id_to_metadata: List[Dict[str, Any]] = []
         self.faiss_index_path: Optional[Path] = None
         self.faiss_metadata_path: Optional[Path] = None
+        self.faiss_secondary_index: Optional[faiss.Index] = None
+        self.faiss_secondary_id_to_metadata: List[Dict[str, Any]] = []
+        self.faiss_secondary_index_path: Optional[Path] = None
+        self.faiss_secondary_metadata_path: Optional[Path] = None
         self._faiss_dirty_flag = True  # Assume dirty until loaded or successfully saved
 
         faiss_on_disk_path_str = self.app_config.get("digester", {}).get(
@@ -1679,6 +1683,12 @@ class RepositoryDigester:
             self.faiss_metadata_path = base_path.parent / (
                 base_path.name + "_metadata.json"
             )
+            self.faiss_secondary_index_path = base_path.parent / (
+                base_path.name + "_secondary.faiss"
+            )
+            self.faiss_secondary_metadata_path = base_path.parent / (
+                base_path.name + "_secondary_metadata.json"
+            )
             self.faiss_index_path.parent.mkdir(parents=True, exist_ok=True)
             if self.verbose:
                 print(
@@ -1686,6 +1696,9 @@ class RepositoryDigester:
                 )
                 print(
                     f"RepositoryDigester Info: FAISS on-disk metadata path set to: {self.faiss_metadata_path}"
+                )
+                print(
+                    f"RepositoryDigester Info: Secondary FAISS path set to: {self.faiss_secondary_index_path}"
                 )
 
         loaded_from_disk = False
@@ -1707,6 +1720,11 @@ class RepositoryDigester:
                     print(
                         f"RepositoryDigester Info: FAISS index and metadata loaded from disk. Index contains {self.faiss_index.ntotal if self.faiss_index else 0} items."
                     )
+                if (
+                    self.faiss_secondary_index_path
+                    and self.faiss_secondary_metadata_path
+                ):
+                    self._load_faiss_secondary()
             else:
                 if self.verbose:
                     print(
@@ -1809,6 +1827,24 @@ class RepositoryDigester:
                     f"RepositoryDigester: Error loading FAISS index/metadata: {e}. A new index will be created if needed."
                 )
             return False
+
+    def _load_faiss_secondary(self) -> None:
+        if (
+            not faiss
+            or not self.faiss_secondary_index_path
+            or not self.faiss_secondary_metadata_path
+        ):
+            return
+        orig_index = self.faiss_index
+        orig_meta = self.faiss_id_to_metadata
+        loaded = self._load_faiss_index_and_metadata(
+            self.faiss_secondary_index_path, self.faiss_secondary_metadata_path
+        )
+        if loaded:
+            self.faiss_secondary_index = self.faiss_index
+            self.faiss_secondary_id_to_metadata = self.faiss_id_to_metadata
+        self.faiss_index = orig_index
+        self.faiss_id_to_metadata = orig_meta
 
     def _save_faiss_index_and_metadata(
         self, index_path: Path, metadata_path: Path
