@@ -22,6 +22,7 @@ DEFAULT_APP_CONFIG: Dict[str, Any] = {
         "t5_spec_normalizer_dir": "./models/placeholder_t5_spec_normalizer/",
         # Planner
         "planner_scorer_gguf": "./models/placeholder_scorer.gguf",
+        "operations_llm_gguf": "./models/placeholder_operations.gguf",
         # Agent Core LLM (scaffold, polish, repair, infill if GGUF based)
         "agent_llm_gguf": "./models/placeholder_llm_agent.gguf",  # General agent model
         "repair_llm_gguf": "./models/placeholder_repair_model.gguf",  # Specific repair model (can be same as agent_llm_gguf)

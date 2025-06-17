@@ -42,7 +42,10 @@ from src.profiler.style_validator import StyleValidatorCore
 
 # Other necessary imports
 from src.agent_group.exceptions import PhaseFailure
-from src.profiler.llm_interfacer import get_llm_score_for_text
+from src.profiler.llm_interfacer import (
+    get_llm_score_for_text,
+    propose_refactor_operations,
+)
 from src.utils.memory_logger import log_successful_patch  # For Success Memory Logging
 
 # REFACTOR_OPERATION_CLASSES is not directly used by PhasePlanner logic, REFACTOR_OPERATION_INSTANCES is.
@@ -227,6 +230,16 @@ class PhasePlanner:
             raise ValueError("Beam width must be a positive integer.")
         if self.verbose:
             print(f"PhasePlanner: Beam width set to {self.beam_width}")
+
+        self.operations_llm_path = str(
+            Path(
+                self.app_config.get("models", {}).get("operations_llm_gguf", "")
+            ).resolve()
+        )
+        if self.verbose and self.operations_llm_path:
+            print(
+                f"PhasePlanner: operations LLM path set to {self.operations_llm_path}"
+            )
 
         # Instantiate Child Components (Passing app_config or derived configs)
 
@@ -478,6 +491,11 @@ class PhasePlanner:
         spec_obj = self.spec_normalizer.normalise_request(goal_text)
         if spec_obj is None:
             raise ValueError("SpecNormalizer failed to create a Spec from goal text")
+
+        if not spec_obj.operations:
+            spec_obj.operations = propose_refactor_operations(
+                goal_text, model_path=self.operations_llm_path, verbose=self.verbose
+            )
 
         if not spec_obj.operations:
             spec_obj.operations = self._extract_operations_from_goal(goal_text)

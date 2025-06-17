@@ -10,6 +10,7 @@ models:
   divot5_style_unifier_dir: ./models/placeholder_divot5_unifier/
   t5_spec_normalizer_dir: ./models/placeholder_t5_spec_normalizer/
   planner_scorer_gguf: ./models/placeholder_scorer.gguf
+  operations_llm_gguf: ./models/placeholder_operations.gguf
   agent_llm_gguf: ./models/placeholder_llm_agent.gguf
   repair_llm_gguf: ./models/placeholder_repair_model.gguf
   infill_llm_gguf: ./models/placeholder_llm_agent.gguf

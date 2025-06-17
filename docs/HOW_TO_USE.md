@@ -30,7 +30,8 @@ From the web interface:
 1. Enter a plain‑text feature request or bug description in the form.
 2. Click **Apply Patch**.
 3. The assistant normalizes the request, plans a sequence of operations, and generates a validated patch.
-4. Successful patches are logged in **Success Memory** for review and future fine‑tuning.
+4. The proposed plan is shown in a text box so you can tweak phase order or parameters before hitting **Approve Plan & Run**.
+5. Successful patches are logged in **Success Memory** for review and future fine‑tuning.
 
 ## 4. Command-Line Operation
 
