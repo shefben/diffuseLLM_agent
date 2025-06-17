@@ -751,6 +751,7 @@ class CollaborativeAgentGroup:
                         f"Best historical script was (Valid: {was_valid_in_history}, Score: {best_historical_score:.2f}), but phase still failed on last attempt."
                     )
 
+                self.abort_and_rollback()
                 raise PhaseFailure(
                     f"Failed to validate/repair patch after {self.max_repair_attempts} attempts. Last error: {last_error_for_failure}"
                 )
@@ -791,6 +792,7 @@ class CollaborativeAgentGroup:
                 if "error_traceback" in locals() and error_traceback
                 else "No successful patch and no specific error traceback recorded."
             )
+            self.abort_and_rollback()
             raise PhaseFailure(
                 f"No valid patch could be generated after loop. Last error: {final_error_msg}"
             )

@@ -8,6 +8,7 @@ import re  # For CallGraphVisitor._resolve_callee_fqn
 from collections import defaultdict
 import collections  # Added for deque in get_call_graph_slice
 import json
+import shutil
 from .graph_structures import (
     CallGraph,
     ControlDependenceGraph,
@@ -2872,9 +2873,32 @@ class RepositoryDigester:
                         self.faiss_index_path, self.faiss_metadata_path
                     )
                     if save_ok:
-                        self._faiss_dirty_flag = (
-                            False  # Clear dirty flag only if save is successful
-                        )
+                        # Update secondary cache with previous on-disk snapshot
+                        if (
+                            self.faiss_secondary_index_path
+                            and self.faiss_secondary_metadata_path
+                        ):
+                            try:
+                                if self.faiss_index_path.exists():
+                                    shutil.copy2(
+                                        self.faiss_index_path,
+                                        self.faiss_secondary_index_path,
+                                    )
+                                if self.faiss_metadata_path.exists():
+                                    shutil.copy2(
+                                        self.faiss_metadata_path,
+                                        self.faiss_secondary_metadata_path,
+                                    )
+                                if self.verbose:
+                                    print(
+                                        "RepositoryDigester Info: Secondary FAISS cache updated."
+                                    )
+                            except Exception as e_copy:
+                                if self.verbose:
+                                    print(
+                                        f"RepositoryDigester Warning: Failed to update secondary FAISS cache: {e_copy}"
+                                    )
+                        self._faiss_dirty_flag = False
                         if self.verbose:
                             print(
                                 "RepositoryDigester Info: FAISS index and metadata saved to disk."
