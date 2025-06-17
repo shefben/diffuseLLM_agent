@@ -1,32 +1,13 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Knowledge Graph Query</title>
-    <style>
-        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
-        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Knowledge Graph Query</h1>
-        <form method="get" action="/query_graph">
-            <label>Source symbol:</label>
-            <input type="text" name="src" value="{{ query_src }}">
-            <label>Relation (optional):</label>
-            <input type="text" name="relation" value="{{ query_relation or '' }}">
-            <label>Depth:</label>
-            <input type="number" name="depth" value="{{ depth }}" min="1" max="5">
-            <input type="submit" value="Query">
-        </form>
-        {% if result %}
-        <h2>Results</h2>
-        <pre>{{ result | tojson(indent=2) }}</pre>
-        {% endif %}
-        <div style="margin-top:20px;">
-            <a href="/">Back to Home</a>
-        </div>
-    </div>
-</body>
-</html>
+{% extends 'base.html' %}
+{% block content %}
+<h1>Knowledge Graph Query</h1>
+<form method="get">
+    <input type="text" name="src" placeholder="Symbol" value="{{ query_src }}">
+    <input type="text" name="relation" placeholder="Relation" value="{{ query_relation or '' }}">
+    <input type="number" name="depth" value="{{ depth }}" min="1">
+    <input type="submit" value="Query">
+</form>
+{% if result %}
+<pre>{{ result|tojson(indent=2) }}</pre>
+{% endif %}
+{% endblock %}

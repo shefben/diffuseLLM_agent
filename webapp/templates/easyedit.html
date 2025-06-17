@@ -1,26 +1,12 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>EasyEdit</title>
-    <style>
-        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
-        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-        textarea { width: 100%; height: 80px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>EasyEdit Model Parameters</h1>
-        {% if message %}<p>{{ message }}</p>{% endif %}
-        <form method="POST">
-            <label>Instruction</label><br>
-            <textarea name="instruction" required></textarea><br>
-            <label>New Response</label><br>
-            <textarea name="new_text" required></textarea><br>
-            <input type="submit" value="Apply Edit">
-        </form>
-        <div style="margin-top:20px;"><a href="/">Back to Home</a></div>
-    </div>
-</body>
-</html>
+{% extends 'base.html' %}
+{% block content %}
+<h1>EasyEdit Model Parameters</h1>
+{% if message %}<p>{{ message }}</p>{% endif %}
+<form method="POST">
+    <label>Instruction</label><br>
+    <textarea name="instruction" required></textarea><br>
+    <label>New Response</label><br>
+    <textarea name="new_text" required></textarea><br>
+    <input type="submit" value="Apply Edit">
+</form>
+{% endblock %}
