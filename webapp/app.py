@@ -119,53 +119,35 @@ def index():
             error_message = "SpecNormalizer component within PhasePlanner not initialized correctly. Check webapp startup logs."
         else:
             try:
-                # Call normalise_request
-                spec_object = phase_planner_global.spec_normalizer.normalise_request(
+                # Generate plan directly from goal text
+                spec_object, plan_list = phase_planner_global.generate_plan_from_goal(
                     submitted_issue
                 )
 
-                if spec_object is None:
-                    error_message = "Failed to normalize request into a Spec (SpecNormalizer returned None)."
-                elif (
-                    isinstance(spec_object, dict) and "error" in spec_object
-                ):  # Check if spec_object itself is an error placeholder
+                if hasattr(spec_object, "model_dump_json"):
+                    spec_data_str = spec_object.model_dump_json(indent=2)
+                elif hasattr(spec_object, "json"):
+                    spec_data_str = spec_object.json(indent=2)
+                else:
+                    spec_data_str = json.dumps(spec_object, indent=2, default=str)
+
+                if not plan_list:  # Handles None or empty list
                     error_message = (
-                        f"Error during spec normalization: {spec_object['error']}"
+                        (error_message + "\n" if error_message else "")
+                        + "Failed to generate a plan from the Spec (generate_plan_from_spec returned empty or None)."
                     )
                 else:
-                    # Successfully got a Spec object
-                    if hasattr(spec_object, "model_dump_json"):
-                        spec_data_str = spec_object.model_dump_json(indent=2)
-                    elif hasattr(spec_object, "json"):  # Pydantic v1
-                        spec_data_str = spec_object.json(indent=2)
-                    else:
-                        spec_data_str = json.dumps(
-                            spec_object, indent=2, default=str
-                        )  # Fallback
-
-                    # Call generate_plan_from_spec
-                    plan_list = phase_planner_global.generate_plan_from_spec(
-                        spec_object
-                    )
-
-                    if not plan_list:  # Handles None or empty list
-                        error_message = (
-                            (error_message + "\n" if error_message else "")
-                            + "Failed to generate a plan from the Spec (generate_plan_from_spec returned empty or None)."
-                        )
-                    else:
-                        phase_data_list = []
-                        for phase in plan_list:
-                            if hasattr(phase, "model_dump_json"):
-                                phase_data_list.append(phase.model_dump_json(indent=2))
-                            elif hasattr(phase, "json"):  # Pydantic v1
-                                phase_data_list.append(phase.json(indent=2))
-                            else:
-                                # Basic string representation for Phase objects if no Pydantic methods
-                                phase_data_list.append(
-                                    f"Phase: {getattr(phase, 'operation_name', 'Unknown Op')}\nTarget: {getattr(phase, 'target_file', 'N/A')}\nParams: {getattr(phase, 'parameters', {})}\nDescription: {getattr(phase, 'description', 'N/A')}"
-                                )
-                        plan_data_str = "\n\n---\n\n".join(phase_data_list)
+                    phase_data_list = []
+                    for phase in plan_list:
+                        if hasattr(phase, "model_dump_json"):
+                            phase_data_list.append(phase.model_dump_json(indent=2))
+                        elif hasattr(phase, "json"):
+                            phase_data_list.append(phase.json(indent=2))
+                        else:
+                            phase_data_list.append(
+                                f"Phase: {getattr(phase, 'operation_name', 'Unknown Op')}\nTarget: {getattr(phase, 'target_file', 'N/A')}\nParams: {getattr(phase, 'parameters', {})}\nDescription: {getattr(phase, 'description', 'N/A')}"
+                            )
+                    plan_data_str = "\n\n---\n\n".join(phase_data_list)
 
             except Exception as e_process:
                 print(f"WebApp Error: Error during POST processing: {e_process}")

@@ -384,6 +384,33 @@ class PhasePlanner:
                     f"PhasePlanner._suggest_alternative_operations: Suggested 'generic_code_edit' as an alternative for '{current_op_name}'."
                 )
 
+            if current_op_name == "add_decorator":
+                dec_import = current_op_spec_item.get(
+                    "decorator_import_statement_param"
+                )
+                if not dec_import:
+                    dec_import = getattr(
+                        REFACTOR_OPERATION_INSTANCES["add_decorator"],
+                        "decorator_import_statement",
+                        None,
+                    )
+                if dec_import:
+                    add_import_alt = {
+                        "name": "add_import",
+                        "target_file": current_op_spec_item.get("target_file"),
+                        "parameters": self._infer_parameters_for_alternative(
+                            "add_import",
+                            current_op_spec_item,
+                            spec,
+                            {"import_statement": dec_import},
+                        ),
+                    }
+                    alternative_ops.append(add_import_alt)
+                    if self.verbose:
+                        print(
+                            "PhasePlanner._suggest_alternative_operations: Added 'add_import' as alternative for missing decorator import."
+                        )
+
         return alternative_ops
 
     def generate_plan_from_spec(self, spec: Spec) -> List[Phase]:
@@ -416,6 +443,36 @@ class PhasePlanner:
 
         return best_plan
 
+    def _extract_operations_from_goal(self, goal_text: str) -> List[Dict[str, Any]]:
+        """Naively infer operations from free-form text.
+
+        This is a lightweight heuristic used when the spec normalizer returns no
+        structured operations.  A real system would delegate to an LLM-based
+        planner, but here we map simple keywords to grammar operations.
+        """
+        ops: List[Dict[str, Any]] = []
+        lowered = goal_text.lower()
+        if "import" in lowered:
+            ops.append({"name": "add_import", "parameters": {"import_statement": ""}})
+        if "decorator" in lowered:
+            ops.append(
+                {
+                    "name": "add_decorator",
+                    "parameters": {
+                        "decorator_name": "@todo",
+                        "target_function_name": "func",
+                    },
+                }
+            )
+        if "docstring" in lowered:
+            ops.append(
+                {
+                    "name": "update_docstring",
+                    "parameters": {"target_name": "func", "new_docstring": ""},
+                }
+            )
+        return ops
+
     def generate_plan_from_goal(self, goal_text: str) -> Tuple[Spec, List[Phase]]:
         """High level entry point: normalize raw goal text and generate a plan."""
         spec_obj = self.spec_normalizer.normalise_request(goal_text)
@@ -423,8 +480,16 @@ class PhasePlanner:
             raise ValueError("SpecNormalizer failed to create a Spec from goal text")
 
         if not spec_obj.operations:
-            # crude fallback: propose a generic code edit
-            spec_obj.operations.append({"name": "generic_code_edit", "parameters": {"edit_description": goal_text[:120]}})
+            spec_obj.operations = self._extract_operations_from_goal(goal_text)
+
+        if not spec_obj.operations:
+            # final fallback
+            spec_obj.operations.append(
+                {
+                    "name": "generic_code_edit",
+                    "parameters": {"edit_description": goal_text[:120]},
+                }
+            )
 
         plan_list = self.generate_plan_from_spec(spec_obj)
         return spec_obj, plan_list
@@ -448,12 +513,43 @@ class PhasePlanner:
         spec: "Spec",
         base_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Heuristic parameter inference for alternative operations."""
+        """Heuristic parameter inference for alternative operations.
+
+        This attempts to map fields from the original operation to sensible
+        defaults for the alternative one so users do not need to manually fill
+        them in when approving a generated plan.
+        """
         params = base_params.copy() if base_params else {}
+
         if alt_op_name == "generic_code_edit":
             target_file = original_op_spec.get("target_file")
             if target_file:
                 params.setdefault("target_file", target_file)
+
+        elif alt_op_name == "add_import":
+            target_file = original_op_spec.get("target_file")
+            if target_file:
+                params.setdefault("target_file", target_file)
+            import_stmt = original_op_spec.get(
+                "decorator_import_statement_param"
+            ) or original_op_spec.get("import_statement")
+            if not import_stmt and original_op_spec.get("decorator_name"):
+                dec = str(original_op_spec["decorator_name"]).lstrip("@")
+                import_stmt = f"from . import {dec}"
+            if import_stmt:
+                params.setdefault("import_statement", import_stmt)
+
+        elif alt_op_name == "update_docstring":
+            target = original_op_spec.get(
+                "target_function_name"
+            ) or original_op_spec.get("target_name")
+            if target:
+                params.setdefault("target_name", target)
+            params.setdefault(
+                "new_docstring",
+                f"Update docstring to clarify: {spec.issue_description[:40]}...",
+            )
+
         return params
 
     def _get_graph_statistics(self) -> Dict[str, Any]:

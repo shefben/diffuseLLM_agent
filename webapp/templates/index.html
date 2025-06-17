@@ -27,6 +27,7 @@
             <input type="hidden" name="issue_text" id="issue_text_hidden">
             <input type="hidden" name="plan_json" id="plan_json_hidden">
             <input type="submit" value="Approve Plan & Run">
+            <button type="button" onclick="window.location.reload()">Reject Plan</button>
         </form>
 
         {% if error_message %}
