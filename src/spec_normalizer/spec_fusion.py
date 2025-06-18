@@ -16,8 +16,7 @@ except ImportError:
 
 # Imports for actual classes
 from src.planner.spec_model import Spec # Assuming this is the correct path
-from .t5_client import T5Client # Keep for __main__ and type hint if not replacing everywhere
-from .spec_normalizer_interface import SpecNormalizerModelInterface # New import
+from .spec_normalizer_interface import SpecNormalizerModelInterface
 
 if TYPE_CHECKING:
     from src.retriever.symbol_retriever import SymbolRetriever # For type hinting
@@ -59,7 +58,9 @@ class SpecFusion:
         if self.verbose:
             print(f"SpecFusion initialized. Spec Model Interface ready: {self.spec_model.is_ready}, SymbolRetriever type: {type(self.symbol_retriever)}")
 
-    def normalise_request(self, raw_issue_text: str) -> Optional[Spec]:
+    def normalise_request(
+        self, raw_issue_text: str, mcp_prompt: Optional[str] = None
+    ) -> Optional[Spec]:
         """
         Normalizes a raw issue text string into a structured Spec object.
         This involves retrieving context symbols, calling a T5 model to generate
@@ -83,7 +84,8 @@ class SpecFusion:
 
         if self.symbol_retriever:
             try:
-                if self.verbose: print("SpecFusion: Retrieving enriched context (symbols and examples)...")
+                if self.verbose:
+                    print("SpecFusion: Retrieving enriched context (symbols and examples)...")
                 retrieved_context = self.symbol_retriever.get_enriched_context_for_spec_fusion(raw_issue_text)
 
                 relevant_symbols_list = retrieved_context.get("relevant_symbols", [])
@@ -104,20 +106,24 @@ class SpecFusion:
                         )
                         symbol_details_strs.append(detail)
                     context_parts.append("\n".join(symbol_details_strs))
-                    if self.verbose: print(f"SpecFusion: Retrieved and formatted {len(relevant_symbols_list)} relevant symbols.")
+                    if self.verbose:
+                        print(f"SpecFusion: Retrieved and formatted {len(relevant_symbols_list)} relevant symbols.")
 
                 if success_examples:
                     example_strs = ["Previously successful related examples:"]
                     for i, ex in enumerate(success_examples, 1):
                         example_strs.append(f"Example {i}:\n  Issue: {ex.get('issue')}\n  Successful Script Preview: {ex.get('script_preview')}")
                     context_parts.append("\n".join(example_strs))
-                    if self.verbose: print(f"SpecFusion: Retrieved {len(success_examples)} success examples.")
+                    if self.verbose:
+                        print(f"SpecFusion: Retrieved {len(success_examples)} success examples.")
 
                 if context_parts:
                     context_symbols_string = "\n\n".join(context_parts)
 
                 if self.verbose and context_symbols_string != "No specific context symbols or examples retrieved.":
-                     print(f"SpecFusion: Enriched context string preview (first 300 chars): '{context_symbols_string[:300]}...'")
+                    print(
+                        f"SpecFusion: Enriched context string preview (first 300 chars): '{context_symbols_string[:300]}...'"
+                    )
                 elif self.verbose:
                     print("SpecFusion: No FQNs or success examples retrieved to form context string.")
 
@@ -132,8 +138,11 @@ class SpecFusion:
             print("SpecFusion Error: SpecNormalizerModelInterface (e.g., T5Client) not ready. Cannot process request.")
             return None
 
-        if self.verbose: print("SpecFusion: Requesting YAML spec from SpecNormalizerModelInterface...")
-        yaml_spec_str = self.spec_model.generate_spec_yaml(raw_issue_text, context_symbols_string)
+        if self.verbose:
+            print("SpecFusion: Requesting YAML spec from SpecNormalizerModelInterface...")
+        yaml_spec_str = self.spec_model.generate_spec_yaml(
+            raw_issue_text, context_symbols_string, mcp_prompt
+        )
 
         if yaml_spec_str is None:
             print("SpecFusion Error: SpecNormalizerModelInterface failed to generate YAML spec string (returned None).")
@@ -145,30 +154,35 @@ class SpecFusion:
         # 3. Parse YAML String
         parsed_dict: Optional[Dict[str, Any]] = None
         try:
-            if self.verbose: print("SpecFusion: Parsing YAML spec string...")
+            if self.verbose:
+                print("SpecFusion: Parsing YAML spec string...")
             parsed_dict = yaml.safe_load(yaml_spec_str)
         except yaml.YAMLError as e:
             print(f"SpecFusion Error: Failed to parse YAML spec from T5. Error: {e}")
-            if self.verbose: print(f"Problematic YAML string:\n{yaml_spec_str}")
+            if self.verbose:
+                print(f"Problematic YAML string:\n{yaml_spec_str}")
             return None
 
         if not isinstance(parsed_dict, dict):
             print(f"SpecFusion Error: Parsed YAML is not a dictionary, but type {type(parsed_dict)}. Content: {str(parsed_dict)[:200]}")
             return None
 
-        if self.verbose: print(f"SpecFusion: Successfully parsed YAML to dictionary: {list(parsed_dict.keys())}")
+        if self.verbose:
+            print(f"SpecFusion: Successfully parsed YAML to dictionary: {list(parsed_dict.keys())}")
 
         # 4. Validate and Instantiate Spec Model
         spec_object: Optional[Spec] = None
         try:
-            if self.verbose: print("SpecFusion: Validating dictionary and instantiating Spec model...")
+            if self.verbose:
+                print("SpecFusion: Validating dictionary and instantiating Spec model...")
             # The Spec model itself should not store these raw inputs if they are not part of its schema.
             # They can be stored alongside the Spec object by the caller if needed.
             # parsed_dict["raw_issue_text"] = raw_issue_text # Removed
             # parsed_dict["raw_yaml_spec"] = yaml_spec_str # Removed
 
             spec_object = Spec(**parsed_dict)
-            if self.verbose: print("SpecFusion: Successfully normalized request to Spec object.")
+            if self.verbose:
+                print("SpecFusion: Successfully normalized request to Spec object.")
             return spec_object
         except ValidationError as e_pydantic: # If Pydantic's ValidationError was imported
             print(f"SpecFusion Error: Failed to validate Spec model from parsed YAML. Errors:\n{e_pydantic}")
@@ -187,8 +201,10 @@ if __name__ == '__main__':
         from src.digester.repository_digester import RepositoryDigester
     except ImportError:
         print("Warning (__main__): src.digester.repository_digester.RepositoryDigester not found. Using placeholder.")
-        class RepositoryDigester: # type: ignore
-             def __init__(self, repo_path: Any): self.repo_path = repo_path; self.faiss_id_to_metadata = []
+        class RepositoryDigester:  # type: ignore
+            def __init__(self, repo_path: Any):
+                self.repo_path = repo_path
+                self.faiss_id_to_metadata = []
              # Add app_config to mock if real one takes it
             # def __init__(self, repo_path: Any, app_config: Dict[str, Any]):
             #     self.repo_path = repo_path; self.app_config = app_config; self.faiss_id_to_metadata = []
@@ -208,8 +224,13 @@ if __name__ == '__main__':
             self.is_ready = True # Assume ready for mock
             print(f"MockT5Client initialized, verbose: {self.verbose}")
 
-        def request_spec_from_text(self, raw_issue_text: str, context_symbols_string: Optional[str] = None) -> Optional[str]:
-            if self.verbose: print(f"MockT5Client.request_spec_from_text called. Issue: '{raw_issue_text[:50]}...', Symbols: '{str(context_symbols_string)[:50]}...'")
+        def request_spec_from_text(
+            self, raw_issue_text: str, context_symbols_string: Optional[str] = None
+        ) -> Optional[str]:
+            if self.verbose:
+                print(
+                    f"MockT5Client.request_spec_from_text called. Issue: '{raw_issue_text[:50]}...', Symbols: '{str(context_symbols_string)[:50]}...'"
+                )
             # Simulate YAML output based on input
             if "add function" in raw_issue_text:
                 return """
@@ -254,8 +275,16 @@ acceptance_tests:
                 self.app_config = app_config
                 self.verbose = self.app_config.get("general",{}).get("verbose",False)
                 print(f"MockSymbolRetrieverForFusionMain initialized, verbose: {self.verbose}")
-            def get_enriched_context_for_spec_fusion(self, raw_issue_text: str, max_fqns: int = 300, max_success_examples: int = 2) -> Dict[str, Any]: # Match real signature
-                if self.verbose: print(f"MockSymbolRetrieverForFusionMain.get_enriched_context_for_spec_fusion called, issue: '{raw_issue_text[:20]}...'")
+            def get_enriched_context_for_spec_fusion(
+                self,
+                raw_issue_text: str,
+                max_fqns: int = 300,
+                max_success_examples: int = 2,
+            ) -> Dict[str, Any]:
+                if self.verbose:
+                    print(
+                        "MockSymbolRetrieverForFusionMain.get_enriched_context_for_spec_fusion called, issue: "
+                        f"'{raw_issue_text[:20]}...'")
                 symbols = ["example.utils.helper_a", "example.services.main_service.process_data", "another.mock.symbol"]
                 return {"fqns": symbols[:max_fqns] if max_fqns is not None else symbols, "success_examples": []}
         SymbolRetrieverToUseInMain = MockSymbolRetrieverForFusionMain # type: ignore

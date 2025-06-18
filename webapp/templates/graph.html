@@ -1,0 +1,13 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Knowledge Graph Query</h1>
+<form method="get">
+    <input type="text" name="src" placeholder="Symbol" value="{{ query_src }}">
+    <input type="text" name="relation" placeholder="Relation" value="{{ query_relation or '' }}">
+    <input type="number" name="depth" value="{{ depth }}" min="1">
+    <input type="submit" value="Query">
+</form>
+{% if result %}
+<pre>{{ result|tojson(indent=2) }}</pre>
+{% endif %}
+{% endblock %}

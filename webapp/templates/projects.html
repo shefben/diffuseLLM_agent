@@ -1,0 +1,24 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Select Project</h1>
+<ul>
+{% for env in environments %}
+    <li>
+        <form method="post" style="display:inline;" action="/projects">
+            <input type="hidden" name="action" value="select">
+            <input type="hidden" name="env_name" value="{{ env.name }}">
+            <input type="submit" value="Open">
+            {{ env.name }} - {{ env.description }} ({{ env.path }})
+        </form>
+    </li>
+{% endfor %}
+</ul>
+<h2>Create New Project</h2>
+<form method="post" action="/projects">
+    <input type="text" name="new_name" placeholder="Name"><br>
+    <input type="text" name="new_path" placeholder="Path"><br>
+    <textarea name="new_desc" rows="3" placeholder="Description"></textarea><br>
+    <input type="submit" value="Create">
+</form>
+{% if message %}<p style="color:red;">{{ message }}</p>{% endif %}
+{% endblock %}

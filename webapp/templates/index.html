@@ -1,56 +1,65 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Code Agent</title>
-    <style>
-        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
-        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-        h1, h2 { color: #333; }
-        textarea { width: 98%; padding: 10px; margin-bottom: 10px; border-radius: 4px; border: 1px solid #ddd; font-family: monospace;}
-        input[type="submit"] { background-color: #5cb85c; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; }
-        input[type="submit"]:hover { background-color: #4cae4c; }
-        pre { background-color: #eee; padding: 10px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; }
-        .results-section { margin-top: 20px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>AI Code Agent: Issue Submission</h1>
-        <form method="POST">
-            <label for="issue_text">Describe the issue or feature request:</label><br>
-            <textarea name="issue_text" id="issue_text" rows="10"></textarea><br>
-            <input type="submit" value="Generate Plan">
-        </form>
-
-        {% if error_message %}
-        <div class="results-section" style="color: red; border: 1px solid red; padding: 10px; background-color: #ffe0e0;">
-            <h2>Error:</h2>
-            <pre>{{ error_message }}</pre>
-        </div>
-        {% endif %}
-
-        {% if submitted_issue %}
-        <div class="results-section">
-            <h2>Submitted Issue:</h2>
-            <pre>{{ submitted_issue }}</pre>
-        </div>
-        {% endif %}
-
-        {% if spec_data %}
-        <div class="results-section">
-            <h2>Generated Specification (Spec):</h2>
-            <pre>{{ spec_data }}</pre>
-        </div>
-        {% endif %}
-
-        {% if plan_data %}
-        <div class="results-section">
-            <h2>Generated Plan (Phases):</h2>
-            <pre>{{ plan_data }}</pre>
-        </div>
-        {% endif %}
-    </div>
-</body>
-</html>
+{% extends 'base.html' %}
+{% block content %}
+<h1>AI Code Agent: Issue Submission</h1>
+<form method="POST" action="/">
+    <label for="issue_text">Describe the issue or feature request:</label><br>
+    <textarea name="issue_text" id="issue_text" rows="10"></textarea><br>
+    <label for="workflow">Workflow:</label>
+    <select name="workflow" id="workflow">
+        <option value="orchestrator-workers" {% if workflow_selected=='orchestrator-workers' %}selected{% endif %}>Orchestrator-workers</option>
+        <option value="prompt_chaining" {% if workflow_selected=='prompt_chaining' %}selected{% endif %}>Prompt chaining</option>
+        <option value="routing" {% if workflow_selected=='routing' %}selected{% endif %}>Routing</option>
+        <option value="parallelization" {% if workflow_selected=='parallelization' %}selected{% endif %}>Parallelization</option>
+        <option value="evaluator-optimizer" {% if workflow_selected=='evaluator-optimizer' %}selected{% endif %}>Evaluator-optimizer</option>
+        {% for wf in custom_workflows %}
+        <option value="{{ wf.name }}" {% if workflow_selected==wf.name %}selected{% endif %}>{{ wf.name }}</option>
+        {% endfor %}
+    </select><br>
+    <input type="submit" value="Generate Plan">
+</form>
+<form method="POST" action="/apply_plan" style="margin-top:10px;">
+    <input type="hidden" name="issue_text" id="issue_text_hidden">
+    <input type="hidden" name="plan_json" id="plan_json_hidden">
+    <input type="hidden" name="workflow" id="workflow_hidden">
+    <input type="submit" value="Approve Plan & Run">
+    <button type="button" onclick="window.location.reload()">Reject Plan</button>
+</form>
+{% if error_message %}
+<div class="results-section" style="color: red; border: 1px solid red; padding: 10px; background-color: #611;">
+    <h2>Error:</h2>
+    <pre>{{ error_message }}</pre>
+</div>
+{% endif %}
+{% if submitted_issue %}
+<div class="results-section">
+    <h2>Submitted Issue:</h2>
+    <pre>{{ submitted_issue }}</pre>
+</div>
+{% endif %}
+{% if spec_data %}
+<div class="results-section">
+    <h2>Generated Specification (Spec):</h2>
+    <pre>{{ spec_data }}</pre>
+</div>
+{% endif %}
+{% if plan_data %}
+<div class="results-section">
+    <h2>Generated Plan (Phases):</h2>
+    <textarea id="plan_editor" rows="10" style="width:98%;">{{ plan_data }}</textarea>
+</div>
+{% endif %}
+<script>
+const issueField = document.getElementById('issue_text');
+const hiddenField = document.getElementById('issue_text_hidden');
+const planHidden = document.getElementById('plan_json_hidden');
+const workflowSelect = document.getElementById('workflow');
+const workflowHidden = document.getElementById('workflow_hidden');
+const applyForm = document.forms[1];
+applyForm.addEventListener('submit', () => {
+    hiddenField.value = issueField.value;
+    const planEditor = document.getElementById('plan_editor');
+    if (planEditor) planHidden.value = planEditor.value;
+    if (workflowSelect) workflowHidden.value = workflowSelect.value;
+});
+</script>
+{% endblock %}
