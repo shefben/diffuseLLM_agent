@@ -51,6 +51,7 @@ Some features depend on optional packages such as `transformers` and GPU‑enabl
    ```
    Visit <http://localhost:5001> to submit an issue, review the generated plan, and approve or edit it before execution.
    Model paths and training parameters are read from `config.yaml`, so command‑line flags are optional.
+   The dashboard also offers code search, knowledge graph queries, memory review, and training controls.
 
 For more detailed workflows—including active learning and fine‑tuning—see the [Usage Guide](docs/HOW_TO_USE.md).
 

@@ -199,7 +199,9 @@ def memory_detail_route(index: int):
 
     data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
     if not data_dir.is_absolute():
-        project_root = Path(app_config_global.get("general", {}).get("project_root", "."))
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
         data_dir = project_root / data_dir
     entries = load_success_memory(data_dir)
     if index < 0 or index >= len(entries):
@@ -328,7 +330,9 @@ def train_route():
     message = None
     data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
     if not data_dir.is_absolute():
-        project_root = Path(app_config_global.get("general", {}).get("project_root", "."))
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
         data_dir = project_root / data_dir
 
     if request.method == "POST":
@@ -336,18 +340,38 @@ def train_route():
         if action == "Prepare Dataset":
             output_path = data_dir / "finetune_dataset.jsonl"
             ok = build_finetune_dataset(data_dir, output_path, verbose=True)
-            message = f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+            message = (
+                f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+            )
         elif action == "Fine-tune LoRA":
             try:
                 import subprocess
-                subprocess.run(["python3", "scripts/finetune_lora.py", "--data-dir", str(data_dir)], check=False)
+
+                subprocess.run(
+                    [
+                        "python3",
+                        "scripts/finetune_lora.py",
+                        "--data-dir",
+                        str(data_dir),
+                    ],
+                    check=False,
+                )
                 message = "LoRA fine-tuning started"
             except Exception as e:
                 message = f"Failed to run fine-tuning: {e}"
         elif action == "Train Predictor":
             try:
                 import subprocess
-                subprocess.run(["python3", "scripts/train_core_predictor.py", "--data-dir", str(data_dir)], check=False)
+
+                subprocess.run(
+                    [
+                        "python3",
+                        "scripts/train_core_predictor.py",
+                        "--data-dir",
+                        str(data_dir),
+                    ],
+                    check=False,
+                )
                 message = "Predictor training started"
             except Exception as e:
                 message = f"Failed to train predictor: {e}"
@@ -374,6 +398,26 @@ def query_graph_route():
     )
 
 
+@app.route("/search_code", methods=["GET", "POST"])
+def search_code_route():
+    """Search symbols using the digester's retriever."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    query = ""
+    results = []
+    if request.method == "POST":
+        query = request.form.get("query", "")
+        if query:
+            retriever = getattr(digester_global, "symbol_retriever", None)
+            if retriever and hasattr(retriever, "search_relevant_symbols_with_details"):
+                results = retriever.search_relevant_symbols_with_details(
+                    query, top_k=10
+                )
+
+    return render_template("search.html", query=query, results=results)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -389,6 +433,7 @@ if __name__ == "__main__":
     initialize_components(args.project_root, args.config, args.verbose)
 
     app.run(debug=args.verbose, host="0.0.0.0", port=args.port)
+
 
 @app.route("/config", methods=["GET", "POST"])
 def config_route():
@@ -406,8 +451,13 @@ def config_route():
         except Exception as e:
             message = f"Failed to update config: {e}"
         return render_template("config.html", config_text=new_text, message=message)
-    text = config_path.read_text(encoding="utf-8") if config_path.exists() else yaml.dump(app_config_global)
+    text = (
+        config_path.read_text(encoding="utf-8")
+        if config_path.exists()
+        else yaml.dump(app_config_global)
+    )
     return render_template("config.html", config_text=text, message=None)
+
 
 @app.route("/chat", methods=["GET", "POST"])
 def chat_route():
@@ -422,13 +472,16 @@ def chat_route():
             try:
                 if phase_planner_global and hasattr(phase_planner_global, "llm_core"):
                     llm_core = phase_planner_global.llm_core
-                    reply, _ = llm_core.generate_scaffold_patch({"phase_description": msg}) or ("", None)
+                    reply, _ = llm_core.generate_scaffold_patch(
+                        {"phase_description": msg}
+                    ) or ("", None)
                     if not reply:
                         reply = "(LLM returned empty response)"
             except Exception as e:
                 reply = f"Error: {e}"
             chat_history.append({"role": "assistant", "text": reply})
     return render_template("chat.html", history=chat_history[-20:])
+
 
 @app.route("/easyedit", methods=["GET", "POST"])
 def easyedit_route():
@@ -442,4 +495,3 @@ def easyedit_route():
         ok = apply_easyedit(model_dir, instr, new_text, verbose=True)
         message = "Edit applied" if ok else "EasyEdit unavailable or failed"
     return render_template("easyedit.html", message=message)
-

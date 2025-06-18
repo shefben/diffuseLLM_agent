@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Code Search</h1>
+<form method="POST">
+    <input type="text" name="query" placeholder="Search term" value="{{ query }}" required>
+    <input type="submit" value="Search">
+</form>
+{% if results %}
+<table>
+<tr><th>FQN</th><th>File</th><th>Lines</th><th>Score</th></tr>
+{% for r in results %}
+<tr>
+    <td>{{ r.fqn }}</td>
+    <td>{{ r.file_path }}</td>
+    <td>{{ r.start_line }}-{{ r.end_line }}</td>
+    <td>{{ '%.3f'|format(r.similarity_score) }}</td>
+</tr>
+{% endfor %}
+</table>
+{% endif %}
+{% endblock %}
