@@ -6,7 +6,11 @@
 <p><strong>Patch Source:</strong> {{ entry.patch_source }}</p>
 <p><strong>Predicted Core:</strong> {{ entry.predicted_core }}</p>
 <h2>Diff Summary</h2>
-<pre>{{ entry.successful_diff_summary }}</pre>
+<pre class="diff">
+{% for line in entry.successful_diff_summary.splitlines() %}
+<span class="{{ 'add' if line.startswith('+') else 'del' if line.startswith('-') else '' }}">{{ line }}</span>
+{% endfor %}
+</pre>
 <h2>Patch Script</h2>
 <pre>{{ entry.successful_script }}</pre>
 {% if entry.user_rating is not none %}

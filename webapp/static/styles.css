@@ -10,3 +10,5 @@ pre{background-color:#252526;padding:10px;border-radius:4px;white-space:pre-wrap
 table{width:100%;border-collapse:collapse;}
 th,td{border:1px solid #333;padding:8px;}
 th{background-color:#2d2d30;}
+.diff .add{color:#9f9;font-weight:bold;}
+.diff .del{color:#f99;font-weight:bold;}
