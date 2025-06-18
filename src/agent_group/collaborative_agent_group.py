@@ -211,7 +211,6 @@ class CollaborativeAgentGroup:
                             )
                             context_data["duplicate_fqn"] = duplicate_method_matches[0]
                             return True, duplicate_method_matches[0]
-
         print(
             f"DuplicateGuard: No duplicate signatures found in {target_file_path.name}."
         )

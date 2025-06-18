@@ -4,7 +4,6 @@ from pathlib import Path
 
 from .spec_normalizer_interface import SpecNormalizerModelInterface
 from .t5_client import T5Client  # Fallback implementation
-
 try:
     import torch
     from transformers import T5ForConditionalGeneration, T5TokenizerFast
