@@ -9,6 +9,7 @@ from typing import (
 from pathlib import Path
 import difflib  # Added for diff generation
 import json
+import subprocess
 
 # Local imports
 from .exceptions import PhaseFailure  # New import
@@ -102,7 +103,7 @@ class CollaborativeAgentGroup:
         modified_code_str: Optional[str],
         target_file_path: Path,
         context_data: Dict[str, Any],
-    ) -> bool:
+    ) -> tuple[bool, Optional[str]]:
         """
         Checks if the modified code string contains any function/method signatures
         that already exist in the project's signature trie.
@@ -183,13 +184,13 @@ class CollaborativeAgentGroup:
                 # We need to check if the list is non-empty.
                 # The mock in SignatureTrie was returning bool, this needs to be aligned.
                 # Assuming search now returns List[str] as per its typical design.
-                if digester.signature_trie.search(
-                    signature_str
-                ):  # If list is not empty, a duplicate exists
+                duplicate_matches = digester.signature_trie.search(signature_str)
+                if duplicate_matches:
                     print(
                         f"DuplicateGuard: Duplicate top-level function signature found for '{module_qname}.{item_node.name}': {signature_str}"
                     )
-                    return True
+                    context_data["duplicate_fqn"] = duplicate_matches[0]
+                    return True, duplicate_matches[0]
             elif isinstance(item_node, ast.ClassDef):
                 class_name_simple = item_node.name
                 # class_fqn_prefix = f"{module_qname}.{class_name_simple}" # Full FQN not needed for prefix arg
@@ -201,16 +202,19 @@ class CollaborativeAgentGroup:
                             simple_type_resolver,
                             class_fqn_prefix_for_method_name=class_name_simple,
                         )
-                        if digester.signature_trie.search(signature_str):
+                        duplicate_method_matches = digester.signature_trie.search(
+                            signature_str
+                        )
+                        if duplicate_method_matches:
                             print(
                                 f"DuplicateGuard: Duplicate method signature found for '{module_qname}.{class_name_simple}.{method_node.name}': {signature_str}"
                             )
-                            return True
-
+                            context_data["duplicate_fqn"] = duplicate_method_matches[0]
+                            return True, duplicate_method_matches[0]
         print(
             f"DuplicateGuard: No duplicate signatures found in {target_file_path.name}."
         )
-        return False
+        return False, None
 
     def run(
         self,
@@ -232,7 +236,6 @@ class CollaborativeAgentGroup:
             print(
                 f"CollaborativeAgentGroup.run: Received predicted_core: {predicted_core if predicted_core else 'Not provided'}"
             )
-        # TODO (future step): Use predicted_core to influence agent logic (e.g., which core to try first).
 
         # self.current_patch_candidate will hold the LibCST SCRIPT string.
         # It's initialized to None in __init__.
@@ -421,11 +424,13 @@ class CollaborativeAgentGroup:
                 and modified_code_content_for_iteration is not None
                 and target_file_str
             ):
-                is_duplicate_detected = self._perform_duplicate_guard(
+                is_duplicate_detected, duplicate_fqn = self._perform_duplicate_guard(
                     modified_code_content_for_iteration,
                     Path(target_file_str),
                     context_data,
                 )
+                if duplicate_fqn:
+                    context_data["duplicate_fqn"] = duplicate_fqn
                 if is_duplicate_detected:
                     is_valid = False
                     error_traceback = "DUPLICATE_DETECTED: REUSE_EXISTING_HELPER"
@@ -745,6 +750,7 @@ class CollaborativeAgentGroup:
                         f"Best historical script was (Valid: {was_valid_in_history}, Score: {best_historical_score:.2f}), but phase still failed on last attempt."
                     )
 
+                self.abort_and_rollback()
                 raise PhaseFailure(
                     f"Failed to validate/repair patch after {self.max_repair_attempts} attempts. Last error: {last_error_for_failure}"
                 )
@@ -785,6 +791,7 @@ class CollaborativeAgentGroup:
                 if "error_traceback" in locals() and error_traceback
                 else "No successful patch and no specific error traceback recorded."
             )
+            self.abort_and_rollback()
             raise PhaseFailure(
                 f"No valid patch could be generated after loop. Last error: {final_error_msg}"
             )
@@ -876,13 +883,16 @@ class CollaborativeAgentGroup:
         return "\n".join(preview_parts)
 
     def abort_and_rollback(self) -> None:
-        """Placeholder: Aborts the current operation and conceptually rolls back changes."""
+        """Abort the current phase and revert working tree changes."""
+
+        repo_root = Path(
+            self.app_config.get("general", {}).get("project_root", ".")
+        ).resolve()
+
         patch_status_info = "No active patch candidate."
-        if self.current_patch_candidate and isinstance(
-            self.current_patch_candidate, str
-        ):
+        if isinstance(self.current_patch_candidate, str):
             patch_status_info = f"Current patch candidate (script) length: {len(self.current_patch_candidate)}."
-        elif self.current_patch_candidate:
+        elif self.current_patch_candidate is not None:
             patch_status_info = (
                 f"Current patch candidate type: {type(self.current_patch_candidate)}."
             )
@@ -890,21 +900,23 @@ class CollaborativeAgentGroup:
         print(
             f"CollaborativeAgentGroup: Abort and Rollback called. {patch_status_info}"
         )
-        print(
-            "  (Mock: No file operations to roll back at this stage as scripts are not yet applied.)"
-        )
 
-        # Reset internal state related to the current run
+        # Reset internal state before touching the filesystem
         self.current_patch_candidate = None
-        self.patch_history = []
-        self._current_run_context_data = None  # Clear the context of the aborted run
+        self.patch_history.clear()
+        self._current_run_context_data = None
 
-        print("  Internal state (patch candidate, history, context) has been reset.")
-        # In a real scenario, this might involve:
-        # - Deleting temporary files
-        # - Reverting any applied changes in a sandbox environment
-        # - Signaling to other components that the phase was aborted
-        pass
+        # Revert any uncommitted changes in the repository
+        try:
+            subprocess.run(["git", "reset", "--hard"], cwd=repo_root, check=False)
+            subprocess.run(["git", "clean", "-fd"], cwd=repo_root, check=False)
+            print(f"  Rolled back working tree at {repo_root}.")
+        except Exception as e:
+            print(
+                f"CollaborativeAgentGroup Warning: Failed to reset git repo at {repo_root}: {e}"
+            )
+
+        print("  Internal state cleared and repository reset.")
 
 
 # Example Usage (Conceptual - requires mock objects for Phase, Digester etc.)

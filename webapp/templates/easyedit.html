@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>EasyEdit Model Parameters</h1>
+{% if message %}<p>{{ message }}</p>{% endif %}
+<form method="POST">
+    <label>Instruction</label><br>
+    <textarea name="instruction" required></textarea><br>
+    <label>New Response</label><br>
+    <textarea name="new_text" required></textarea><br>
+    <input type="submit" value="Apply Edit">
+</form>
+{% endblock %}
