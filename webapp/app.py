@@ -1,134 +1,497 @@
 from flask import Flask, render_template, request, redirect, url_for
 import sys
 from pathlib import Path
+import json  # For json.dumps as a fallback for displaying objects
+import yaml
+from src.learning.easyedit_helper import apply_easyedit
 
 # Add project root to sys.path to allow imports from src
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
-
-import json # For json.dumps as a fallback for displaying objects
 
 # Conditional imports for project modules, handle if not found during early setup
 try:
     from src.utils.config_loader import load_app_config
     from src.digester.repository_digester import RepositoryDigester
     from src.planner.phase_planner import PhasePlanner
-    # Spec is needed for type hints and potentially direct use if normalise_request returns it
+    from src.planner.phase_model import Phase
     from src.planner.spec_model import Spec
+    from src.profiler.orchestrator import run_phase1_style_profiling_pipeline
+    from src.utils.memory_logger import load_success_memory
+    from src.learning.ft_dataset import build_finetune_dataset
 except ImportError as e:
-    print(f"Error importing project modules in webapp/app.py: {e}. Ensure PROJECT_ROOT is correct and src modules are accessible.")
-    # Define placeholders if imports fail, to allow Flask app to run for basic HTML serving
-    load_app_config = lambda: {"error": "load_app_config failed"}
-    RepositoryDigester = lambda path, config: {"error": "RepositoryDigester failed"} # type: ignore
-    PhasePlanner = lambda root, config, digester: {"error": "PhasePlanner failed"} # type: ignore
-    Spec = dict # Placeholder type
+    print(
+        f"Error importing project modules in webapp/app.py: {e}. Ensure PROJECT_ROOT is correct and src modules are accessible."
+    )
+
+    def load_app_config(*_a, **_k):
+        return {"error": "load_app_config failed"}
+
+    def RepositoryDigester(*_a, **_k):  # type: ignore
+        return {"error": "RepositoryDigester failed"}
+
+    def PhasePlanner(*_a, **_k):  # type: ignore
+        return {"error": "PhasePlanner failed"}
+
+    def run_phase1_style_profiling_pipeline(*_a, **_k):  # type: ignore
+        return {"error": "profiling failed"}
+
+    def build_finetune_dataset(*_a, **_k):  # type: ignore
+        return False
+
+    Spec = dict  # Placeholder type
+    Phase = dict  # Placeholder type
 
 app = Flask(__name__)
 
-# Load application configuration
-# This assumes config.yaml or defaults are accessible relative to PROJECT_ROOT
-# or via load_app_config's internal logic.
+# Globals populated by initialize_components()
 app_config_global = {}
 digester_global = None
 phase_planner_global = None
-
-try:
-    app_config_global = load_app_config()
-    # Initialize digester and planner globally if they are stateless enough
-    # or if their state is managed per request. For now, simple global init.
-    # This might need adjustment if they are stateful and need per-request setup.
-    repo_path_str = app_config_global.get("general", {}).get("project_root", str(PROJECT_ROOT))
-
-    if isinstance(RepositoryDigester, type): # Check if it's the actual class
-        digester_global = RepositoryDigester(repo_path=Path(repo_path_str), app_config=app_config_global)
-        # Optionally, run a quick digest if it's fast and needed for all requests.
-        # For a webapp, might be better to have a pre-digested state or digest on demand.
-        # digester_global.digest_repository() # Potentially long running
-
-    if isinstance(PhasePlanner, type) and digester_global and not isinstance(digester_global, dict):
-            phase_planner_global = PhasePlanner(
-            project_root_path=Path(repo_path_str),
-            app_config=app_config_global,
-            digester=digester_global
-        )
-    elif isinstance(PhasePlanner, type) and isinstance(digester_global, dict): # Digester init failed
-            print("WebApp Warning: Digester failed to initialize, PhasePlanner cannot be initialized with it.")
-
-    print("WebApp: Global components (app_config, digester, planner) initialized.")
-    if isinstance(digester_global, dict) and "error" in digester_global : print(f"  Digester status: {digester_global['error']}")
-    if isinstance(phase_planner_global, dict) and "error" in phase_planner_global : print(f"  PhasePlanner status: {phase_planner_global['error']}")
+initialized = False
 
 
-except Exception as e_init:
-    print(f"WebApp Error: Failed to initialize global components: {e_init}")
-    # app_config_global, digester_global, phase_planner_global will retain placeholder error states or be None.
+def initialize_components(
+    project_root: Path, config_path: Path | None = None, verbose: bool = False
+) -> None:
+    """Initializes profiler, digester, and planner for the web UI."""
+    global app_config_global, digester_global, phase_planner_global, initialized
 
-@app.route('/', methods=['GET', 'POST'])
+    app_config_global = load_app_config(config_path)
+    app_config_global["general"]["project_root"] = str(project_root)
+    app_config_global["loaded_config_path"] = str(config_path or "config.yaml")
+    if verbose:
+        app_config_global["general"]["verbose"] = True
+
+    # Run style profiling pipeline to generate configs and naming DB
+    run_phase1_style_profiling_pipeline(project_root, app_config_global)
+
+    digester_global = RepositoryDigester(
+        repo_path=project_root, app_config=app_config_global
+    )
+    digester_global.digest_repository()
+
+    phase_planner_global = PhasePlanner(
+        project_root_path=project_root,
+        app_config=app_config_global,
+        digester=digester_global,
+    )
+
+    initialized = True
+
+
+@app.route("/", methods=["GET", "POST"])
 def index():
     spec_data_str = None
     plan_data_str = None
     error_message = None
-    submitted_issue = None # Initialize to ensure it's always available for render_template
+    submitted_issue = (
+        None  # Initialize to ensure it's always available for render_template
+    )
 
-    if request.method == 'POST':
-        submitted_issue = request.form.get('issue_text', '')
+    if not initialized:
+        error_message = (
+            "Application not initialized. Please run initialize_components()."
+        )
+        return render_template(
+            "index.html",
+            submitted_issue=None,
+            spec_data=None,
+            plan_data=None,
+            error_message=error_message,
+        )
+
+    if request.method == "POST":
+        submitted_issue = request.form.get("issue_text", "")
 
         # Check global components
-        if phase_planner_global is None or (isinstance(phase_planner_global, dict) and 'error' in phase_planner_global):
-            error_message = "PhasePlanner not initialized correctly. Check webapp startup logs."
-        elif not hasattr(phase_planner_global, 'spec_normalizer') or \
-             phase_planner_global.spec_normalizer is None or \
-             (isinstance(phase_planner_global.spec_normalizer, dict) and 'error' in phase_planner_global.spec_normalizer): # Assuming spec_normalizer could also be an error dict
+        if phase_planner_global is None or (
+            isinstance(phase_planner_global, dict) and "error" in phase_planner_global
+        ):
+            error_message = (
+                "PhasePlanner not initialized correctly. Check webapp startup logs."
+            )
+        elif (
+            not hasattr(phase_planner_global, "spec_normalizer")
+            or phase_planner_global.spec_normalizer is None
+            or (
+                isinstance(phase_planner_global.spec_normalizer, dict)
+                and "error" in phase_planner_global.spec_normalizer
+            )
+        ):  # Assuming spec_normalizer could also be an error dict
             error_message = "SpecNormalizer component within PhasePlanner not initialized correctly. Check webapp startup logs."
         else:
             try:
-                # Call normalise_request
-                spec_object = phase_planner_global.spec_normalizer.normalise_request(submitted_issue)
+                # Generate plan directly from goal text
+                spec_object, plan_list = phase_planner_global.generate_plan_from_goal(
+                    submitted_issue
+                )
 
-                if spec_object is None:
-                    error_message = "Failed to normalize request into a Spec (SpecNormalizer returned None)."
-                elif isinstance(spec_object, dict) and 'error' in spec_object: # Check if spec_object itself is an error placeholder
-                    error_message = f"Error during spec normalization: {spec_object['error']}"
+                if hasattr(spec_object, "model_dump_json"):
+                    spec_data_str = spec_object.model_dump_json(indent=2)
+                elif hasattr(spec_object, "json"):
+                    spec_data_str = spec_object.json(indent=2)
                 else:
-                    # Successfully got a Spec object
-                    if hasattr(spec_object, 'model_dump_json'):
-                        spec_data_str = spec_object.model_dump_json(indent=2)
-                    elif hasattr(spec_object, 'json'): # Pydantic v1
-                        spec_data_str = spec_object.json(indent=2)
-                    else:
-                        spec_data_str = json.dumps(spec_object, indent=2, default=str) # Fallback
+                    spec_data_str = json.dumps(spec_object, indent=2, default=str)
 
-                    # Call generate_plan_from_spec
-                    plan_list = phase_planner_global.generate_plan_from_spec(spec_object)
-
-                    if not plan_list: # Handles None or empty list
-                        error_message = (error_message + "\n" if error_message else "") + "Failed to generate a plan from the Spec (generate_plan_from_spec returned empty or None)."
-                    else:
-                        phase_data_list = []
-                        for phase in plan_list:
-                            if hasattr(phase, 'model_dump_json'):
-                                phase_data_list.append(phase.model_dump_json(indent=2))
-                            elif hasattr(phase, 'json'): # Pydantic v1
-                                phase_data_list.append(phase.json(indent=2))
-                            else:
-                                # Basic string representation for Phase objects if no Pydantic methods
-                                phase_data_list.append(f"Phase: {getattr(phase, 'operation_name', 'Unknown Op')}\nTarget: {getattr(phase, 'target_file', 'N/A')}\nParams: {getattr(phase, 'parameters', {})}\nDescription: {getattr(phase, 'description', 'N/A')}")
-                        plan_data_str = "\n\n---\n\n".join(phase_data_list)
+                if not plan_list:  # Handles None or empty list
+                    error_message = (
+                        (error_message + "\n" if error_message else "")
+                        + "Failed to generate a plan from the Spec (generate_plan_from_spec returned empty or None)."
+                    )
+                else:
+                    phase_data_list = []
+                    for phase in plan_list:
+                        if hasattr(phase, "model_dump_json"):
+                            phase_data_list.append(phase.model_dump_json(indent=2))
+                        elif hasattr(phase, "json"):
+                            phase_data_list.append(phase.json(indent=2))
+                        else:
+                            phase_data_list.append(
+                                f"Phase: {getattr(phase, 'operation_name', 'Unknown Op')}\nTarget: {getattr(phase, 'target_file', 'N/A')}\nParams: {getattr(phase, 'parameters', {})}\nDescription: {getattr(phase, 'description', 'N/A')}"
+                            )
+                    plan_data_str = "\n\n---\n\n".join(phase_data_list)
 
             except Exception as e_process:
                 print(f"WebApp Error: Error during POST processing: {e_process}")
                 error_message = f"An unexpected error occurred: {str(e_process)}"
 
-        return render_template('index.html',
-                               submitted_issue=submitted_issue,
-                               spec_data=spec_data_str,
-                               plan_data=plan_data_str,
-                               error_message=error_message)
+        return render_template(
+            "index.html",
+            submitted_issue=submitted_issue,
+            spec_data=spec_data_str,
+            plan_data=plan_data_str,
+            error_message=error_message,
+        )
 
     # For GET request
-    return render_template('index.html', submitted_issue=None, spec_data=None, plan_data=None, error_message=None)
+    return render_template(
+        "index.html",
+        submitted_issue=None,
+        spec_data=None,
+        plan_data=None,
+        error_message=None,
+    )
 
-if __name__ == '__main__':
-    # Consider adding host='0.0.0.0' for accessibility if running in a container/VM
-    # Debug should be False in production
-    app.run(debug=True, port=5001)
+
+@app.route("/memory")
+def view_memory():
+    """Display recent success memory entries."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
+        data_dir = project_root / data_dir
+    entries = load_success_memory(data_dir)
+    recent_entries = entries[-20:]
+    return render_template("memory.html", entries=recent_entries)
+
+
+@app.route("/memory/<int:index>")
+def memory_detail_route(index: int):
+    """Display full details for a single memory entry."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
+        data_dir = project_root / data_dir
+    entries = load_success_memory(data_dir)
+    if index < 0 or index >= len(entries):
+        return redirect(url_for("view_memory"))
+    entry = entries[index]
+    return render_template("patch_detail.html", entry=entry)
+
+
+@app.route("/apply_patch", methods=["POST"])
+def apply_patch_route():
+    """Run full patch generation for an issue and redirect to memory."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    issue_text = request.form.get("issue_text", "")
+    if not issue_text:
+        return redirect(url_for("index"))
+
+    spec_obj = phase_planner_global.spec_normalizer.normalise_request(issue_text)
+    if spec_obj is None or isinstance(spec_obj, dict) and "error" in spec_obj:
+        return render_template(
+            "index.html",
+            submitted_issue=issue_text,
+            spec_data=None,
+            plan_data=None,
+            error_message="Spec normalization failed",
+        )
+
+    phase_planner_global.plan_phases(spec_obj)
+    return redirect(url_for("view_memory"))
+
+
+@app.route("/apply_plan", methods=["POST"])
+def apply_plan_route():
+    """Execute a user-approved plan represented as JSON."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    issue_text = request.form.get("issue_text", "")
+    plan_json = request.form.get("plan_json", "")
+    if not issue_text or not plan_json:
+        return redirect(url_for("index"))
+
+    spec_obj = phase_planner_global.spec_normalizer.normalise_request(issue_text)
+    if spec_obj is None or isinstance(spec_obj, dict) and "error" in spec_obj:
+        return render_template(
+            "index.html",
+            submitted_issue=issue_text,
+            spec_data=None,
+            plan_data=None,
+            error_message="Spec normalization failed",
+        )
+
+    try:
+        plan_list_dicts = json.loads(plan_json)
+        custom_plan = [Phase(**p) for p in plan_list_dicts]
+    except Exception as e:
+        return render_template(
+            "index.html",
+            submitted_issue=issue_text,
+            spec_data=None,
+            plan_data=plan_json,
+            error_message=f"Invalid plan JSON: {e}",
+        )
+
+    cache_key = phase_planner_global._get_spec_cache_key(spec_obj)
+    phase_planner_global.plan_cache[cache_key] = custom_plan
+    phase_planner_global.plan_phases(spec_obj)
+    return redirect(url_for("view_memory"))
+
+
+@app.route("/feedback", methods=["POST"])
+def feedback_route():
+    if not initialized:
+        return "Application not initialized", 503
+
+    timestamp = request.form.get("timestamp")
+    rating = request.form.get("rating")
+    if not timestamp or not rating:
+        return redirect(url_for("view_memory"))
+
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
+        data_dir = project_root / data_dir
+
+    entries = load_success_memory(data_dir)
+    for entry in entries:
+        if entry.get("timestamp_utc") == timestamp:
+            entry["user_rating"] = int(rating)
+
+    log_path = data_dir / "success_memory.jsonl"
+    with open(log_path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    return redirect(url_for("view_memory"))
+
+
+@app.route("/prepare_dataset")
+def prepare_dataset_route():
+    """Generate a fine-tuning dataset from success memory."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
+        data_dir = project_root / data_dir
+
+    output_path = data_dir / "finetune_dataset.jsonl"
+    ok = build_finetune_dataset(data_dir, output_path, verbose=True)
+    message = f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+    return render_template("dataset.html", message=message)
+
+
+@app.route("/train", methods=["GET", "POST"])
+def train_route():
+    if not initialized:
+        return "Application not initialized", 503
+
+    message = None
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
+        data_dir = project_root / data_dir
+
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "Prepare Dataset":
+            output_path = data_dir / "finetune_dataset.jsonl"
+            ok = build_finetune_dataset(data_dir, output_path, verbose=True)
+            message = (
+                f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+            )
+        elif action == "Fine-tune LoRA":
+            try:
+                import subprocess
+
+                subprocess.run(
+                    [
+                        "python3",
+                        "scripts/finetune_lora.py",
+                        "--data-dir",
+                        str(data_dir),
+                    ],
+                    check=False,
+                )
+                message = "LoRA fine-tuning started"
+            except Exception as e:
+                message = f"Failed to run fine-tuning: {e}"
+        elif action == "Train Predictor":
+            try:
+                import subprocess
+
+                subprocess.run(
+                    [
+                        "python3",
+                        "scripts/train_core_predictor.py",
+                        "--data-dir",
+                        str(data_dir),
+                    ],
+                    check=False,
+                )
+                message = "Predictor training started"
+            except Exception as e:
+                message = f"Failed to train predictor: {e}"
+
+    return render_template("train.html", message=message)
+
+
+@app.route("/query_graph", methods=["GET"])
+def query_graph_route():
+    """Query the knowledge graph and display results."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    src = request.args.get("src", "")
+    relation = request.args.get("relation") or None
+    depth = int(request.args.get("depth", "1"))
+
+    result = {}
+    if src:
+        result = digester_global.query_knowledge_paths(src, relation, depth)
+
+    return render_template(
+        "graph.html", query_src=src, query_relation=relation, depth=depth, result=result
+    )
+
+
+@app.route("/search_code", methods=["GET", "POST"])
+def search_code_route():
+    """Search symbols using the digester's retriever."""
+    if not initialized:
+        return "Application not initialized", 503
+
+    query = ""
+    results = []
+    if request.method == "POST":
+        query = request.form.get("query", "")
+        if query:
+            retriever = getattr(digester_global, "symbol_retriever", None)
+            if retriever and hasattr(retriever, "search_relevant_symbols_with_details"):
+                results = retriever.search_relevant_symbols_with_details(
+                    query, top_k=10
+                )
+
+    return render_template("search.html", query=query, results=results)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Launch diffuseLLM web UI")
+    parser.add_argument("project_root", type=Path, help="Path to the codebase")
+    parser.add_argument(
+        "--config", type=Path, default=None, help="Optional config YAML"
+    )
+    parser.add_argument("--port", type=int, default=5001)
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    initialize_components(args.project_root, args.config, args.verbose)
+
+    app.run(debug=args.verbose, host="0.0.0.0", port=args.port)
+
+
+@app.route("/config", methods=["GET", "POST"])
+def config_route():
+    if not initialized:
+        return "Application not initialized", 503
+    config_path = Path(app_config_global.get("loaded_config_path", "config.yaml"))
+    if request.method == "POST":
+        new_text = request.form.get("config_text", "")
+        try:
+            yaml.safe_load(new_text)
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(new_text)
+            app_config_global.update(yaml.safe_load(new_text) or {})
+            message = "Configuration updated"
+        except Exception as e:
+            message = f"Failed to update config: {e}"
+        return render_template("config.html", config_text=new_text, message=message)
+    text = (
+        config_path.read_text(encoding="utf-8")
+        if config_path.exists()
+        else yaml.dump(app_config_global)
+    )
+    return render_template("config.html", config_text=text, message=None)
+
+
+@app.route("/chat", methods=["GET", "POST"])
+def chat_route():
+    if not initialized:
+        return "Application not initialized", 503
+    global chat_history
+    if request.method == "POST":
+        msg = request.form.get("message", "")
+        if msg:
+            chat_history.append({"role": "user", "text": msg})
+            reply = "No response"
+            try:
+                if phase_planner_global and hasattr(phase_planner_global, "llm_core"):
+                    llm_core = phase_planner_global.llm_core
+                    reply, _ = llm_core.generate_scaffold_patch(
+                        {"phase_description": msg}
+                    ) or ("", None)
+                    if not reply:
+                        reply = "(LLM returned empty response)"
+            except Exception as e:
+                reply = f"Error: {e}"
+            chat_history.append({"role": "assistant", "text": reply})
+    return render_template("chat.html", history=chat_history[-20:])
+
+
+@app.route("/easyedit", methods=["GET", "POST"])
+def easyedit_route():
+    if not initialized:
+        return "Application not initialized", 503
+    message = None
+    if request.method == "POST":
+        instr = request.form.get("instruction", "")
+        new_text = request.form.get("new_text", "")
+        model_dir = Path(app_config_global.get("models", {}).get("agent_llm_gguf", ""))
+        ok = apply_easyedit(model_dir, instr, new_text, verbose=True)
+        message = "Edit applied" if ok else "EasyEdit unavailable or failed"
+    return render_template("easyedit.html", message=message)
