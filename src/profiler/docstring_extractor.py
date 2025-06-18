@@ -1,5 +1,6 @@
 import ast
-from typing import Dict, List, Optional, Union
+from typing import Dict, Optional
+
 
 def extract_docstrings_from_source(source_code: str) -> Dict[str, Optional[str]]:
     """
@@ -51,12 +52,12 @@ def extract_docstrings_from_source(source_code: str) -> Dict[str, Optional[str]]
 
                 if isinstance(parent, (ast.ClassDef, ast.FunctionDef)):
                     current = parent
-                else: # Reached module level or unsupported nesting
+                else:  # Reached module level or unsupported nesting
                     current = None
 
             name = ".".join(path_parts)
-            if not name: # Should not happen if node is FunctionDef
-                 name = node.name # Fallback to just node name
+            if not name:  # Should not happen if node is FunctionDef
+                name = node.name  # Fallback to just node name
 
             docstrings[name] = ast.get_docstring(node)
         elif isinstance(node, ast.ClassDef):
@@ -65,6 +66,7 @@ def extract_docstrings_from_source(source_code: str) -> Dict[str, Optional[str]]
             # by constructing the 'ClassName.method_name' path.
 
     return docstrings
+
 
 def extract_docstrings_from_file(file_path: str) -> Dict[str, Optional[str]]:
     """
@@ -87,8 +89,9 @@ def extract_docstrings_from_file(file_path: str) -> Dict[str, Optional[str]]:
     except Exception as e:
         return {"error": f"Failed to read file {file_path}: {e}"}
 
-if __name__ == '__main__':
-    example_code = """
+
+if __name__ == "__main__":
+    example_code = '''
 """Module docstring."""
 
 class MyClass:
@@ -113,7 +116,7 @@ class NestedClass:
         def inner_method(self):
             """Inner method docstring."""
             pass
-"""
+'''
 
     # Test with source code
     print("--- Docstrings from source ---")
@@ -143,4 +146,5 @@ class NestedClass:
     print(docstrings_error)
 
     import os
+
     os.remove(dummy_file)

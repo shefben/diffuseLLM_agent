@@ -1,0 +1,9 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Edit Configuration</h1>
+{% if message %}<p>{{ message }}</p>{% endif %}
+<form method="POST">
+    <textarea name="config_text" rows="20">{{ config_text }}</textarea><br>
+    <input type="submit" value="Save">
+</form>
+{% endblock %}

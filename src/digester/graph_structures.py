@@ -1,9 +1,10 @@
 # src/digester/graph_structures.py
-from typing import Dict, Set, Tuple, List, NewType
-from pathlib import Path
+from typing import Dict, Set, NewType
 
 # Using NewType for more semantic meaning, though they are still strings at runtime.
-NodeID = NewType('NodeID', str) # Represents a unique ID for a node in a graph, e.g., FQN or file:line:col:type
+NodeID = NewType(
+    "NodeID", str
+)  # Represents a unique ID for a node in a graph, e.g., FQN or file:line:col:type
 
 # Call Graph: Maps a caller's FQN (NodeID) to a set of callees' FQNs (NodeID).
 CallGraph = Dict[NodeID, Set[NodeID]]
