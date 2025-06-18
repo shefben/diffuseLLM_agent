@@ -70,7 +70,7 @@ def projects_route():
             for env in envs:
                 if env.get("name") == name:
                     initialize_components(Path(env["path"]))
-                    return redirect(url_for("index"))
+                    return redirect(url_for("dashboard_route"))
         else:  # create new environment
             name = request.form.get("new_name")
             path = request.form.get("new_path")
@@ -79,7 +79,7 @@ def projects_route():
                 envs.append({"name": name, "path": path, "description": desc})
                 save_environments(envs)
                 initialize_components(Path(path))
-                return redirect(url_for("index"))
+                return redirect(url_for("dashboard_route"))
             message = "Name and path are required"
     return render_template("projects.html", environments=envs, message=message)
 
@@ -133,8 +133,37 @@ def initialize_components(
     initialized = True
 
 
-@app.route("/", methods=["GET", "POST"])
-def index():
+@app.route("/")
+def dashboard_route():
+    if not initialized:
+        return redirect(url_for("projects_route"))
+
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
+        data_dir = project_root / data_dir
+    entries = load_success_memory(data_dir)
+    recent_entries = entries[-5:]
+    dataset_path = data_dir / "finetune_dataset.jsonl"
+    dataset_entries = 0
+    if dataset_path.exists():
+        try:
+            with open(dataset_path, "r", encoding="utf-8") as f:
+                dataset_entries = sum(1 for _ in f)
+        except Exception:
+            dataset_entries = 0
+    return render_template(
+        "dashboard.html",
+        recent_entries=recent_entries,
+        memory_count=len(entries),
+        dataset_entries=dataset_entries,
+    )
+
+
+@app.route("/issue", methods=["GET", "POST"])
+def issue_route():
     spec_data_str = None
     plan_data_str = None
     error_message = None
@@ -268,11 +297,13 @@ def apply_patch_route():
 
     issue_text = request.form.get("issue_text", "")
     if not issue_text:
-        return redirect(url_for("index"))
+        return redirect(url_for("issue_route"))
 
     workflow = request.form.get("workflow", "orchestrator-workers")
     spec_prompt = get_mcp_prompt(app_config_global, workflow, "SpecNormalizer")
-    spec_obj = phase_planner_global.spec_normalizer.normalise_request(issue_text, spec_prompt)
+    spec_obj = phase_planner_global.spec_normalizer.normalise_request(
+        issue_text, spec_prompt
+    )
     if spec_obj is None or isinstance(spec_obj, dict) and "error" in spec_obj:
         return render_template(
             "index.html",
@@ -296,10 +327,12 @@ def apply_plan_route():
     plan_json = request.form.get("plan_json", "")
     workflow = request.form.get("workflow", "orchestrator-workers")
     if not issue_text or not plan_json:
-        return redirect(url_for("index"))
+        return redirect(url_for("issue_route"))
 
     spec_prompt = get_mcp_prompt(app_config_global, workflow, "SpecNormalizer")
-    spec_obj = phase_planner_global.spec_normalizer.normalise_request(issue_text, spec_prompt)
+    spec_obj = phase_planner_global.spec_normalizer.normalise_request(
+        issue_text, spec_prompt
+    )
     if spec_obj is None or isinstance(spec_obj, dict) and "error" in spec_obj:
         return render_template(
             "index.html",
@@ -608,10 +641,16 @@ def mcp_route():
                     wf, agent = key.split("__", 1)
                     workflow_settings.setdefault(wf, {})[agent] = val
             message = "Settings saved"
-        with open(app_config_global.get("loaded_config_path", "config.yaml"), "w", encoding="utf-8") as f:
+        with open(
+            app_config_global.get("loaded_config_path", "config.yaml"),
+            "w",
+            encoding="utf-8",
+        ) as f:
             yaml.safe_dump(app_config_global, f)
 
-    return render_template("mcp.html", tools=tools, workflow_settings=workflow_settings, message=message)
+    return render_template(
+        "mcp.html", tools=tools, workflow_settings=workflow_settings, message=message
+    )
 
 
 @app.route("/custom_workflow", methods=["GET", "POST"])
@@ -634,7 +673,16 @@ def custom_workflow_route():
             workflows.append(wf)
             workflow_json = json.dumps(wf, indent=2)
             message = "Workflow added"
-            with open(app_config_global.get("loaded_config_path", "config.yaml"), "w", encoding="utf-8") as f:
+            with open(
+                app_config_global.get("loaded_config_path", "config.yaml"),
+                "w",
+                encoding="utf-8",
+            ) as f:
                 yaml.safe_dump(app_config_global, f)
 
-    return render_template("custom_workflow.html", message=message, workflow_json=workflow_json, workflows=workflows)
+    return render_template(
+        "custom_workflow.html",
+        message=message,
+        workflow_json=workflow_json,
+        workflows=workflows,
+    )
