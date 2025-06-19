@@ -277,19 +277,51 @@ def issue_route():
 
 @app.route("/memory")
 def view_memory():
-    """Display recent success memory entries."""
+    """Display recent success memory entries with optional filtering."""
     if not initialized:
         return "Application not initialized", 503
 
     data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
     if not data_dir.is_absolute():
-        project_root = Path(
-            app_config_global.get("general", {}).get("project_root", ".")
-        )
+        project_root = Path(app_config_global.get("general", {}).get("project_root", "."))
         data_dir = project_root / data_dir
+
+    query = request.args.get("query", "").lower()
+    rating = request.args.get("rating")
+    start = request.args.get("start")
+    end = request.args.get("end")
+
     entries = load_success_memory(data_dir)
-    recent_entries = entries[-20:]
-    return render_template("memory.html", entries=recent_entries)
+    filtered: list[dict] = []
+
+    for e in entries:
+        keep = True
+        issue_text = str(e.get("spec_issue_description", "")).lower()
+        if query and query not in issue_text:
+            keep = False
+        if rating:
+            try:
+                if int(rating) != int(e.get("user_rating", -1)):
+                    keep = False
+            except Exception:
+                pass
+        ts = e.get("timestamp_utc")
+        if start and ts and ts < start:
+            keep = False
+        if end and ts and ts > end:
+            keep = False
+        if keep:
+            filtered.append(e)
+
+    recent_entries = filtered[-20:]
+    return render_template(
+        "memory.html",
+        entries=recent_entries,
+        query=query,
+        rating=rating,
+        start=start,
+        end=end,
+    )
 
 
 @app.route("/memory/<int:index>")
@@ -547,7 +579,12 @@ def query_graph_route():
         result = digester_global.query_knowledge_paths(src, relation, depth)
 
     return render_template(
-        "graph.html", query_src=src, query_relation=relation, depth=depth, result=result
+        "graph.html",
+        query_src=src,
+        query_relation=relation,
+        depth=depth,
+        result=result,
+        result_json=json.dumps(result),
     )
 
 

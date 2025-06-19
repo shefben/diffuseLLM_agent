@@ -12,3 +12,7 @@ th,td{border:1px solid #333;padding:8px;}
 th{background-color:#2d2d30;}
 .diff .add{color:#9f9;font-weight:bold;}
 .diff .del{color:#f99;font-weight:bold;}
+.memory-filter input,
+.memory-filter select {
+    margin-right:8px;
+}
