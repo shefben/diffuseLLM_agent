@@ -1,24 +1,30 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 
+
 class Spec(BaseModel):
-    issue_description: str = Field(description="The original issue description in plain English.")
-    target_files: List[str] = Field(default_factory=list, description="List of file paths relevant to the issue.")
+    issue_description: str = Field(
+        description="The original issue description in plain English."
+    )
+    target_files: List[str] = Field(
+        default_factory=list, description="List of file paths relevant to the issue."
+    )
     operations: List[Dict[str, Any]] = Field(
         default_factory=list,
         description="A list of operations to be performed. Each operation is a dictionary, "
-                    "e.g., {'name': 'add_decorator', 'target_function': 'my_func', 'decorator': '@log_calls'}."
-                    "The structure of these dictionaries will be further refined by specific refactor operations."
+        "e.g., {'name': 'add_decorator', 'target_function': 'my_func', 'decorator': '@log_calls'}."
+        "The structure of these dictionaries will be further refined by specific refactor operations.",
     )
     acceptance_tests: List[str] = Field(
         default_factory=list,
-        description="A list of human-readable descriptions of acceptance tests that the planned changes should satisfy."
+        description="A list of human-readable descriptions of acceptance tests that the planned changes should satisfy.",
     )
     # Optional: Add a field for the normalized/cleaned spec text from Tiny-T5 if needed later.
     # normalized_spec_text: Optional[str] = Field(None, description="The cleaned/canonicalized spec text from the diffusion model.")
 
     class Config:
-        extra = "forbid" # To prevent unexpected fields
+        extra = "forbid"  # To prevent unexpected fields
+
 
 # Example Usage (for testing or if run directly)
 if __name__ == "__main__":
@@ -30,18 +36,18 @@ if __name__ == "__main__":
                 "name": "add_decorator",
                 "target_file": "src/core/utils.py",
                 "target_function": "process_data",
-                "decorator_name": "@log_entry_exit"
+                "decorator_name": "@log_entry_exit",
             },
             {
                 "name": "add_import",
                 "target_file": "src/core/utils.py",
-                "import_statement": "from ..logging_utils import log_entry_exit"
-            }
+                "import_statement": "from ..logging_utils import log_entry_exit",
+            },
         ],
         acceptance_tests=[
             "When process_data in utils.py is called, its entry and exit should be logged.",
-            "The new decorator @log_entry_exit should be correctly imported and applied."
-        ]
+            "The new decorator @log_entry_exit should be correctly imported and applied.",
+        ],
     )
     print("Example Spec:")
     try:

@@ -1,5 +1,5 @@
 import ast
-from typing import Dict, List, Set
+from typing import Dict, Set
 
 def extract_identifiers_from_source(source_code: str) -> Dict[str, Set[str]]:
     """

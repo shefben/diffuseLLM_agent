@@ -1,5 +1,6 @@
 general:
   verbose: false
+  use_vllm: false
   project_root: null
   data_dir: .agent_data
   patches_output_dir: .autopatches
@@ -10,6 +11,7 @@ models:
   divot5_style_unifier_dir: ./models/placeholder_divot5_unifier/
   t5_spec_normalizer_dir: ./models/placeholder_t5_spec_normalizer/
   planner_scorer_gguf: ./models/placeholder_scorer.gguf
+  operations_llm_gguf: ./models/placeholder_operations.gguf
   agent_llm_gguf: ./models/placeholder_llm_agent.gguf
   repair_llm_gguf: ./models/placeholder_repair_model.gguf
   infill_llm_gguf: ./models/placeholder_llm_agent.gguf
@@ -36,3 +38,23 @@ llm_params:
   agent_polish_max_tokens: 2048
   agent_repair_temp: 0.3
   agent_repair_max_tokens: 2048
+active_learning:
+  enabled: false
+  model_name: gpt2
+  output_dir: ./lora_adapters
+  interval: 3600
+  predictor_model: ./models/core_predictor.joblib
+mcp:
+  default_tool: basic
+  tools:
+    - name: basic
+      prompt: "You are a helpful assistant generating high quality Python patches."
+  workflow_settings: {}
+  agent_defaults: {}
+webui:
+  port: 5001
+  allow_registration: true
+planner:
+  beam_width: 3
+  workflow_type: orchestrator-workers
+custom_workflows: []

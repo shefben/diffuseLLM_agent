@@ -1,0 +1,20 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Edit Configuration</h1>
+{% if message %}<p>{{ message }}</p>{% endif %}
+<h2>Basic Settings</h2>
+<form method="POST">
+    <input type="hidden" name="mode" value="basic">
+    Data dir: <input type="text" name="general__data_dir" value="{{ basic_fields['general__data_dir'] }}"><br>
+    WebUI port: <input type="text" name="webui__port" value="{{ basic_fields['webui__port'] }}"><br>
+    Allow registration: <input type="text" name="webui__allow_registration" value="{{ basic_fields['webui__allow_registration'] }}"><br>
+    Active learning: <input type="text" name="active_learning__enabled" value="{{ basic_fields['active_learning__enabled'] }}"><br>
+    <input type="submit" value="Save">
+</form>
+<h2>Advanced</h2>
+<form method="POST">
+    <input type="hidden" name="mode" value="text">
+    <textarea name="config_text" rows="20">{{ config_text }}</textarea><br>
+    <input type="submit" value="Save Raw YAML">
+</form>
+{% endblock %}
