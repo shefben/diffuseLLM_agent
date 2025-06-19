@@ -45,7 +45,8 @@
 {% if plan_data %}
 <div class="results-section">
     <h2>Generated Plan (Phases):</h2>
-    <textarea id="plan_editor" rows="10" style="width:98%;">{{ plan_data }}</textarea>
+    <ul id="phase_list"></ul>
+    <textarea id="plan_editor" rows="10" style="width:98%; display:none;">{{ plan_data }}</textarea>
 </div>
 {% endif %}
 <script>
@@ -55,11 +56,36 @@ const planHidden = document.getElementById('plan_json_hidden');
 const workflowSelect = document.getElementById('workflow');
 const workflowHidden = document.getElementById('workflow_hidden');
 const applyForm = document.forms[1];
-applyForm.addEventListener('submit', () => {
+function renderPhases(phases){
+    const list = document.getElementById('phase_list');
+    if(!list) return;
+    list.innerHTML='';
+    phases.forEach((p,i)=>{
+        const li=document.createElement('li');
+        li.innerHTML=`<pre>${JSON.stringify(p, null, 2)}</pre>`+
+            `<button type="button" onclick="moveUp(${i})">&#8593;</button>`+
+            `<button type="button" onclick="moveDown(${i})">&#8595;</button>`;
+        list.appendChild(li);
+    });
+}
+
+function moveUp(i){ if(i>0){ const t=phases[i-1]; phases[i-1]=phases[i]; phases[i]=t; renderPhases(phases);} }
+function moveDown(i){ if(i<phases.length-1){ const t=phases[i+1]; phases[i+1]=phases[i]; phases[i]=t; renderPhases(phases);} }
+
+let phases=[];
+const planEditor = document.getElementById('plan_editor');
+if(planEditor){
+    try{ phases=JSON.parse(planEditor.value);}catch(e){ phases=[]; }
+    renderPhases(phases);
+}
+
+function updateHidden(){
     hiddenField.value = issueField.value;
-    const planEditor = document.getElementById('plan_editor');
-    if (planEditor) planHidden.value = planEditor.value;
+    if(planEditor){ planEditor.value = JSON.stringify(phases, null, 2); }
+    planHidden.value = planEditor ? planEditor.value : '';
     if (workflowSelect) workflowHidden.value = workflowSelect.value;
-});
+}
+
+applyForm.addEventListener('submit', updateHidden);
 </script>
 {% endblock %}

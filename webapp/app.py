@@ -1,5 +1,7 @@
-from flask import Flask, render_template, request, redirect, url_for
+from flask import Flask, render_template, request, redirect, url_for, jsonify
 import sys
+import uuid
+import threading
 from pathlib import Path
 import json  # For json.dumps as a fallback for displaying objects
 import yaml
@@ -54,6 +56,26 @@ app_config_global = {}
 digester_global = None
 phase_planner_global = None
 initialized = False
+job_status: dict[str, dict] = {}
+
+
+def start_job(target, *args, **kwargs) -> str:
+    """Start a background thread and return a job id."""
+    job_id = str(uuid.uuid4())
+    job_status[job_id] = {"status": "running", "message": ""}
+
+    def wrapper():
+        try:
+            target(*args, **kwargs, job_id=job_id)
+            job_status[job_id]["status"] = "complete"
+        except Exception as e:  # pragma: no cover - threading
+            job_status[job_id]["status"] = "error"
+            job_status[job_id]["message"] = str(e)
+
+    thread = threading.Thread(target=wrapper, daemon=True)
+    thread.start()
+    return job_id
+
 
 # -------------------------------------------------------------
 # Environment management and selection
@@ -301,20 +323,21 @@ def apply_patch_route():
 
     workflow = request.form.get("workflow", "orchestrator-workers")
     spec_prompt = get_mcp_prompt(app_config_global, workflow, "SpecNormalizer")
-    spec_obj = phase_planner_global.spec_normalizer.normalise_request(
-        issue_text, spec_prompt
-    )
-    if spec_obj is None or isinstance(spec_obj, dict) and "error" in spec_obj:
-        return render_template(
-            "index.html",
-            submitted_issue=issue_text,
-            spec_data=None,
-            plan_data=None,
-            error_message="Spec normalization failed",
+    def job(job_id=None):
+        spec_obj_local = phase_planner_global.spec_normalizer.normalise_request(
+            issue_text, spec_prompt
         )
+        if spec_obj_local is None or (
+            isinstance(spec_obj_local, dict) and "error" in spec_obj_local
+        ):
+            job_status[job_id]["status"] = "error"
+            job_status[job_id]["message"] = "Spec normalization failed"
+            return
+        phase_planner_global.plan_phases(spec_obj_local, workflow_type=workflow)
+        job_status[job_id]["redirect"] = url_for("view_memory")
 
-    phase_planner_global.plan_phases(spec_obj, workflow_type=workflow)
-    return redirect(url_for("view_memory"))
+    jid = start_job(job)
+    return render_template("progress.html", title="Applying Patch", job_id=jid)
 
 
 @app.route("/apply_plan", methods=["POST"])
@@ -330,34 +353,32 @@ def apply_plan_route():
         return redirect(url_for("issue_route"))
 
     spec_prompt = get_mcp_prompt(app_config_global, workflow, "SpecNormalizer")
-    spec_obj = phase_planner_global.spec_normalizer.normalise_request(
-        issue_text, spec_prompt
-    )
-    if spec_obj is None or isinstance(spec_obj, dict) and "error" in spec_obj:
-        return render_template(
-            "index.html",
-            submitted_issue=issue_text,
-            spec_data=None,
-            plan_data=None,
-            error_message="Spec normalization failed",
+    def job(job_id=None):
+        spec_obj_local = phase_planner_global.spec_normalizer.normalise_request(
+            issue_text, spec_prompt
         )
+        if spec_obj_local is None or (
+            isinstance(spec_obj_local, dict) and "error" in spec_obj_local
+        ):
+            job_status[job_id]["status"] = "error"
+            job_status[job_id]["message"] = "Spec normalization failed"
+            return
 
-    try:
-        plan_list_dicts = json.loads(plan_json)
-        custom_plan = [Phase(**p) for p in plan_list_dicts]
-    except Exception as e:
-        return render_template(
-            "index.html",
-            submitted_issue=issue_text,
-            spec_data=None,
-            plan_data=plan_json,
-            error_message=f"Invalid plan JSON: {e}",
-        )
+        try:
+            plan_list_dicts = json.loads(plan_json)
+            custom_plan = [Phase(**p) for p in plan_list_dicts]
+        except Exception as e:
+            job_status[job_id]["status"] = "error"
+            job_status[job_id]["message"] = f"Invalid plan JSON: {e}"
+            return
 
-    cache_key = phase_planner_global._get_spec_cache_key(spec_obj)
-    phase_planner_global.plan_cache[cache_key] = custom_plan
-    phase_planner_global.plan_phases(spec_obj, workflow_type=workflow)
-    return redirect(url_for("view_memory"))
+        cache_key = phase_planner_global._get_spec_cache_key(spec_obj_local)
+        phase_planner_global.plan_cache[cache_key] = custom_plan
+        phase_planner_global.plan_phases(spec_obj_local, workflow_type=workflow)
+        job_status[job_id]["redirect"] = url_for("view_memory")
+
+    jid = start_job(job)
+    return render_template("progress.html", title="Applying Plan", job_id=jid)
 
 
 @app.route("/feedback", methods=["POST"])
@@ -404,9 +425,14 @@ def prepare_dataset_route():
         data_dir = project_root / data_dir
 
     output_path = data_dir / "finetune_dataset.jsonl"
-    ok = build_finetune_dataset(data_dir, output_path, verbose=True)
-    message = f"Dataset written to {output_path}" if ok else "Failed to build dataset"
-    return render_template("dataset.html", message=message)
+    def job(job_id=None):
+        ok = build_finetune_dataset(data_dir, output_path, verbose=True)
+        msg = f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+        job_status[job_id]["message"] = msg
+        job_status[job_id]["redirect"] = url_for("train_route")
+
+    jid = start_job(job)
+    return render_template("progress.html", title="Preparing Dataset", job_id=jid)
 
 
 @app.route("/train", methods=["GET", "POST"])
@@ -425,75 +451,85 @@ def train_route():
     if request.method == "POST":
         action = request.form.get("action")
         if action == "Prepare Dataset":
-            output_path = data_dir / "finetune_dataset.jsonl"
-            ok = build_finetune_dataset(data_dir, output_path, verbose=True)
-            message = (
-                f"Dataset written to {output_path}" if ok else "Failed to build dataset"
-            )
-        elif action == "Fine-tune LoRA":
-            try:
-                import subprocess
-
-                subprocess.run(
-                    [
-                        "python3",
-                        "scripts/finetune_lora.py",
-                        "--data-dir",
-                        str(data_dir),
-                    ],
-                    check=False,
-                )
-                message = "LoRA fine-tuning started"
-            except Exception as e:
-                message = f"Failed to run fine-tuning: {e}"
-        elif action == "Train Predictor":
-            try:
-                import subprocess
-
-                subprocess.run(
-                    [
-                        "python3",
-                        "scripts/train_core_predictor.py",
-                        "--data-dir",
-                        str(data_dir),
-                    ],
-                    check=False,
-                )
-                message = "Predictor training started"
-            except Exception as e:
-                message = f"Failed to train predictor: {e}"
-        elif action == "Run Full Pipeline":
-            try:
-                import subprocess
-
+            def job(job_id=None):
                 output_path = data_dir / "finetune_dataset.jsonl"
-                build_finetune_dataset(data_dir, output_path, verbose=True)
+                ok = build_finetune_dataset(data_dir, output_path, verbose=True)
+                job_status[job_id]["message"] = (
+                    f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+                )
+                job_status[job_id]["redirect"] = url_for("train_route")
 
-                subprocess.run(
-                    [
+            jid = start_job(job)
+            return render_template("progress.html", title="Preparing Dataset", job_id=jid)
+        elif action == "Fine-tune LoRA":
+            def job(job_id=None):
+                try:
+                    import subprocess
+                    subprocess.run([
                         "python3",
                         "scripts/finetune_lora.py",
                         "--data-dir",
                         str(data_dir),
-                    ],
-                    check=False,
-                )
+                    ], check=False)
+                    job_status[job_id]["message"] = "LoRA fine-tuning started"
+                except Exception as e:
+                    job_status[job_id]["status"] = "error"
+                    job_status[job_id]["message"] = str(e)
+                job_status[job_id]["redirect"] = url_for("train_route")
 
-                subprocess.run(
-                    [
+            jid = start_job(job)
+            return render_template("progress.html", title="Fine-tuning", job_id=jid)
+        elif action == "Train Predictor":
+            def job(job_id=None):
+                try:
+                    import subprocess
+                    subprocess.run([
                         "python3",
                         "scripts/train_core_predictor.py",
                         "--data-dir",
                         str(data_dir),
-                    ],
-                    check=False,
-                )
+                    ], check=False)
+                    job_status[job_id]["message"] = "Predictor training started"
+                except Exception as e:
+                    job_status[job_id]["status"] = "error"
+                    job_status[job_id]["message"] = str(e)
+                job_status[job_id]["redirect"] = url_for("train_route")
 
-                message = "Full training pipeline started"
-            except Exception as e:
-                message = f"Failed to run full pipeline: {e}"
+            jid = start_job(job)
+            return render_template("progress.html", title="Training Predictor", job_id=jid)
+        elif action == "Run Full Pipeline":
+            def job(job_id=None):
+                try:
+                    import subprocess
+                    output_path = data_dir / "finetune_dataset.jsonl"
+                    build_finetune_dataset(data_dir, output_path, verbose=True)
+                    subprocess.run([
+                        "python3",
+                        "scripts/finetune_lora.py",
+                        "--data-dir",
+                        str(data_dir),
+                    ], check=False)
+                    subprocess.run([
+                        "python3",
+                        "scripts/train_core_predictor.py",
+                        "--data-dir",
+                        str(data_dir),
+                    ], check=False)
+                    job_status[job_id]["message"] = "Full training pipeline started"
+                except Exception as e:
+                    job_status[job_id]["status"] = "error"
+                    job_status[job_id]["message"] = str(e)
+                job_status[job_id]["redirect"] = url_for("train_route")
+
+            jid = start_job(job)
+            return render_template("progress.html", title="Training", job_id=jid)
 
     return render_template("train.html", message=message)
+
+
+@app.route("/job_status/<job_id>")
+def job_status_route(job_id: str):
+    return jsonify(job_status.get(job_id, {"status": "unknown"}))
 
 
 @app.route("/query_graph", methods=["GET"])

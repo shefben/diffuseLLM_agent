@@ -1,0 +1,15 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>{{ title }}</h1>
+<div id="status">Starting...</div>
+<script>
+function poll(){
+  fetch("/job_status/{{ job_id }}").then(r=>r.json()).then(d=>{
+    document.getElementById('status').textContent = d.status + (d.message ? ' - ' + d.message : '');
+    if(d.status === 'running') setTimeout(poll, 1000);
+    else if(d.redirect){ window.location = d.redirect; }
+  });
+}
+poll();
+</script>
+{% endblock %}
