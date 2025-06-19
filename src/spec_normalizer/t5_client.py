@@ -135,7 +135,10 @@ class T5Client(SpecNormalizerModelInterface):
             self.tokenizer = None
 
     def generate_spec_yaml(
-        self, raw_issue_text: str, context_symbols_string: Optional[str] = None
+        self,
+        raw_issue_text: str,
+        context_symbols_string: Optional[str] = None,
+        mcp_prompt: Optional[str] = None,
     ) -> Optional[str]:
         """
         Generates a YAML specification string from raw issue text and context.
@@ -201,7 +204,9 @@ Issue Description to process:
 {raw_issue_text}
 
 Generate the YAML:
-"""
+        """
+        if mcp_prompt:
+            prompt = mcp_prompt + "\n" + prompt
 
         if self.verbose:
             print(

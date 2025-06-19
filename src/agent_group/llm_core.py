@@ -95,6 +95,8 @@ class LLMCore:
         code_snippets = context_data.get("retrieved_code_snippets", {})
         style_profile = context_data.get("style_profile", {})
 
+        mcp_p = context_data.get("mcp_prompt_llm")
+
         # Refined Prompt for LibCST script and delimited edit summary
         prompt = f"""[TASK]
 You are an expert Python programmer specializing in code generation using LibCST.
@@ -105,7 +107,7 @@ For complex logic or sections that will be filled in later (e.g., by another AI 
 [OUTPUT FORMAT]
 Provide your response as two distinct parts, separated by a specific delimiter:
 1.  The LibCST Python script.
-2.  An edit summary list enclosed in XML-like tags.
+        2.  An edit summary list enclosed in XML-like tags.
 
 Example:
 ```python
@@ -178,6 +180,9 @@ Quote Style: {style_profile.get("quote_style", DEFAULT_APP_CONFIG.get("style_pro
                 DEFAULT_APP_CONFIG["llm_params"]["temperature_default"],
             ),
         )
+
+        if mcp_p:
+            prompt = mcp_p + "\n" + prompt
 
         raw_llm_output = get_llm_cst_scaffold(
             model_path=scaffold_model_path,

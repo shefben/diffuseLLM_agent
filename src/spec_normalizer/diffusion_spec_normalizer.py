@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .spec_normalizer_interface import SpecNormalizerModelInterface
 from .t5_client import T5Client  # Fallback implementation
+
 try:
     import torch
     from transformers import T5ForConditionalGeneration, T5TokenizerFast
@@ -79,7 +80,10 @@ class DiffusionSpecNormalizer(SpecNormalizerModelInterface):
         return False
 
     def generate_spec_yaml(
-        self, raw_issue_text: str, context_symbols_string: Optional[str] = None
+        self,
+        raw_issue_text: str,
+        context_symbols_string: Optional[str] = None,
+        mcp_prompt: Optional[str] = None,
     ) -> Optional[str]:
         if self._is_diffusion_model_configured and self.model and self.tokenizer:
             if self.verbose:
@@ -92,6 +96,8 @@ class DiffusionSpecNormalizer(SpecNormalizerModelInterface):
                 f"Context symbols:\n{context_symbols_string if context_symbols_string else 'None'}\n\n"
                 f"Issue:\n{raw_issue_text}\n\nGenerate YAML:"
             )
+            if mcp_prompt:
+                prompt = mcp_prompt + "\n" + prompt
             try:
                 inputs = self.tokenizer(
                     prompt,
@@ -119,7 +125,7 @@ class DiffusionSpecNormalizer(SpecNormalizerModelInterface):
                     f"DiffusionSpecNormalizer: Using T5Client fallback for: {raw_issue_text[:50]}..."
                 )
             return self.fallback_t5_client.generate_spec_yaml(
-                raw_issue_text, context_symbols_string
+                raw_issue_text, context_symbols_string, mcp_prompt
             )
         else:
             if self.verbose:

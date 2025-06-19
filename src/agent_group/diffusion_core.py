@@ -149,6 +149,7 @@ class DiffusionCore:
             # GGUF FIM models might expect a specific format too (e.g., CodeLlama FIM).
             # This part needs careful alignment with the chosen models.
             # For now, a simple text prompt:
+            mcp_p = context_data.get("mcp_prompt_diffusion")
             prompt = f"""You are an expert Python code completion assistant.
 Your task is to fill in the placeholder `{hole_marker}` in the provided Python (LibCST) script.
 The script is intended to perform a refactoring operation.
@@ -201,6 +202,9 @@ Provide only the code snippet to replace `{hole_marker}`:"""
                         "agent_infill_gguf_stop_sequences",
                         ["\n```", "\n# End of infill"],
                     )
+
+                    if mcp_p:
+                        prompt = mcp_p + "\n" + prompt
 
                     if get_llm_code_infill:
                         infilled_code_snippet = get_llm_code_infill(

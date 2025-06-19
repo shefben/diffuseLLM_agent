@@ -43,5 +43,17 @@ active_learning:
   output_dir: ./lora_adapters
   interval: 3600
   predictor_model: ./models/core_predictor.joblib
+mcp:
+  default_tool: basic
+  tools:
+    - name: basic
+      prompt: "You are a helpful assistant generating high quality Python patches."
+  workflow_settings: {}
+  agent_defaults: {}
 webui:
   port: 5001
+  allow_registration: true
+planner:
+  beam_width: 3
+  workflow_type: orchestrator-workers
+custom_workflows: []

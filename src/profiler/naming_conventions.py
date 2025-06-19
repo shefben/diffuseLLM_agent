@@ -1,6 +1,8 @@
 # src/profiler/naming_conventions.py
 import re
-from typing import Dict
+import sqlite3
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 # Define standard naming conventions and their regex patterns
 # These regexes aim to be reasonably practical but might not cover every nuanced edge case.
@@ -95,12 +97,7 @@ if __name__ == '__main__':
             matches = is_identifier_matching_convention(ident, convention)
             print(f"'{ident}': {'Matches' if matches else 'Does NOT match'}")
             if matches:
-                 print(f"ERROR: Expected '{ident}' NOT to match {convention} but it did.")
-
-# Add new imports
-import sqlite3
-from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List # Added List
+                print(f"ERROR: Expected '{ident}' NOT to match {convention} but it did.")
 
 # Define identifier types used in the database
 IDENTIFIER_TYPES = [

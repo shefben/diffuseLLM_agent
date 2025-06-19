@@ -703,6 +703,7 @@ def propose_refactor_operations(
     n_gpu_layers: int = -1,
     n_ctx: int = 2048,
     temperature: float = 0.3,
+    mcp_prompt: str | None = None,
 ) -> list[dict]:
     """Use an LLM to propose refactor operations for a free-text goal.
 
@@ -717,10 +718,11 @@ def propose_refactor_operations(
             "JSON array of refactor operations. Each operation should have a "
             "'name', optional 'target_file', and 'parameters' dict."
         )
-        messages = [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": goal_text},
-        ]
+        messages = []
+        if mcp_prompt:
+            messages.append({"role": "system", "content": mcp_prompt})
+        messages.append({"role": "system", "content": prompt})
+        messages.append({"role": "user", "content": goal_text})
         try:
             llm = Llama(
                 model_path=str(Path(model_path)),
@@ -766,6 +768,55 @@ def propose_refactor_operations(
             )
 
     return operations
+
+
+def generate_custom_workflow(
+    description: str,
+    model_path: str | None = None,
+    verbose: bool = False,
+    n_gpu_layers: int = -1,
+    n_ctx: int = 2048,
+    temperature: float = 0.3,
+    mcp_prompt: str | None = None,
+) -> dict | None:
+    """Generate a custom workflow definition from a textual prompt."""
+    if model_path and Llama is not None and Path(model_path).is_file():
+        system_prompt = (
+            "You are a workflow designer. Generate a JSON object with a 'name' and"
+            " a 'steps' list describing which agents or models run in order."
+        )
+        messages = []
+        if mcp_prompt:
+            messages.append({"role": "system", "content": mcp_prompt})
+        messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": description})
+        try:
+            llm = Llama(
+                model_path=str(Path(model_path)),
+                n_gpu_layers=n_gpu_layers,
+                n_ctx=n_ctx,
+                verbose=verbose,
+            )
+            resp = llm.create_chat_completion(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=512,
+            )
+            if resp and resp.get("choices"):
+                raw = resp["choices"][0]["message"]["content"].strip()
+                try:
+                    obj = json.loads(raw)
+                    if isinstance(obj, dict):
+                        return obj
+                except json.JSONDecodeError:
+                    if verbose:
+                        print("generate_custom_workflow: invalid JSON")
+        except Exception as e:
+            if verbose:
+                print(f"generate_custom_workflow: LLM error {e}")
+
+    # fallback simple workflow
+    return {"name": "custom", "steps": ["LLMCore", "DiffusionCore", "LLMCore"]}
 
 # Main block for testing (commented out as per original structure)
 # if __name__ == '__main__':

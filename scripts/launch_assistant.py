@@ -45,7 +45,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Launch diffuseLLM assistant with web UI"
     )
-    parser.add_argument("project_root", type=Path, help="Path to the codebase")
+    parser.add_argument(
+        "project_root", type=Path, nargs="?", help="Path to the codebase"
+    )
     parser.add_argument("--config", type=Path, default=None, help="Configuration YAML")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument(
@@ -71,7 +73,8 @@ def main() -> None:
         al_cfg.get("predictor_model", "./models/core_predictor.joblib")
     )
 
-    initialize_components(args.project_root, args.config, args.verbose)
+    if args.project_root:
+        initialize_components(args.project_root, args.config, args.verbose)
 
     if args.active_learning or al_cfg.get("enabled", False):
         start_active_learning_loop(

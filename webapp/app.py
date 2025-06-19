@@ -1,9 +1,22 @@
-from flask import Flask, render_template, request
+from flask import (
+    Flask,
+    render_template,
+    request,
+    redirect,
+    url_for,
+    jsonify,
+    session,
+)
+from functools import wraps
+from werkzeug.security import check_password_hash, generate_password_hash
 import sys
+import uuid
+import threading
 from pathlib import Path
 import json  # For json.dumps as a fallback for displaying objects
 import yaml
 from src.learning.easyedit_helper import apply_easyedit
+from src.mcp.mcp_manager import get_mcp_prompt
 
 # Add project root to sys.path to allow imports from src
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +32,7 @@ try:
     from src.profiler.orchestrator import run_phase1_style_profiling_pipeline
     from src.utils.memory_logger import load_success_memory
     from src.learning.ft_dataset import build_finetune_dataset
+    from src.profiler.llm_interfacer import generate_custom_workflow
 except ImportError as e:
     print(
         f"Error importing project modules in webapp/app.py: {e}. Ensure PROJECT_ROOT is correct and src modules are accessible."
@@ -39,16 +53,209 @@ except ImportError as e:
     def build_finetune_dataset(*_a, **_k):  # type: ignore
         return False
 
+    def generate_custom_workflow(*_a, **_k):  # type: ignore
+        return {"name": "custom", "steps": ["LLMCore", "DiffusionCore", "LLMCore"]}
+
     Spec = dict  # Placeholder type
     Phase = dict  # Placeholder type
 
 app = Flask(__name__)
+app.secret_key = "change-me"
 
 # Globals populated by initialize_components()
 app_config_global = {}
 digester_global = None
 phase_planner_global = None
 initialized = False
+job_status: dict[str, dict] = {}
+
+# ---------------------------
+# User management
+# ---------------------------
+USERS_FILE = PROJECT_ROOT / "config" / "users.json"
+
+
+def load_users() -> dict:
+    if USERS_FILE.exists():
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_users(users: dict) -> None:
+    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, indent=2)
+
+
+@app.context_processor
+def inject_user():
+    users = load_users()
+    user = session.get("user")
+    return {
+        "current_user": user,
+        "is_admin": users.get(user, {}).get("is_admin", False),
+    }
+
+
+def login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("user"):
+            return redirect(url_for("login_route", next=request.path))
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("user"):
+            return redirect(url_for("login_route", next=request.path))
+        users = load_users()
+        user_data = users.get(session["user"], {})
+        if not user_data.get("is_admin"):
+            return redirect(url_for("dashboard_route"))
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+def start_job(target, *args, **kwargs) -> str:
+    """Start a background thread and return a job id."""
+    job_id = str(uuid.uuid4())
+    job_status[job_id] = {"status": "running", "message": ""}
+
+    def wrapper():
+        try:
+            target(*args, **kwargs, job_id=job_id)
+            job_status[job_id]["status"] = "complete"
+        except Exception as e:  # pragma: no cover - threading
+            job_status[job_id]["status"] = "error"
+            job_status[job_id]["message"] = str(e)
+
+    thread = threading.Thread(target=wrapper, daemon=True)
+    thread.start()
+    return job_id
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login_route():
+    users = load_users()
+    message = None
+    if not users:
+        return redirect(url_for("register_route"))
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if username in users and check_password_hash(users[username], password):
+            session["user"] = username
+            return redirect(request.args.get("next") or url_for("dashboard_route"))
+        message = "Invalid credentials"
+    return render_template(
+        "login.html", message=message, config=app_config_global, users=users
+    )
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register_route():
+    users = load_users()
+    allow = app_config_global.get("webui", {}).get("allow_registration", False)
+    if users and not allow:
+        return redirect(url_for("login_route"))
+    message = None
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        email = request.form.get("email", "")
+        if not username or not password:
+            message = "Username and password required"
+        elif username in users:
+            message = "User already exists"
+        else:
+            users[username] = {
+                "password": generate_password_hash(password),
+                "email": email,
+                "is_admin": not users,  # first user becomes admin
+            }
+            save_users(users)
+            session["user"] = username
+            return redirect(url_for("dashboard_route"))
+    return render_template("register.html", message=message)
+
+
+@app.route("/logout")
+def logout_route():
+    session.pop("user", None)
+    return redirect(url_for("login_route"))
+
+
+# -------------------------------------------------------------
+# Environment management and selection
+# -------------------------------------------------------------
+
+
+@app.route("/projects", methods=["GET", "POST"])
+def projects_route():
+    envs = load_environments()
+    message = None
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "select":
+            name = request.form.get("env_name")
+            for env in envs:
+                if env.get("name") == name:
+                    initialize_components(Path(env["path"]))
+                    return redirect(url_for("dashboard_route"))
+        elif action == "create":
+            name = request.form.get("new_name")
+            path = request.form.get("new_path")
+            desc = request.form.get("new_desc")
+            if name and path:
+                envs.append({"name": name, "path": path, "description": desc})
+                save_environments(envs)
+                initialize_components(Path(path))
+                return redirect(url_for("dashboard_route"))
+            message = "Name and path are required"
+        elif action == "delete":
+            name = request.form.get("env_name")
+            envs = [e for e in envs if e.get("name") != name]
+            save_environments(envs)
+        elif action == "rename":
+            name = request.form.get("env_name")
+            new_name = request.form.get("new_name")
+            for env in envs:
+                if env.get("name") == name and new_name:
+                    env["name"] = new_name
+            save_environments(envs)
+    for env in envs:
+        fp = Path(env.get("path", "")) / "style_fingerprint.json"
+        env["profiled"] = fp.exists()
+    return render_template("projects.html", environments=envs, message=message)
+
+
+# Environments config
+ENV_FILE = PROJECT_ROOT / "config" / "environments.json"
+
+
+def load_environments() -> list[dict]:
+    if ENV_FILE.exists():
+        try:
+            with open(ENV_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def save_environments(envs: list[dict]) -> None:
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(ENV_FILE, "w", encoding="utf-8") as f:
+        json.dump(envs, f, indent=2)
 
 
 def initialize_components(
@@ -80,8 +287,39 @@ def initialize_components(
     initialized = True
 
 
-@app.route("/", methods=["GET", "POST"])
-def index():
+@app.route("/")
+@login_required
+def dashboard_route():
+    if not initialized:
+        return redirect(url_for("projects_route"))
+
+    data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
+    if not data_dir.is_absolute():
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
+        data_dir = project_root / data_dir
+    entries = load_success_memory(data_dir)
+    recent_entries = entries[-5:]
+    dataset_path = data_dir / "finetune_dataset.jsonl"
+    dataset_entries = 0
+    if dataset_path.exists():
+        try:
+            with open(dataset_path, "r", encoding="utf-8") as f:
+                dataset_entries = sum(1 for _ in f)
+        except Exception:
+            dataset_entries = 0
+    return render_template(
+        "dashboard.html",
+        recent_entries=recent_entries,
+        memory_count=len(entries),
+        dataset_entries=dataset_entries,
+    )
+
+
+@app.route("/issue", methods=["GET", "POST"])
+@login_required
+def issue_route():
     spec_data_str = None
     plan_data_str = None
     error_message = None
@@ -90,19 +328,11 @@ def index():
     )
 
     if not initialized:
-        error_message = (
-            "Application not initialized. Please run initialize_components()."
-        )
-        return render_template(
-            "index.html",
-            submitted_issue=None,
-            spec_data=None,
-            plan_data=None,
-            error_message=error_message,
-        )
+        return redirect(url_for("projects_route"))
 
     if request.method == "POST":
         submitted_issue = request.form.get("issue_text", "")
+        workflow_selected = request.form.get("workflow", "orchestrator-workers")
 
         # Check global components
         if phase_planner_global is None or (
@@ -124,7 +354,8 @@ def index():
             try:
                 # Generate plan directly from goal text
                 spec_object, plan_list = phase_planner_global.generate_plan_from_goal(
-                    submitted_issue
+                    submitted_issue,
+                    workflow_selected,
                 )
 
                 if hasattr(spec_object, "model_dump_json"):
@@ -162,6 +393,8 @@ def index():
             spec_data=spec_data_str,
             plan_data=plan_data_str,
             error_message=error_message,
+            workflow_selected=workflow_selected,
+            custom_workflows=app_config_global.get("custom_workflows", []),
         )
 
     # For GET request
@@ -171,12 +404,15 @@ def index():
         spec_data=None,
         plan_data=None,
         error_message=None,
+        workflow_selected="orchestrator-workers",
+        custom_workflows=app_config_global.get("custom_workflows", []),
     )
 
 
 @app.route("/memory")
+@login_required
 def view_memory():
-    """Display recent success memory entries."""
+    """Display recent success memory entries with optional filtering."""
     if not initialized:
         return "Application not initialized", 503
 
@@ -186,12 +422,47 @@ def view_memory():
             app_config_global.get("general", {}).get("project_root", ".")
         )
         data_dir = project_root / data_dir
+
+    query = request.args.get("query", "").lower()
+    rating = request.args.get("rating")
+    start = request.args.get("start")
+    end = request.args.get("end")
+
     entries = load_success_memory(data_dir)
-    recent_entries = entries[-20:]
-    return render_template("memory.html", entries=recent_entries)
+    filtered: list[dict] = []
+
+    for e in entries:
+        keep = True
+        issue_text = str(e.get("spec_issue_description", "")).lower()
+        if query and query not in issue_text:
+            keep = False
+        if rating:
+            try:
+                if int(rating) != int(e.get("user_rating", -1)):
+                    keep = False
+            except Exception:
+                pass
+        ts = e.get("timestamp_utc")
+        if start and ts and ts < start:
+            keep = False
+        if end and ts and ts > end:
+            keep = False
+        if keep:
+            filtered.append(e)
+
+    recent_entries = filtered[-20:]
+    return render_template(
+        "memory.html",
+        entries=recent_entries,
+        query=query,
+        rating=rating,
+        start=start,
+        end=end,
+    )
 
 
 @app.route("/memory/<int:index>")
+@login_required
 def memory_detail_route(index: int):
     """Display full details for a single memory entry."""
     if not initialized:
@@ -211,6 +482,7 @@ def memory_detail_route(index: int):
 
 
 @app.route("/apply_patch", methods=["POST"])
+@login_required
 def apply_patch_route():
     """Run full patch generation for an issue and redirect to memory."""
     if not initialized:
@@ -218,23 +490,30 @@ def apply_patch_route():
 
     issue_text = request.form.get("issue_text", "")
     if not issue_text:
-        return redirect(url_for("index"))
+        return redirect(url_for("issue_route"))
 
-    spec_obj = phase_planner_global.spec_normalizer.normalise_request(issue_text)
-    if spec_obj is None or isinstance(spec_obj, dict) and "error" in spec_obj:
-        return render_template(
-            "index.html",
-            submitted_issue=issue_text,
-            spec_data=None,
-            plan_data=None,
-            error_message="Spec normalization failed",
+    workflow = request.form.get("workflow", "orchestrator-workers")
+    spec_prompt = get_mcp_prompt(app_config_global, workflow, "SpecNormalizer")
+
+    def job(job_id=None):
+        spec_obj_local = phase_planner_global.spec_normalizer.normalise_request(
+            issue_text, spec_prompt
         )
+        if spec_obj_local is None or (
+            isinstance(spec_obj_local, dict) and "error" in spec_obj_local
+        ):
+            job_status[job_id]["status"] = "error"
+            job_status[job_id]["message"] = "Spec normalization failed"
+            return
+        phase_planner_global.plan_phases(spec_obj_local, workflow_type=workflow)
+        job_status[job_id]["redirect"] = url_for("view_memory")
 
-    phase_planner_global.plan_phases(spec_obj)
-    return redirect(url_for("view_memory"))
+    jid = start_job(job)
+    return render_template("progress.html", title="Applying Patch", job_id=jid)
 
 
 @app.route("/apply_plan", methods=["POST"])
+@login_required
 def apply_plan_route():
     """Execute a user-approved plan represented as JSON."""
     if not initialized:
@@ -242,38 +521,42 @@ def apply_plan_route():
 
     issue_text = request.form.get("issue_text", "")
     plan_json = request.form.get("plan_json", "")
+    workflow = request.form.get("workflow", "orchestrator-workers")
     if not issue_text or not plan_json:
-        return redirect(url_for("index"))
+        return redirect(url_for("issue_route"))
 
-    spec_obj = phase_planner_global.spec_normalizer.normalise_request(issue_text)
-    if spec_obj is None or isinstance(spec_obj, dict) and "error" in spec_obj:
-        return render_template(
-            "index.html",
-            submitted_issue=issue_text,
-            spec_data=None,
-            plan_data=None,
-            error_message="Spec normalization failed",
+    spec_prompt = get_mcp_prompt(app_config_global, workflow, "SpecNormalizer")
+
+    def job(job_id=None):
+        spec_obj_local = phase_planner_global.spec_normalizer.normalise_request(
+            issue_text, spec_prompt
         )
+        if spec_obj_local is None or (
+            isinstance(spec_obj_local, dict) and "error" in spec_obj_local
+        ):
+            job_status[job_id]["status"] = "error"
+            job_status[job_id]["message"] = "Spec normalization failed"
+            return
 
-    try:
-        plan_list_dicts = json.loads(plan_json)
-        custom_plan = [Phase(**p) for p in plan_list_dicts]
-    except Exception as e:
-        return render_template(
-            "index.html",
-            submitted_issue=issue_text,
-            spec_data=None,
-            plan_data=plan_json,
-            error_message=f"Invalid plan JSON: {e}",
-        )
+        try:
+            plan_list_dicts = json.loads(plan_json)
+            custom_plan = [Phase(**p) for p in plan_list_dicts]
+        except Exception as e:
+            job_status[job_id]["status"] = "error"
+            job_status[job_id]["message"] = f"Invalid plan JSON: {e}"
+            return
 
-    cache_key = phase_planner_global._get_spec_cache_key(spec_obj)
-    phase_planner_global.plan_cache[cache_key] = custom_plan
-    phase_planner_global.plan_phases(spec_obj)
-    return redirect(url_for("view_memory"))
+        cache_key = phase_planner_global._get_spec_cache_key(spec_obj_local)
+        phase_planner_global.plan_cache[cache_key] = custom_plan
+        phase_planner_global.plan_phases(spec_obj_local, workflow_type=workflow)
+        job_status[job_id]["redirect"] = url_for("view_memory")
+
+    jid = start_job(job)
+    return render_template("progress.html", title="Applying Plan", job_id=jid)
 
 
 @app.route("/feedback", methods=["POST"])
+@login_required
 def feedback_route():
     if not initialized:
         return "Application not initialized", 503
@@ -304,6 +587,7 @@ def feedback_route():
 
 
 @app.route("/prepare_dataset")
+@login_required
 def prepare_dataset_route():
     """Generate a fine-tuning dataset from success memory."""
     if not initialized:
@@ -317,12 +601,19 @@ def prepare_dataset_route():
         data_dir = project_root / data_dir
 
     output_path = data_dir / "finetune_dataset.jsonl"
-    ok = build_finetune_dataset(data_dir, output_path, verbose=True)
-    message = f"Dataset written to {output_path}" if ok else "Failed to build dataset"
-    return render_template("dataset.html", message=message)
+
+    def job(job_id=None):
+        ok = build_finetune_dataset(data_dir, output_path, verbose=True)
+        msg = f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+        job_status[job_id]["message"] = msg
+        job_status[job_id]["redirect"] = url_for("train_route")
+
+    jid = start_job(job)
+    return render_template("progress.html", title="Preparing Dataset", job_id=jid)
 
 
 @app.route("/train", methods=["GET", "POST"])
+@login_required
 def train_route():
     if not initialized:
         return "Application not initialized", 503
@@ -338,48 +629,114 @@ def train_route():
     if request.method == "POST":
         action = request.form.get("action")
         if action == "Prepare Dataset":
-            output_path = data_dir / "finetune_dataset.jsonl"
-            ok = build_finetune_dataset(data_dir, output_path, verbose=True)
-            message = (
-                f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+
+            def job(job_id=None):
+                output_path = data_dir / "finetune_dataset.jsonl"
+                ok = build_finetune_dataset(data_dir, output_path, verbose=True)
+                job_status[job_id]["message"] = (
+                    f"Dataset written to {output_path}"
+                    if ok
+                    else "Failed to build dataset"
+                )
+                job_status[job_id]["redirect"] = url_for("train_route")
+
+            jid = start_job(job)
+            return render_template(
+                "progress.html", title="Preparing Dataset", job_id=jid
             )
         elif action == "Fine-tune LoRA":
-            try:
-                import subprocess
 
-                subprocess.run(
-                    [
-                        "python3",
-                        "scripts/finetune_lora.py",
-                        "--data-dir",
-                        str(data_dir),
-                    ],
-                    check=False,
-                )
-                message = "LoRA fine-tuning started"
-            except Exception as e:
-                message = f"Failed to run fine-tuning: {e}"
+            def job(job_id=None):
+                try:
+                    import subprocess
+
+                    subprocess.run(
+                        [
+                            "python3",
+                            "scripts/finetune_lora.py",
+                            "--data-dir",
+                            str(data_dir),
+                        ],
+                        check=False,
+                    )
+                    job_status[job_id]["message"] = "LoRA fine-tuning started"
+                except Exception as e:
+                    job_status[job_id]["status"] = "error"
+                    job_status[job_id]["message"] = str(e)
+                job_status[job_id]["redirect"] = url_for("train_route")
+
+            jid = start_job(job)
+            return render_template("progress.html", title="Fine-tuning", job_id=jid)
         elif action == "Train Predictor":
-            try:
-                import subprocess
 
-                subprocess.run(
-                    [
-                        "python3",
-                        "scripts/train_core_predictor.py",
-                        "--data-dir",
-                        str(data_dir),
-                    ],
-                    check=False,
-                )
-                message = "Predictor training started"
-            except Exception as e:
-                message = f"Failed to train predictor: {e}"
+            def job(job_id=None):
+                try:
+                    import subprocess
+
+                    subprocess.run(
+                        [
+                            "python3",
+                            "scripts/train_core_predictor.py",
+                            "--data-dir",
+                            str(data_dir),
+                        ],
+                        check=False,
+                    )
+                    job_status[job_id]["message"] = "Predictor training started"
+                except Exception as e:
+                    job_status[job_id]["status"] = "error"
+                    job_status[job_id]["message"] = str(e)
+                job_status[job_id]["redirect"] = url_for("train_route")
+
+            jid = start_job(job)
+            return render_template(
+                "progress.html", title="Training Predictor", job_id=jid
+            )
+        elif action == "Run Full Pipeline":
+
+            def job(job_id=None):
+                try:
+                    import subprocess
+
+                    output_path = data_dir / "finetune_dataset.jsonl"
+                    build_finetune_dataset(data_dir, output_path, verbose=True)
+                    subprocess.run(
+                        [
+                            "python3",
+                            "scripts/finetune_lora.py",
+                            "--data-dir",
+                            str(data_dir),
+                        ],
+                        check=False,
+                    )
+                    subprocess.run(
+                        [
+                            "python3",
+                            "scripts/train_core_predictor.py",
+                            "--data-dir",
+                            str(data_dir),
+                        ],
+                        check=False,
+                    )
+                    job_status[job_id]["message"] = "Full training pipeline started"
+                except Exception as e:
+                    job_status[job_id]["status"] = "error"
+                    job_status[job_id]["message"] = str(e)
+                job_status[job_id]["redirect"] = url_for("train_route")
+
+            jid = start_job(job)
+            return render_template("progress.html", title="Training", job_id=jid)
 
     return render_template("train.html", message=message)
 
 
+@app.route("/job_status/<job_id>")
+def job_status_route(job_id: str):
+    return jsonify(job_status.get(job_id, {"status": "unknown"}))
+
+
 @app.route("/query_graph", methods=["GET"])
+@login_required
 def query_graph_route():
     """Query the knowledge graph and display results."""
     if not initialized:
@@ -394,11 +751,17 @@ def query_graph_route():
         result = digester_global.query_knowledge_paths(src, relation, depth)
 
     return render_template(
-        "graph.html", query_src=src, query_relation=relation, depth=depth, result=result
+        "graph.html",
+        query_src=src,
+        query_relation=relation,
+        depth=depth,
+        result=result,
+        result_json=json.dumps(result),
     )
 
 
 @app.route("/search_code", methods=["GET", "POST"])
+@login_required
 def search_code_route():
     """Search symbols using the digester's retriever."""
     if not initialized:
@@ -422,7 +785,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Launch diffuseLLM web UI")
-    parser.add_argument("project_root", type=Path, help="Path to the codebase")
+    parser.add_argument(
+        "project_root", type=Path, nargs="?", help="Path to the codebase"
+    )
     parser.add_argument(
         "--config", type=Path, default=None, help="Optional config YAML"
     )
@@ -430,36 +795,71 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    initialize_components(args.project_root, args.config, args.verbose)
+    if args.project_root:
+        initialize_components(args.project_root, args.config, args.verbose)
 
     app.run(debug=args.verbose, host="0.0.0.0", port=args.port)
 
 
 @app.route("/config", methods=["GET", "POST"])
+@login_required
+@admin_required
 def config_route():
     if not initialized:
         return "Application not initialized", 503
     config_path = Path(app_config_global.get("loaded_config_path", "config.yaml"))
+    basic_fields = {
+        "general__data_dir": "",
+        "webui__port": "",
+        "webui__allow_registration": "",
+        "active_learning__enabled": "",
+    }
+
     if request.method == "POST":
-        new_text = request.form.get("config_text", "")
-        try:
-            yaml.safe_load(new_text)
+        mode = request.form.get("mode", "text")
+        if mode == "basic":
+            for key in basic_fields:
+                section, field = key.split("__")
+                val = request.form.get(key)
+                app_config_global.setdefault(section, {})[field] = yaml.safe_load(val)
             with open(config_path, "w", encoding="utf-8") as f:
-                f.write(new_text)
-            app_config_global.update(yaml.safe_load(new_text) or {})
+                yaml.safe_dump(app_config_global, f)
             message = "Configuration updated"
-        except Exception as e:
-            message = f"Failed to update config: {e}"
-        return render_template("config.html", config_text=new_text, message=message)
+        else:
+            new_text = request.form.get("config_text", "")
+            try:
+                yaml.safe_load(new_text)
+                with open(config_path, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+                app_config_global.update(yaml.safe_load(new_text) or {})
+                message = "Configuration updated"
+            except Exception as e:
+                message = f"Failed to update config: {e}"
+            return render_template(
+                "config.html",
+                config_text=new_text,
+                message=message,
+                basic_fields=basic_fields,
+            )
     text = (
         config_path.read_text(encoding="utf-8")
         if config_path.exists()
         else yaml.dump(app_config_global)
     )
-    return render_template("config.html", config_text=text, message=None)
+    # populate field values
+    for key in basic_fields:
+        section, field = key.split("__")
+        basic_fields[key] = app_config_global.get(section, {}).get(field, "")
+    return render_template(
+        "config.html",
+        config_text=text,
+        message=None,
+        basic_fields=basic_fields,
+    )
 
 
 @app.route("/chat", methods=["GET", "POST"])
+@login_required
 def chat_route():
     if not initialized:
         return "Application not initialized", 503
@@ -484,6 +884,7 @@ def chat_route():
 
 
 @app.route("/easyedit", methods=["GET", "POST"])
+@login_required
 def easyedit_route():
     if not initialized:
         return "Application not initialized", 503
@@ -495,3 +896,115 @@ def easyedit_route():
         ok = apply_easyedit(model_dir, instr, new_text, verbose=True)
         message = "Edit applied" if ok else "EasyEdit unavailable or failed"
     return render_template("easyedit.html", message=message)
+
+
+@app.route("/mcp", methods=["GET", "POST"])
+@login_required
+def mcp_route():
+    if not initialized:
+        return "Application not initialized", 503
+
+    mcp_cfg = app_config_global.setdefault("mcp", {})
+    tools = mcp_cfg.setdefault("tools", [])
+    workflow_settings = mcp_cfg.setdefault("workflow_settings", {})
+
+    message = None
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "add":
+            name = request.form.get("tool_name", "").strip()
+            prompt = request.form.get("tool_prompt", "")
+            if name and prompt:
+                tools.append({"name": name, "prompt": prompt})
+                message = "Tool added"
+        elif action == "save_settings":
+            for key, val in request.form.items():
+                if "__" in key:
+                    wf, agent = key.split("__", 1)
+                    workflow_settings.setdefault(wf, {})[agent] = val
+            message = "Settings saved"
+        with open(
+            app_config_global.get("loaded_config_path", "config.yaml"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            yaml.safe_dump(app_config_global, f)
+
+    return render_template(
+        "mcp.html", tools=tools, workflow_settings=workflow_settings, message=message
+    )
+
+
+@app.route("/custom_workflow", methods=["GET", "POST"])
+@login_required
+def custom_workflow_route():
+    if not initialized:
+        return "Application not initialized", 503
+
+    message = None
+    workflow_json = None
+    workflows = app_config_global.setdefault("custom_workflows", [])
+
+    if request.method == "POST":
+        name = request.form.get("workflow_name", "custom")
+        prompt = request.form.get("prompt", "")
+        model_path = app_config_global.get("models", {}).get("operations_llm_gguf")
+        wf = generate_custom_workflow(prompt, model_path=model_path)
+        if wf:
+            if "name" not in wf:
+                wf["name"] = name
+            workflows.append(wf)
+            workflow_json = json.dumps(wf, indent=2)
+            message = "Workflow added"
+            with open(
+                app_config_global.get("loaded_config_path", "config.yaml"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                yaml.safe_dump(app_config_global, f)
+
+    return render_template(
+        "custom_workflow.html",
+        message=message,
+        workflow_json=workflow_json,
+        workflows=workflows,
+    )
+
+
+@app.route("/users", methods=["GET", "POST"])
+@login_required
+@admin_required
+def users_route():
+    users = load_users()
+    message = None
+    if request.method == "POST":
+        action = request.form.get("action")
+        username = request.form.get("username", "").strip()
+        if action == "add":
+            password = request.form.get("password", "")
+            email = request.form.get("email", "")
+            is_admin = bool(request.form.get("is_admin"))
+            if username and password:
+                users[username] = {
+                    "password": generate_password_hash(password),
+                    "email": email,
+                    "is_admin": is_admin,
+                }
+                message = "User added"
+        elif action == "update" and username in users:
+            email = request.form.get("email", "")
+            is_admin = bool(request.form.get("is_admin"))
+            new_username = request.form.get("new_username", username).strip()
+            users[new_username] = users.pop(username)
+            users[new_username]["email"] = email
+            users[new_username]["is_admin"] = is_admin
+            if request.form.get("password"):
+                users[new_username]["password"] = generate_password_hash(
+                    request.form.get("password")
+                )
+            message = "User updated"
+        elif action == "delete" and username in users:
+            users.pop(username)
+            message = "User deleted"
+        save_users(users)
+    return render_template("users.html", users=users, message=message)

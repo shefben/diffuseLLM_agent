@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 # Placeholder for more specific types if they are defined later
 # e.g., for Black configuration, Ruff rules, etc.

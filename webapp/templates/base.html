@@ -6,16 +6,29 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
-    <div class="nav">
-        <a href="{{ url_for('index') }}">Home</a>
+    <div class="sidebar">
+        <a href="{{ url_for('dashboard_route') }}">Dashboard</a>
+        <a href="{{ url_for('issue_route') }}">Issue</a>
         <a href="{{ url_for('view_memory') }}">Memory</a>
         <a href="{{ url_for('prepare_dataset_route') }}">Dataset</a>
-        <a href="{{ url_for('query_graph_route') }}">Graph</a>
+        <a href="{{ url_for('train_route') }}">Training</a>
         <a href="{{ url_for('search_code_route') }}">Search</a>
+        <a href="{{ url_for('query_graph_route') }}">Graph</a>
         <a href="{{ url_for('chat_route') }}">Chat</a>
         <a href="{{ url_for('config_route') }}">Config</a>
+        {% if is_admin %}
+        <a href="{{ url_for('users_route') }}">Users</a>
+        {% endif %}
         <a href="{{ url_for('easyedit_route') }}">EasyEdit</a>
-        <a href="{{ url_for('train_route') }}">Training</a>
+        <a href="{{ url_for('mcp_route') }}">MCP</a>
+        <a href="{{ url_for('custom_workflow_route') }}">Custom Workflow</a>
+        <a href="{{ url_for('projects_route') }}">Projects</a>
+        <a href="https://github.com/user/docs" title="Usage Guide">Help</a>
+        {% if current_user %}
+        <a href="{{ url_for('logout_route') }}">Logout ({{ current_user }})</a>
+        {% else %}
+        <a href="{{ url_for('login_route') }}">Login</a>
+        {% endif %}
     </div>
     <div class="container">
         {% block content %}{% endblock %}

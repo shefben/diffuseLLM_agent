@@ -41,19 +41,25 @@ Some features depend on optional packages such as `transformers` and GPU‑enabl
 
 ## Quick Start
 
-1. **Profile the repository**
+1. **Launch the assistant**
    ```bash
-   python3 scripts/profile_style.py /path/to/project
+   python3 scripts/launch_assistant.py
    ```
-2. **Launch the assistant with the web UI**
-   ```bash
-   python3 scripts/launch_assistant.py /path/to/project
-   ```
-   Visit <http://localhost:5001> to submit an issue, review the generated plan, and approve or edit it before execution.
+   Open <http://localhost:5001> to create or select a project and provide the repository path. The profiler runs automatically, then you can submit issues, review plans and approve patches.
    Model paths and training parameters are read from `config.yaml`, so command‑line flags are optional.
-   The dashboard also offers code search, knowledge graph queries, memory review, and training controls.
+  The dashboard also offers code search, knowledge graph queries, memory review, and training controls. Use the **Config** page to edit the YAML settings directly and the **Training** page to run LoRA fine‑tuning and predictor updates without extra scripts. When submitting an issue you can select among several agent workflows—**prompt_chaining**, **routing**, **parallelization**, **orchestrator-workers**, or **evaluator-optimizer**—to control how patches are generated.
+  The **MCP** page lets you manage prompting tools and assign them to agents per workflow.
 
 For more detailed workflows—including active learning and fine‑tuning—see the [Usage Guide](docs/HOW_TO_USE.md).
+
+## Workflows
+
+The assistant supports several ways to coordinate the LLM and diffusion cores.
+The default is **orchestrator-workers**, where a central planner delegates tasks
+and merges the results. When submitting an issue you can instead select
+**prompt_chaining**, **routing**, **parallelization**, or
+**evaluator-optimizer**. Set `planner.workflow_type` in `config.yaml` to change
+the default.
 
 ## Helper Scripts
 

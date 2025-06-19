@@ -4,11 +4,23 @@
 <form method="POST" action="/">
     <label for="issue_text">Describe the issue or feature request:</label><br>
     <textarea name="issue_text" id="issue_text" rows="10"></textarea><br>
+    <label for="workflow">Workflow:</label>
+    <select name="workflow" id="workflow">
+        <option value="orchestrator-workers" {% if workflow_selected=='orchestrator-workers' %}selected{% endif %}>Orchestrator-workers</option>
+        <option value="prompt_chaining" {% if workflow_selected=='prompt_chaining' %}selected{% endif %}>Prompt chaining</option>
+        <option value="routing" {% if workflow_selected=='routing' %}selected{% endif %}>Routing</option>
+        <option value="parallelization" {% if workflow_selected=='parallelization' %}selected{% endif %}>Parallelization</option>
+        <option value="evaluator-optimizer" {% if workflow_selected=='evaluator-optimizer' %}selected{% endif %}>Evaluator-optimizer</option>
+        {% for wf in custom_workflows %}
+        <option value="{{ wf.name }}" {% if workflow_selected==wf.name %}selected{% endif %}>{{ wf.name }}</option>
+        {% endfor %}
+    </select><br>
     <input type="submit" value="Generate Plan">
 </form>
 <form method="POST" action="/apply_plan" style="margin-top:10px;">
     <input type="hidden" name="issue_text" id="issue_text_hidden">
     <input type="hidden" name="plan_json" id="plan_json_hidden">
+    <input type="hidden" name="workflow" id="workflow_hidden">
     <input type="submit" value="Approve Plan & Run">
     <button type="button" onclick="window.location.reload()">Reject Plan</button>
 </form>
@@ -33,18 +45,47 @@
 {% if plan_data %}
 <div class="results-section">
     <h2>Generated Plan (Phases):</h2>
-    <textarea id="plan_editor" rows="10" style="width:98%;">{{ plan_data }}</textarea>
+    <ul id="phase_list"></ul>
+    <textarea id="plan_editor" rows="10" style="width:98%; display:none;">{{ plan_data }}</textarea>
 </div>
 {% endif %}
 <script>
 const issueField = document.getElementById('issue_text');
 const hiddenField = document.getElementById('issue_text_hidden');
 const planHidden = document.getElementById('plan_json_hidden');
+const workflowSelect = document.getElementById('workflow');
+const workflowHidden = document.getElementById('workflow_hidden');
 const applyForm = document.forms[1];
-applyForm.addEventListener('submit', () => {
+function renderPhases(phases){
+    const list = document.getElementById('phase_list');
+    if(!list) return;
+    list.innerHTML='';
+    phases.forEach((p,i)=>{
+        const li=document.createElement('li');
+        li.innerHTML=`<pre>${JSON.stringify(p, null, 2)}</pre>`+
+            `<button type="button" onclick="moveUp(${i})">&#8593;</button>`+
+            `<button type="button" onclick="moveDown(${i})">&#8595;</button>`;
+        list.appendChild(li);
+    });
+}
+
+function moveUp(i){ if(i>0){ const t=phases[i-1]; phases[i-1]=phases[i]; phases[i]=t; renderPhases(phases);} }
+function moveDown(i){ if(i<phases.length-1){ const t=phases[i+1]; phases[i+1]=phases[i]; phases[i]=t; renderPhases(phases);} }
+
+let phases=[];
+const planEditor = document.getElementById('plan_editor');
+if(planEditor){
+    try{ phases=JSON.parse(planEditor.value);}catch(e){ phases=[]; }
+    renderPhases(phases);
+}
+
+function updateHidden(){
     hiddenField.value = issueField.value;
-    const planEditor = document.getElementById('plan_editor');
-    if (planEditor) planHidden.value = planEditor.value;
-});
+    if(planEditor){ planEditor.value = JSON.stringify(phases, null, 2); }
+    planHidden.value = planEditor ? planEditor.value : '';
+    if (workflowSelect) workflowHidden.value = workflowSelect.value;
+}
+
+applyForm.addEventListener('submit', updateHidden);
 </script>
 {% endblock %}

@@ -41,7 +41,9 @@ def main() -> None:
         project_root_path=project_root, app_config=app_config, digester=digester
     )
 
-    planner.plan_phases(spec)
+    planner.plan_phases(
+        spec, workflow_type=app_config.get("planner", {}).get("workflow_type")
+    )
 
 
 if __name__ == "__main__":

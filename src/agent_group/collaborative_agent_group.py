@@ -20,6 +20,7 @@ import ast  # For parsing modified code in duplicate guard
 from src.digester.signature_trie import (
     generate_function_signature_string,
 )  # For duplicate guard
+from src.mcp.mcp_manager import get_mcp_prompt
 from src.transformer import (
     apply_libcst_codemod_script,
     PatchApplicationError,
@@ -211,6 +212,7 @@ class CollaborativeAgentGroup:
                             )
                             context_data["duplicate_fqn"] = duplicate_method_matches[0]
                             return True, duplicate_method_matches[0]
+
         print(
             f"DuplicateGuard: No duplicate signatures found in {target_file_path.name}."
         )
@@ -225,7 +227,8 @@ class CollaborativeAgentGroup:
             Tuple[bool, Optional[str]],
         ],
         score_style_handle: Callable[[Any, Dict[str, Any]], float],
-        predicted_core: Optional[str] = None,  # New parameter
+        predicted_core: Optional[str] = None,
+        workflow: str = "orchestrator-workers",
     ) -> Tuple[
         Optional[str], Optional[str]
     ]:  # Returns (script_string, source_info_string)
@@ -274,6 +277,7 @@ class CollaborativeAgentGroup:
             "validator_handle": validator_handle,  # Passed from PhasePlanner
             "repository_digester": digester,
             "predicted_core_preference": predicted_core,  # New item
+            "workflow_type": workflow,
         }
 
         # Add PDG slice and code snippets from digester
@@ -284,6 +288,13 @@ class CollaborativeAgentGroup:
 
         # Store context for potential use in utility methods like generate_patch_preview
         self._current_run_context_data = context_data
+
+        llm_prompt = get_mcp_prompt(self.app_config, workflow, "LLMCore")
+        diff_prompt = get_mcp_prompt(self.app_config, workflow, "DiffusionCore")
+        if llm_prompt:
+            context_data["mcp_prompt_llm"] = llm_prompt
+        if diff_prompt:
+            context_data["mcp_prompt_diffusion"] = diff_prompt
 
         print(
             f"Step 1: Context Broadcast prepared. Context keys: {list(context_data.keys())}"

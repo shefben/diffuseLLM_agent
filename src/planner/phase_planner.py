@@ -46,6 +46,7 @@ from src.profiler.llm_interfacer import (
     get_llm_score_for_text,
     propose_refactor_operations,
 )
+from src.mcp.mcp_manager import get_mcp_prompt
 from src.utils.memory_logger import log_successful_patch  # For Success Memory Logging
 
 # REFACTOR_OPERATION_CLASSES is not directly used by PhasePlanner logic, REFACTOR_OPERATION_INSTANCES is.
@@ -173,6 +174,11 @@ class PhasePlanner:
         self.style_validator = StyleValidatorCore(
             app_config=self.app_config,
             style_profile=self.style_fingerprint,
+        )
+
+        # Default workflow type controls how agents cooperate during execution
+        self.workflow_type = self.app_config.get("planner", {}).get(
+            "workflow_type", "orchestrator-workers"
         )
 
         # Configure self.scorer_model_config (for internal use by _score_candidate_plan_with_llm)
@@ -318,6 +324,20 @@ class PhasePlanner:
             print("PhasePlanner: CommitBuilder instance initialized.")
 
         self.plan_cache: Dict[str, List[Phase]] = {}
+
+    def set_workflow_type(self, workflow: str) -> None:
+        """Update the planner's workflow strategy."""
+        valid = {
+            "prompt_chaining",
+            "routing",
+            "parallelization",
+            "orchestrator-workers",
+            "evaluator-optimizer",
+        }
+        if workflow in valid:
+            self.workflow_type = workflow
+        else:
+            print(f"Unknown workflow '{workflow}', using default {self.workflow_type}")
         # self.phi2_scorer_cache: Dict[str, float] = {} # Optional cache
 
         # Determine CorePredictor model path from app_config or use a default
@@ -499,14 +519,22 @@ class PhasePlanner:
             )
         return ops
 
-    def generate_plan_from_goal(self, goal_text: str) -> Tuple[Spec, List[Phase]]:
+    def generate_plan_from_goal(
+        self, goal_text: str, workflow_type: Optional[str] = None
+    ) -> Tuple[Spec, List[Phase]]:
         """High level entry point: normalize raw goal text and generate a plan."""
-        spec_obj = self.spec_normalizer.normalise_request(goal_text)
+        workflow = workflow_type or self.workflow_type
+        mcp_spec = get_mcp_prompt(self.app_config, workflow, "SpecNormalizer")
+        spec_obj = self.spec_normalizer.normalise_request(goal_text, mcp_spec)
         if spec_obj is None:
             raise ValueError("SpecNormalizer failed to create a Spec from goal text")
 
+        mcp_ops = get_mcp_prompt(self.app_config, workflow, "OperationsModel")
         llm_ops = propose_refactor_operations(
-            goal_text, model_path=self.operations_llm_path, verbose=self.verbose
+            goal_text,
+            model_path=self.operations_llm_path,
+            verbose=self.verbose,
+            mcp_prompt=mcp_ops,
         )
 
         if not llm_ops:
@@ -887,16 +915,19 @@ Score:"""
 
         return best_plan_phases
 
-    def plan_phases(self, spec: Spec) -> List[Phase]:
-        """
-        Generates a plan from a spec and then executes each phase of the plan.
-        Plan generation is handled by generate_plan_from_spec.
-        This method focuses on the execution loop using CollaborativeAgentGroup.
-        """
+    def plan_phases(
+        self, spec: Spec, workflow_type: Optional[str] = None
+    ) -> List[Phase]:
+        """Generate a plan and execute it using the chosen workflow."""
         best_plan = self.generate_plan_from_spec(spec)
+        workflow = workflow_type or self.workflow_type
 
-        predicted_core = None  # Default if prediction fails or not possible
-        if best_plan:  # Only try to predict if a plan was generated
+        predicted_core = None
+        if best_plan and workflow in {
+            "routing",
+            "orchestrator-workers",
+            "evaluator-optimizer",
+        }:
             if self.core_predictor and self.core_predictor.is_ready:
                 # Prepare raw_features for CorePredictor
                 raw_features_for_predictor = {
@@ -943,22 +974,81 @@ Score:"""
                 "\n--- Running CollaborativeAgentGroup for each phase in the generated plan ---"
             )
             execution_summary = []  # To store results of agent_group.run for each phase
-            for phase_obj in best_plan:  # best_plan is List[Phase]
+            for phase_obj in best_plan:
                 print(
                     f"Executing phase: {phase_obj.operation_name} on {phase_obj.target_file or 'repo-level'}"
                 )
                 try:
-                    # The CollaborativeAgentGroup's run method signature is:
-                    # run(self, phase_ctx: 'Phase', digester: 'RepositoryDigester',
-                    #     validator_handle: Callable, score_style_handle: Callable, predicted_core: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-                    # It uses its own initialized style_profile and naming_conventions_db_path.
-                    validated_patch_script, patch_source = self.agent_group.run(
-                        phase_ctx=phase_obj,
-                        digester=self.digester,
-                        validator_handle=self.validator_handle,
-                        score_style_handle=self.score_style_handle,
-                        predicted_core=predicted_core,  # Pass the predicted core
+                    workflow_core = (
+                        predicted_core
+                        if workflow
+                        in {"routing", "orchestrator-workers", "evaluator-optimizer"}
+                        else None
                     )
+
+                    if workflow == "parallelization":
+                        llm_script, llm_src = self.agent_group.run(
+                            phase_ctx=phase_obj,
+                            digester=self.digester,
+                            validator_handle=self.validator_handle,
+                            score_style_handle=self.score_style_handle,
+                            predicted_core="LLMCore",
+                            workflow=workflow,
+                        )
+                        diff_script, diff_src = self.agent_group.run(
+                            phase_ctx=phase_obj,
+                            digester=self.digester,
+                            validator_handle=self.validator_handle,
+                            score_style_handle=self.score_style_handle,
+                            predicted_core="DiffusionCore",
+                            workflow=workflow,
+                        )
+                        score_llm = (
+                            self.style_validator.score_patch_script_content(
+                                llm_script or "",
+                                self.project_root_path,
+                                self.naming_conventions_db_path,
+                            )
+                            if llm_script
+                            else -1.0
+                        )
+                        score_diff = (
+                            self.style_validator.score_patch_script_content(
+                                diff_script or "",
+                                self.project_root_path,
+                                self.naming_conventions_db_path,
+                            )
+                            if diff_script
+                            else -1.0
+                        )
+                        if score_diff > score_llm:
+                            validated_patch_script, patch_source = diff_script, diff_src
+                        else:
+                            validated_patch_script, patch_source = llm_script, llm_src
+                    else:
+                        validated_patch_script, patch_source = self.agent_group.run(
+                            phase_ctx=phase_obj,
+                            digester=self.digester,
+                            validator_handle=self.validator_handle,
+                            score_style_handle=self.score_style_handle,
+                            predicted_core=workflow_core,
+                            workflow=workflow,
+                        )
+
+                    if workflow == "evaluator-optimizer" and validated_patch_script:
+                        score = get_llm_score_for_text(
+                            validated_patch_script,
+                            model_path=self.scorer_model_config.get("model_path"),
+                            n_ctx=self.scorer_model_config.get("n_ctx"),
+                            temperature=self.scorer_model_config.get("temperature"),
+                            verbose=self.verbose,
+                        )
+                        if score is not None and score < 0.5:
+                            validated_patch_script = (
+                                self.agent_group.llm_agent.polish_patch(
+                                    validated_patch_script, {}
+                                )
+                            )
 
                     if validated_patch_script:
                         print(
@@ -1351,7 +1441,10 @@ if __name__ == "__main__":
         spec_instance_main = Spec(**example_spec_data_main)
 
         print(f"\nPlanning for spec: {spec_instance_main.issue_description}")
-        plan_phases_list_main = planner.plan_phases(spec_instance_main)
+        plan_phases_list_main = planner.plan_phases(
+            spec_instance_main,
+            workflow_type=planner.workflow_type,
+        )
 
         print("\n--- Post-execution: Generated Plan Phases (from planner return) ---")
         if plan_phases_list_main:

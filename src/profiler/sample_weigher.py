@@ -89,7 +89,8 @@ def calculate_sample_weights(
             norm_size_score = 1.0 if max_size > 0 else 0.0 # All same size (or all zero size)
         else:
             norm_size_score = (current_size_proc - min_size) / (max_size - min_size)
-            if math.isnan(norm_size_score) or math.isinf(norm_size_score): norm_size_score = 0.5 # Fallback
+            if math.isnan(norm_size_score) or math.isinf(norm_size_score):
+                norm_size_score = 0.5  # Fallback
 
         # Normalize recency score (0 to 1, 1 is most recent)
         current_mod_timestamp_val = sample.mod_timestamp if sample.mod_timestamp is not None else 0
@@ -97,7 +98,8 @@ def calculate_sample_weights(
             norm_recency_score = 1.0 # All same timestamp (or only one file)
         else:
             norm_recency_score = (current_mod_timestamp_val - min_ts) / (max_ts - min_ts)
-            if math.isnan(norm_recency_score) or math.isinf(norm_recency_score): norm_recency_score = 0.5 # Fallback
+            if math.isnan(norm_recency_score) or math.isinf(norm_recency_score):
+                norm_recency_score = 0.5  # Fallback
 
         # Combined weight
         combined_weight = (size_weight_coeff * norm_size_score) + \

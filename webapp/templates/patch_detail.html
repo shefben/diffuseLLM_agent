@@ -6,11 +6,16 @@
 <p><strong>Patch Source:</strong> {{ entry.patch_source }}</p>
 <p><strong>Predicted Core:</strong> {{ entry.predicted_core }}</p>
 <h2>Diff Summary</h2>
-<pre class="diff">
-{% for line in entry.successful_diff_summary.splitlines() %}
-<span class="{{ 'add' if line.startswith('+') else 'del' if line.startswith('-') else '' }}">{{ line }}</span>
-{% endfor %}
-</pre>
+<div id="diff"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/diff2html/3.4.9/diff2html.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/diff2html/3.4.9/diff2html.min.css" />
+<script>
+const diffString = {{ entry.successful_diff_summary|tojson }};
+const diffHtml = Diff2Html.html(diffString, { drawFileList: true, matching: 'lines', outputFormat: 'side-by-side' });
+document.getElementById('diff').innerHTML = diffHtml;
+</script>
 <h2>Patch Script</h2>
 <pre>{{ entry.successful_script }}</pre>
 {% if entry.user_rating is not none %}
