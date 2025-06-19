@@ -52,6 +52,7 @@ mcp:
   agent_defaults: {}
 webui:
   port: 5001
+  allow_registration: true
 planner:
   beam_width: 3
   workflow_type: orchestrator-workers

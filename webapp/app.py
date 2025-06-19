@@ -82,12 +82,7 @@ def load_users() -> dict:
                 return json.load(f)
         except Exception:
             return {}
-    # create default user
-    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    default = {"admin": generate_password_hash("admin")}
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(default, f, indent=2)
-    return default
+    return {}
 
 
 def save_users(users: dict) -> None:
@@ -96,11 +91,35 @@ def save_users(users: dict) -> None:
         json.dump(users, f, indent=2)
 
 
+@app.context_processor
+def inject_user():
+    users = load_users()
+    user = session.get("user")
+    return {
+        "current_user": user,
+        "is_admin": users.get(user, {}).get("is_admin", False),
+    }
+
+
 def login_required(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         if not session.get("user"):
             return redirect(url_for("login_route", next=request.path))
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("user"):
+            return redirect(url_for("login_route", next=request.path))
+        users = load_users()
+        user_data = users.get(session["user"], {})
+        if not user_data.get("is_admin"):
+            return redirect(url_for("dashboard_route"))
         return func(*args, **kwargs)
 
     return wrapper
@@ -128,6 +147,8 @@ def start_job(target, *args, **kwargs) -> str:
 def login_route():
     users = load_users()
     message = None
+    if not users:
+        return redirect(url_for("register_route"))
     if request.method == "POST":
         username = request.form.get("username", "")
         password = request.form.get("password", "")
@@ -135,7 +156,36 @@ def login_route():
             session["user"] = username
             return redirect(request.args.get("next") or url_for("dashboard_route"))
         message = "Invalid credentials"
-    return render_template("login.html", message=message)
+    return render_template(
+        "login.html", message=message, config=app_config_global, users=users
+    )
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register_route():
+    users = load_users()
+    allow = app_config_global.get("webui", {}).get("allow_registration", False)
+    if users and not allow:
+        return redirect(url_for("login_route"))
+    message = None
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        email = request.form.get("email", "")
+        if not username or not password:
+            message = "Username and password required"
+        elif username in users:
+            message = "User already exists"
+        else:
+            users[username] = {
+                "password": generate_password_hash(password),
+                "email": email,
+                "is_admin": not users,  # first user becomes admin
+            }
+            save_users(users)
+            session["user"] = username
+            return redirect(url_for("dashboard_route"))
+    return render_template("register.html", message=message)
 
 
 @app.route("/logout")
@@ -368,7 +418,9 @@ def view_memory():
 
     data_dir = Path(app_config_global.get("general", {}).get("data_dir", ".agent_data"))
     if not data_dir.is_absolute():
-        project_root = Path(app_config_global.get("general", {}).get("project_root", "."))
+        project_root = Path(
+            app_config_global.get("general", {}).get("project_root", ".")
+        )
         data_dir = project_root / data_dir
 
     query = request.args.get("query", "").lower()
@@ -442,6 +494,7 @@ def apply_patch_route():
 
     workflow = request.form.get("workflow", "orchestrator-workers")
     spec_prompt = get_mcp_prompt(app_config_global, workflow, "SpecNormalizer")
+
     def job(job_id=None):
         spec_obj_local = phase_planner_global.spec_normalizer.normalise_request(
             issue_text, spec_prompt
@@ -473,6 +526,7 @@ def apply_plan_route():
         return redirect(url_for("issue_route"))
 
     spec_prompt = get_mcp_prompt(app_config_global, workflow, "SpecNormalizer")
+
     def job(job_id=None):
         spec_obj_local = phase_planner_global.spec_normalizer.normalise_request(
             issue_text, spec_prompt
@@ -547,6 +601,7 @@ def prepare_dataset_route():
         data_dir = project_root / data_dir
 
     output_path = data_dir / "finetune_dataset.jsonl"
+
     def job(job_id=None):
         ok = build_finetune_dataset(data_dir, output_path, verbose=True)
         msg = f"Dataset written to {output_path}" if ok else "Failed to build dataset"
@@ -574,26 +629,36 @@ def train_route():
     if request.method == "POST":
         action = request.form.get("action")
         if action == "Prepare Dataset":
+
             def job(job_id=None):
                 output_path = data_dir / "finetune_dataset.jsonl"
                 ok = build_finetune_dataset(data_dir, output_path, verbose=True)
                 job_status[job_id]["message"] = (
-                    f"Dataset written to {output_path}" if ok else "Failed to build dataset"
+                    f"Dataset written to {output_path}"
+                    if ok
+                    else "Failed to build dataset"
                 )
                 job_status[job_id]["redirect"] = url_for("train_route")
 
             jid = start_job(job)
-            return render_template("progress.html", title="Preparing Dataset", job_id=jid)
+            return render_template(
+                "progress.html", title="Preparing Dataset", job_id=jid
+            )
         elif action == "Fine-tune LoRA":
+
             def job(job_id=None):
                 try:
                     import subprocess
-                    subprocess.run([
-                        "python3",
-                        "scripts/finetune_lora.py",
-                        "--data-dir",
-                        str(data_dir),
-                    ], check=False)
+
+                    subprocess.run(
+                        [
+                            "python3",
+                            "scripts/finetune_lora.py",
+                            "--data-dir",
+                            str(data_dir),
+                        ],
+                        check=False,
+                    )
                     job_status[job_id]["message"] = "LoRA fine-tuning started"
                 except Exception as e:
                     job_status[job_id]["status"] = "error"
@@ -603,15 +668,20 @@ def train_route():
             jid = start_job(job)
             return render_template("progress.html", title="Fine-tuning", job_id=jid)
         elif action == "Train Predictor":
+
             def job(job_id=None):
                 try:
                     import subprocess
-                    subprocess.run([
-                        "python3",
-                        "scripts/train_core_predictor.py",
-                        "--data-dir",
-                        str(data_dir),
-                    ], check=False)
+
+                    subprocess.run(
+                        [
+                            "python3",
+                            "scripts/train_core_predictor.py",
+                            "--data-dir",
+                            str(data_dir),
+                        ],
+                        check=False,
+                    )
                     job_status[job_id]["message"] = "Predictor training started"
                 except Exception as e:
                     job_status[job_id]["status"] = "error"
@@ -619,25 +689,35 @@ def train_route():
                 job_status[job_id]["redirect"] = url_for("train_route")
 
             jid = start_job(job)
-            return render_template("progress.html", title="Training Predictor", job_id=jid)
+            return render_template(
+                "progress.html", title="Training Predictor", job_id=jid
+            )
         elif action == "Run Full Pipeline":
+
             def job(job_id=None):
                 try:
                     import subprocess
+
                     output_path = data_dir / "finetune_dataset.jsonl"
                     build_finetune_dataset(data_dir, output_path, verbose=True)
-                    subprocess.run([
-                        "python3",
-                        "scripts/finetune_lora.py",
-                        "--data-dir",
-                        str(data_dir),
-                    ], check=False)
-                    subprocess.run([
-                        "python3",
-                        "scripts/train_core_predictor.py",
-                        "--data-dir",
-                        str(data_dir),
-                    ], check=False)
+                    subprocess.run(
+                        [
+                            "python3",
+                            "scripts/finetune_lora.py",
+                            "--data-dir",
+                            str(data_dir),
+                        ],
+                        check=False,
+                    )
+                    subprocess.run(
+                        [
+                            "python3",
+                            "scripts/train_core_predictor.py",
+                            "--data-dir",
+                            str(data_dir),
+                        ],
+                        check=False,
+                    )
                     job_status[job_id]["message"] = "Full training pipeline started"
                 except Exception as e:
                     job_status[job_id]["status"] = "error"
@@ -723,6 +803,7 @@ if __name__ == "__main__":
 
 @app.route("/config", methods=["GET", "POST"])
 @login_required
+@admin_required
 def config_route():
     if not initialized:
         return "Application not initialized", 503
@@ -730,6 +811,7 @@ def config_route():
     basic_fields = {
         "general__data_dir": "",
         "webui__port": "",
+        "webui__allow_registration": "",
         "active_learning__enabled": "",
     }
 
@@ -887,3 +969,42 @@ def custom_workflow_route():
         workflow_json=workflow_json,
         workflows=workflows,
     )
+
+
+@app.route("/users", methods=["GET", "POST"])
+@login_required
+@admin_required
+def users_route():
+    users = load_users()
+    message = None
+    if request.method == "POST":
+        action = request.form.get("action")
+        username = request.form.get("username", "").strip()
+        if action == "add":
+            password = request.form.get("password", "")
+            email = request.form.get("email", "")
+            is_admin = bool(request.form.get("is_admin"))
+            if username and password:
+                users[username] = {
+                    "password": generate_password_hash(password),
+                    "email": email,
+                    "is_admin": is_admin,
+                }
+                message = "User added"
+        elif action == "update" and username in users:
+            email = request.form.get("email", "")
+            is_admin = bool(request.form.get("is_admin"))
+            new_username = request.form.get("new_username", username).strip()
+            users[new_username] = users.pop(username)
+            users[new_username]["email"] = email
+            users[new_username]["is_admin"] = is_admin
+            if request.form.get("password"):
+                users[new_username]["password"] = generate_password_hash(
+                    request.form.get("password")
+                )
+            message = "User updated"
+        elif action == "delete" and username in users:
+            users.pop(username)
+            message = "User deleted"
+        save_users(users)
+    return render_template("users.html", users=users, message=message)

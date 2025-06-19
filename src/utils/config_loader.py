@@ -72,13 +72,13 @@ DEFAULT_APP_CONFIG: Dict[str, Any] = {
         "tools": [
             {
                 "name": "basic",
-                "prompt": "You are a helpful assistant generating high quality Python patches."
+                "prompt": "You are a helpful assistant generating high quality Python patches.",
             }
         ],
         "workflow_settings": {},
         "agent_defaults": {},
     },
-    "webui": {"port": 5001},
+    "webui": {"port": 5001, "allow_registration": True},
     "divot5_fim_params": {  # Parameters specific to DivoT5 Fill-In-Middle models
         "infill_max_length": 256,
         "infill_num_beams": 3,
