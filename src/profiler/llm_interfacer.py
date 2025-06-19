@@ -1,6 +1,7 @@
-import random
 from typing import Dict, Literal, Union, Optional, List, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+# ruff: noqa: E701, E702
 import io
 import tokenize
 import re
@@ -58,17 +59,21 @@ def _get_modal_indent(code_snippet: str) -> int:
     indents = []
     for line in code_snippet.splitlines():
         stripped_line = line.lstrip()
-        if not stripped_line: continue
+        if not stripped_line:
+            continue
         leading_spaces = len(line) - len(stripped_line)
-        if leading_spaces > 0: indents.append(leading_spaces)
-    if not indents: return 4
+        if leading_spaces > 0:
+            indents.append(leading_spaces)
+    if not indents:
+        return 4
     counts = Counter(indents)
     most_common = counts.most_common(1)
     return most_common[0][0] if most_common else 4
 
 def _get_line_length_percentile(code_snippet: str, percentile: float = 0.95) -> int:
     line_lengths = [len(line) for line in code_snippet.splitlines()]
-    if not line_lengths: return 88
+    if not line_lengths:
+        return 88
     line_lengths.sort()
     index = int(len(line_lengths) * percentile) - 1
     index = max(0, min(index, len(line_lengths) - 1))
@@ -77,29 +82,54 @@ def _get_line_length_percentile(code_snippet: str, percentile: float = 0.95) -> 
 def collect_deterministic_stats(code_snippet: str) -> str:
     stats: Dict[str, Any] = {}
     stats['indent_modal'] = _get_modal_indent(code_snippet)
-    single_quotes_count = 0; double_quotes_count = 0; f_strings_count = 0; identifiers = []
+    single_quotes_count = 0
+    double_quotes_count = 0
+    f_strings_count = 0
+    identifiers = []
     try:
         code_bytes = code_snippet.encode('utf-8')
         token_stream = tokenize.tokenize(io.BytesIO(code_bytes).readline)
         for token_info in token_stream:
             if token_info.type == tokenize.STRING:
-                token_string = token_info.string; is_fstring = False; prefix_len = 0
+                token_string = token_info.string
+                is_fstring = False
+                prefix_len = 0
                 lowered_token_string = token_string.lower()
-                if lowered_token_string.startswith(("rf", "fr")): is_fstring = True; prefix_len = 2
+                if lowered_token_string.startswith(("rf", "fr")):
+                    is_fstring = True
+                    prefix_len = 2
                 elif lowered_token_string.startswith(("r", "f", "u", "b")):
-                    if lowered_token_string.startswith("f"): is_fstring = True
+                    if lowered_token_string.startswith("f"):
+                        is_fstring = True
                     prefix_len = 1
-                if is_fstring: f_strings_count += 1
+                if is_fstring:
+                    f_strings_count += 1
                 actual_string_part = token_string[prefix_len:]
-                if actual_string_part.startswith(TRIPLE_SINGLE_QUOTE) and actual_string_part.endswith(TRIPLE_SINGLE_QUOTE): single_quotes_count += 1
-                elif actual_string_part.startswith(TRIPLE_DOUBLE_QUOTE) and actual_string_part.endswith(TRIPLE_DOUBLE_QUOTE): double_quotes_count += 1
-                elif actual_string_part.startswith("'") and actual_string_part.endswith("'"): single_quotes_count += 1
-                elif actual_string_part.startswith('"') and actual_string_part.endswith('"'): double_quotes_count += 1
-            elif token_info.type == tokenize.NAME: identifiers.append(token_info.string)
-    except tokenize.TokenError: pass
-    stats['quotes_single'] = single_quotes_count; stats['quotes_double'] = double_quotes_count; stats['f_strings'] = f_strings_count
+                if (
+                    actual_string_part.startswith(TRIPLE_SINGLE_QUOTE)
+                    and actual_string_part.endswith(TRIPLE_SINGLE_QUOTE)
+                ):
+                    single_quotes_count += 1
+                elif (
+                    actual_string_part.startswith(TRIPLE_DOUBLE_QUOTE)
+                    and actual_string_part.endswith(TRIPLE_DOUBLE_QUOTE)
+                ):
+                    double_quotes_count += 1
+                elif actual_string_part.startswith("'") and actual_string_part.endswith("'"):
+                    single_quotes_count += 1
+                elif actual_string_part.startswith('"') and actual_string_part.endswith('"'):
+                    double_quotes_count += 1
+            elif token_info.type == tokenize.NAME:
+                identifiers.append(token_info.string)
+    except tokenize.TokenError:
+        pass
+    stats['quotes_single'] = single_quotes_count
+    stats['quotes_double'] = double_quotes_count
+    stats['f_strings'] = f_strings_count
     stats['line_len_95p'] = _get_line_length_percentile(code_snippet)
-    snake_case_count = 0; camelCase_count = 0; UPPER_SCREAMING_count = 0
+    snake_case_count = 0
+    camelCase_count = 0
+    UPPER_SCREAMING_count = 0
     valid_idents_for_case_analysis = [ident for ident in identifiers if len(ident) > 1 or ident == '_']
     for ident in valid_idents_for_case_analysis:
         if re.fullmatch(r'[a-z0-9_]+', ident) and not any(c.isupper() for c in ident): snake_case_count += 1
@@ -109,9 +139,12 @@ def collect_deterministic_stats(code_snippet: str) -> str:
     stats['snake_pct'] = round(snake_case_count / total_countable_idents, 2) if total_countable_idents > 0 else 0.0
     stats['camel_pct'] = round(camelCase_count / total_countable_idents, 2) if total_countable_idents > 0 else 0.0
     stats['screaming_pct'] = round(UPPER_SCREAMING_count / total_countable_idents, 2) if total_countable_idents > 0 else 0.0
-    docstring_markers = []; tree = None
-    try: tree = ast.parse(code_snippet)
-    except SyntaxError: pass
+    docstring_markers = []
+    tree = None
+    try:
+        tree = ast.parse(code_snippet)
+    except SyntaxError:
+        pass
     if tree:
         for node in ast.walk(tree):
             docstring = ast.get_docstring(node, clean=False)
@@ -151,7 +184,7 @@ def get_deepseek_draft_fingerprint(stats_block: str, model_path: str, n_gpu_laye
         return {**default_error_fingerprint, "error": error_msg}
     system_prompt = ("You are a style analysis assistant. Based on the provided code statistics, generate a JSON object representing the style fingerprint. The JSON object must only contain the following keys, with appropriate values derived from the statistics: 'indent' (int), 'quotes' (string, e.g., 'single', 'double', 'mixed?'), 'linelen' (int), 'snake_pct' (float, 0.0-1.0), 'camel_pct' (float, 0.0-1.0), 'screaming_pct' (float, 0.0-1.0), 'docstyle' (string, e.g., 'google', 'numpy', 'plain', 'unknown?'). Ensure screaming_pct refers to UPPER_CASE_SNAKE_CASE.")
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": stats_block}]
-    raw_json_output = "{}";
+    raw_json_output = "{}"
     try:
         response = llm.create_chat_completion(messages=messages, temperature=0.1, max_tokens=256)
         if response and response['choices'] and response['choices'][0]['message']['content']: raw_json_output = response['choices'][0]['message']['content'].strip()
@@ -660,6 +693,130 @@ def get_llm_polished_cst_script(
     except Exception as e_infer:
         print(f"LLM_Interfacer Error: Error during LLM CST script polishing inference: {e_infer}")
         return None
+
+
+def propose_refactor_operations(
+    goal_text: str,
+    model_path: str | None = None,
+    max_tokens: int = 512,
+    verbose: bool = False,
+    n_gpu_layers: int = -1,
+    n_ctx: int = 2048,
+    temperature: float = 0.3,
+    mcp_prompt: str | None = None,
+) -> list[dict]:
+    """Use an LLM to propose refactor operations for a free-text goal.
+
+    If no model is available, fall back to a small heuristic that guesses a few
+    common operations based on keywords in the goal text.
+    """
+    operations: list[dict] = []
+
+    if model_path and Llama is not None and Path(model_path).is_file():
+        prompt = (
+            "You are an assistant that converts free text coding goals into a "
+            "JSON array of refactor operations. Each operation should have a "
+            "'name', optional 'target_file', and 'parameters' dict."
+        )
+        messages = []
+        if mcp_prompt:
+            messages.append({"role": "system", "content": mcp_prompt})
+        messages.append({"role": "system", "content": prompt})
+        messages.append({"role": "user", "content": goal_text})
+        try:
+            llm = Llama(
+                model_path=str(Path(model_path)),
+                n_gpu_layers=n_gpu_layers,
+                n_ctx=n_ctx,
+                verbose=verbose,
+            )
+            response = llm.create_chat_completion(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            if response and response.get("choices"):
+                raw = response["choices"][0]["message"]["content"].strip()
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        operations = parsed
+                except json.JSONDecodeError:
+                    if verbose:
+                        print("propose_refactor_operations: LLM output was not valid JSON")
+        except Exception as e:
+            if verbose:
+                print(f"propose_refactor_operations: LLM error {e}")
+
+    if not operations:
+        lowered = goal_text.lower()
+        if "import" in lowered:
+            operations.append({"name": "add_import", "parameters": {"import_statement": ""}})
+        if "decorator" in lowered:
+            operations.append(
+                {
+                    "name": "add_decorator",
+                    "parameters": {"decorator_name": "@todo", "target_function_name": "func"},
+                }
+            )
+        if "docstring" in lowered:
+            operations.append(
+                {
+                    "name": "update_docstring",
+                    "parameters": {"target_name": "func", "new_docstring": ""},
+                }
+            )
+
+    return operations
+
+
+def generate_custom_workflow(
+    description: str,
+    model_path: str | None = None,
+    verbose: bool = False,
+    n_gpu_layers: int = -1,
+    n_ctx: int = 2048,
+    temperature: float = 0.3,
+    mcp_prompt: str | None = None,
+) -> dict | None:
+    """Generate a custom workflow definition from a textual prompt."""
+    if model_path and Llama is not None and Path(model_path).is_file():
+        system_prompt = (
+            "You are a workflow designer. Generate a JSON object with a 'name' and"
+            " a 'steps' list describing which agents or models run in order."
+        )
+        messages = []
+        if mcp_prompt:
+            messages.append({"role": "system", "content": mcp_prompt})
+        messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": description})
+        try:
+            llm = Llama(
+                model_path=str(Path(model_path)),
+                n_gpu_layers=n_gpu_layers,
+                n_ctx=n_ctx,
+                verbose=verbose,
+            )
+            resp = llm.create_chat_completion(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=512,
+            )
+            if resp and resp.get("choices"):
+                raw = resp["choices"][0]["message"]["content"].strip()
+                try:
+                    obj = json.loads(raw)
+                    if isinstance(obj, dict):
+                        return obj
+                except json.JSONDecodeError:
+                    if verbose:
+                        print("generate_custom_workflow: invalid JSON")
+        except Exception as e:
+            if verbose:
+                print(f"generate_custom_workflow: LLM error {e}")
+
+    # fallback simple workflow
+    return {"name": "custom", "steps": ["LLMCore", "DiffusionCore", "LLMCore"]}
 
 # Main block for testing (commented out as per original structure)
 # if __name__ == '__main__':

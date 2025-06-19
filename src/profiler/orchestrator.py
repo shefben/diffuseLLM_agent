@@ -1,14 +1,15 @@
 # src/profiler/orchestrator.py
 from pathlib import Path
 import json
-import tempfile # For creating a temporary project root for the example
+import tempfile
+from typing import Any, Dict
 
-# Profiler components
-from .style_sampler import StyleSampler, CodeSample # Assuming CodeSample might be needed for type hints if not directly used
+from .style_sampler import StyleSampler
 from .sample_weigher import calculate_sample_weights, InputCodeSampleForWeighing # Use the defined input type
 from .diffusion_interfacer import unify_fingerprints_with_diffusion
-from .llm_interfacer import SingleSampleFingerprint # For creating mock AI fingerprints
 
+
+# Artifact generators
 # Artifact generators
 from .config_generator import (
     generate_black_config_in_pyproject,
@@ -44,9 +45,9 @@ def create_dummy_project_for_profiling(base_path: Path, num_files: int = 3, line
             content.append('        return self.value')
         else:
             content.append("def another_function(arg_one, arg_two):")
-            content.append("  """Docstring using double quotes."""")
-            content.append("  result = arg_one + arg_two")
-            content.append("  return result")
+            content.append('    """Docstring using double quotes."""')
+            content.append("    result = arg_one + arg_two")
+            content.append("    return result")
 
         # Add more lines to reach lines_per_file
         for j in range(len(content), lines_per_file):
@@ -174,19 +175,19 @@ def run_phase1_style_profiling_pipeline(project_root: Path, app_config: dict) ->
         print(f"  Generating Naming Conventions DB at: {naming_db_path}")
         create_naming_conventions_db(db_path=naming_db_path) # This function should handle if DB already exists
         populate_naming_rules_from_profile(db_path=naming_db_path, unified_profile=unified_profile_dict)
-        print(f"  Naming Conventions DB generated and populated successfully.")
+        print("  Naming Conventions DB generated and populated successfully.")
 
         print(f"  Generating Black config in: {pyproject_toml_path}")
         generate_black_config_in_pyproject(unified_profile=unified_profile_dict, pyproject_path=pyproject_toml_path)
-        print(f"  Black config generated successfully.")
+        print("  Black config generated successfully.")
 
         print(f"  Generating Ruff config in: {pyproject_toml_path}")
         generate_ruff_config_in_pyproject(unified_profile=unified_profile_dict, pyproject_path=pyproject_toml_path, db_path=naming_db_path)
-        print(f"  Ruff config generated successfully.")
+        print("  Ruff config generated successfully.")
 
         print(f"  Generating Docstring template at: {docstring_template_output_path}")
         generate_docstring_template_file(unified_profile=unified_profile_dict, template_output_path=docstring_template_output_path)
-        print(f"  Docstring template generated successfully.")
+        print("  Docstring template generated successfully.")
 
     except Exception as e_artifacts:
         print(f"ERROR during artifact generation: {e_artifacts}")
@@ -314,9 +315,13 @@ if __name__ == "__main__":
 
         print("\n--- Pipeline Execution Finished ---")
         if final_profile.get("error") or final_profile.get("artifact_generation_error"):
-            print(f"Pipeline completed with error(s):")
-            if final_profile.get("error"): print(f"  - Profiling error: {final_profile['error']}")
-            if final_profile.get("artifact_generation_error"): print(f"  - Artifact generation error: {final_profile['artifact_generation_error']}")
+            print("Pipeline completed with error(s):")
+            if final_profile.get("error"):
+                print(f"  - Profiling error: {final_profile['error']}")
+            if final_profile.get("artifact_generation_error"):
+                print(
+                    f"  - Artifact generation error: {final_profile['artifact_generation_error']}"
+                )
             print("Formatter and Style Scorer tests skipped due to errors in profile generation or artifact creation.")
         else:
             print("Pipeline completed successfully. Final Unified Profile:")

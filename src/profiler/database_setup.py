@@ -1,8 +1,8 @@
 import sqlite3
 from pathlib import Path
-from typing import Optional
 
 DEFAULT_NAMING_DB_PATH = Path("config") / "naming_conventions.db"
+
 
 def create_naming_conventions_db(db_path: Path = DEFAULT_NAMING_DB_PATH) -> bool:
     """
@@ -36,7 +36,8 @@ def create_naming_conventions_db(db_path: Path = DEFAULT_NAMING_DB_PATH) -> bool
         # regex_pattern: The regex to validate the naming convention.
         # description: Optional description of the rule.
         # is_active: Boolean, to enable/disable rules.
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS naming_rules (
                 rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 identifier_type TEXT NOT NULL,
@@ -46,7 +47,8 @@ def create_naming_conventions_db(db_path: Path = DEFAULT_NAMING_DB_PATH) -> bool
                 is_active BOOLEAN DEFAULT TRUE,
                 UNIQUE (identifier_type, convention_name)
             )
-        """)
+        """
+        )
         print("Table 'naming_rules' created or already exists.")
 
         # 2. Create 'symbols_fts' table (FTS5 virtual table)
@@ -60,7 +62,9 @@ def create_naming_conventions_db(db_path: Path = DEFAULT_NAMING_DB_PATH) -> bool
         try:
             # Check if FTS5 is supported by trying a simple FTS5 table creation
             # This is a more reliable check than just catching the error on the main table creation.
-            cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts5_test_table USING fts5(test_col)")
+            cursor.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS fts5_test_table USING fts5(test_col)"
+            )
             cursor.execute("DROP TABLE IF EXISTS fts5_test_table")
 
             # The 'UNINDEXED' keyword for fq_name means it's not stored separately as a column value accessible
@@ -70,7 +74,8 @@ def create_naming_conventions_db(db_path: Path = DEFAULT_NAMING_DB_PATH) -> bool
             # Let's make fq_name a regular indexed column as well for easier retrieval if needed.
             # Drop the table if it exists to ensure the schema is correctly applied (e.g. if UNINDEXED status of fq_name changes)
             cursor.execute("DROP TABLE IF EXISTS symbols_fts")
-            cursor.execute("""
+            cursor.execute(
+                """
                 CREATE VIRTUAL TABLE symbols_fts USING fts5(
                     fq_name,          -- Fully qualified name
                     file_path,
@@ -78,26 +83,32 @@ def create_naming_conventions_db(db_path: Path = DEFAULT_NAMING_DB_PATH) -> bool
                     signature,
                     tokenize = 'unicode61 remove_diacritics 0'
                 )
-            """)
+            """
+            )
             print("FTS5 table 'symbols_fts' created or already exists.")
         except sqlite3.OperationalError as e:
             if "no such module: fts5" in str(e):
-                print("FTS5 module is not available in this SQLite version. "
-                      "This module requires an SQLite version compiled with FTS5 support.")
+                print(
+                    "FTS5 module is not available in this SQLite version. "
+                    "This module requires an SQLite version compiled with FTS5 support."
+                )
                 # Fallback to FTS4 example (less common these days)
                 # cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts4(fq_name, file_path, symbol_type, signature, tokenize=unicode61)")
                 # print("Attempted fallback to FTS4 for 'symbols_fts'.")
                 # For now, we'll let this be an error if FTS5 isn't there, as FTS5 is preferred.
-                raise # Re-raise the exception if FTS5 is critical
+                raise  # Re-raise the exception if FTS5 is critical
             else:
-                raise # Re-raise other operational errors
-
+                raise  # Re-raise other operational errors
 
         # Create indexes for faster queries on naming_rules if needed (e.g., on identifier_type)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_naming_rules_identifier_type ON naming_rules (identifier_type)")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_naming_rules_identifier_type ON naming_rules (identifier_type)"
+        )
 
         conn.commit()
-        print(f"Naming conventions database schema created successfully at {db_path.resolve()}")
+        print(
+            f"Naming conventions database schema created successfully at {db_path.resolve()}"
+        )
         return True
 
     except sqlite3.Error as e:
@@ -107,10 +118,11 @@ def create_naming_conventions_db(db_path: Path = DEFAULT_NAMING_DB_PATH) -> bool
         print(f"An unexpected error occurred during database setup: {e}")
         return False
     finally:
-        if 'conn' in locals() and conn:
+        if "conn" in locals() and conn:
             conn.close()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     # Example Usage:
     # Define a temporary path for the test database
     temp_db_path = Path("temp_naming_conventions.db")
@@ -134,30 +146,42 @@ if __name__ == '__main__':
             tables = cursor.fetchall()
             print("Tables:", tables)
 
-            if any('naming_rules' in t for t in tables):
+            if any("naming_rules" in t for t in tables):
                 cursor.execute("PRAGMA table_info(naming_rules);")
                 print("naming_rules columns:", cursor.fetchall())
 
-            if any('symbols_fts' in t for t in tables):
-                cursor.execute("PRAGMA table_info(symbols_fts);") # For FTS tables, this shows internal structure
+            if any("symbols_fts" in t for t in tables):
+                cursor.execute(
+                    "PRAGMA table_info(symbols_fts);"
+                )  # For FTS tables, this shows internal structure
                 print("symbols_fts columns (internal):", cursor.fetchall())
                 # Example: Add a dummy record and search (if FTS5 is available)
                 try:
-                    cursor.execute("INSERT INTO symbols_fts (fq_name, file_path, symbol_type, signature) VALUES (?, ?, ?, ?)",
-                                   ('my.module.MyClass.my_method', 'src/my_module.py', 'method', '(self, arg1: int) -> str'))
+                    cursor.execute(
+                        "INSERT INTO symbols_fts (fq_name, file_path, symbol_type, signature) VALUES (?, ?, ?, ?)",
+                        (
+                            "my.module.MyClass.my_method",
+                            "src/my_module.py",
+                            "method",
+                            "(self, arg1: int) -> str",
+                        ),
+                    )
                     conn.commit()
-                    cursor.execute("SELECT fq_name, symbol_type FROM symbols_fts WHERE symbols_fts MATCH 'MyClass.my_method'")
-                    print("FTS search result for 'MyClass.my_method':", cursor.fetchall())
+                    cursor.execute(
+                        "SELECT fq_name, symbol_type FROM symbols_fts WHERE symbols_fts MATCH 'MyClass.my_method'"
+                    )
+                    print(
+                        "FTS search result for 'MyClass.my_method':", cursor.fetchall()
+                    )
                 except sqlite3.OperationalError as e:
                     # This might occur if FTS5 was reported as available but has issues,
                     # or if the test FTS5 table creation in the main function failed silently earlier.
                     print(f"Could not test FTS table insertion/query: {e}")
 
-
         except sqlite3.Error as e:
             print(f"Error during schema inspection: {e}")
         finally:
-            if 'conn' in locals() and conn:
+            if "conn" in locals() and conn:
                 conn.close()
     else:
         print("Failed to create database schema.")
@@ -166,4 +190,6 @@ if __name__ == '__main__':
     if temp_db_path.exists():
         # temp_db_path.unlink() # Comment out to inspect the db manually after run
         # print(f"Cleaned up {temp_db_path.name}")
-        print(f"Temporary database {temp_db_path.name} was created. Inspect it manually if desired.")
+        print(
+            f"Temporary database {temp_db_path.name} was created. Inspect it manually if desired."
+        )

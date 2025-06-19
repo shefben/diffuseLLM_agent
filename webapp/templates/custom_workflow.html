@@ -1,0 +1,22 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Create Custom Workflow</h2>
+<form method="post">
+  <label>Name:<br><input type="text" name="workflow_name"></label><br>
+  <label>Description / Prompt:<br>
+    <textarea name="prompt" rows="6" style="width:90%;"></textarea>
+  </label><br>
+  <input type="submit" value="Generate Workflow">
+</form>
+{% if workflow_json %}
+<h3>Generated Workflow</h3>
+<pre>{{ workflow_json }}</pre>
+{% endif %}
+{% if message %}<p>{{ message }}</p>{% endif %}
+<h3>Existing Custom Workflows</h3>
+<ul>
+{% for wf in workflows %}
+  <li>{{ wf.name }}</li>
+{% endfor %}
+</ul>
+{% endblock %}

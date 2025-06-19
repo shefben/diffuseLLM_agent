@@ -1,0 +1,31 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>User Management</h1>
+{% if message %}<p>{{ message }}</p>{% endif %}
+<table>
+<tr><th>User</th><th>Email</th><th>Admin</th><th>Actions</th></tr>
+{% for name, data in users.items() %}
+<tr>
+<form method="POST">
+    <td><input type="hidden" name="username" value="{{ name }}"><input type="text" name="new_username" value="{{ name }}"></td>
+    <td><input type="email" name="email" value="{{ data.email }}"></td>
+    <td><input type="checkbox" name="is_admin" {% if data.is_admin %}checked{% endif %}></td>
+    <td>
+        <input type="password" name="password" placeholder="New password">
+        <button type="submit" name="action" value="update">Update</button>
+        <button type="submit" name="action" value="delete">Delete</button>
+    </td>
+</form>
+</tr>
+{% endfor %}
+</table>
+<h2>Add User</h2>
+<form method="POST">
+    <input type="hidden" name="action" value="add">
+    <input type="text" name="username" placeholder="Username">
+    <input type="email" name="email" placeholder="Email">
+    <input type="password" name="password" placeholder="Password">
+    <label><input type="checkbox" name="is_admin"> Admin</label>
+    <input type="submit" value="Add">
+</form>
+{% endblock %}

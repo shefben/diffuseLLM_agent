@@ -1,5 +1,4 @@
 import ast
-import os
 import random
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Union, Optional
@@ -229,9 +228,17 @@ class StyleSampler:
                             ai_fingerprint_result["validation_status"] = "failed_json_parsing"
                             ai_fingerprint_result["_raw_polished_json_FAILURE"] = polished_json_str
                     else:
-                        error_message_for_sample = "JSON polishing by LLM failed or no input."
-                        if not string_to_polish_for_json: error_message_for_sample = "No valid string (draft/refined) to polish for JSON."
-                        elif refined_output_kvs_str is None and draft_fp_for_divot5: error_message_for_sample += " (DivoT5 refinement also failed)."
+                        error_message_for_sample = (
+                            "JSON polishing by LLM failed or no input."
+                        )
+                        if not string_to_polish_for_json:
+                            error_message_for_sample = (
+                                "No valid string (draft/refined) to polish for JSON."
+                            )
+                        elif refined_output_kvs_str is None and draft_fp_for_divot5:
+                            error_message_for_sample += (
+                                " (DivoT5 refinement also failed)."
+                            )
 
                         ai_fingerprint_result.update(draft_fp)
                         ai_fingerprint_result["error"] = (draft_fp.get("error") or "") + " | Additionally: " + error_message_for_sample
@@ -391,7 +398,8 @@ class StyleSampler:
                             info["current_samples"] += 1
                             added_in_final_pass = True
                             break
-                    if not added_in_final_pass: break # Cannot add more
+                    if not added_in_final_pass:
+                        break  # Cannot add more
 
             # If over-allocated (less common with floor + remainder, but possible if logic changes)
             # Remove from smallest pools that have samples > 0 (or > 1 if min representation is 1)
@@ -406,7 +414,8 @@ class StyleSampler:
                             info["current_samples"] -= 1
                             removed_in_final_pass = True
                             break
-                    if not removed_in_final_pass: break # Cannot remove more
+                    if not removed_in_final_pass:
+                        break  # Cannot remove more
 
         # 5. Perform the actual sampling from each directory
         final_selected_samples: List[CodeSample] = []
@@ -466,8 +475,8 @@ if __name__ == '__main__':
     (dummy_repo_path / "module2").mkdir(exist_ok=True)
 
     with open(dummy_repo_path / "main.py", "w") as f:
-        f.write("""
-"""This is the main module docstring."""
+        f.write(
+            '''"""This is the main module docstring."""
 import os
 
 class MainClass:
@@ -482,11 +491,12 @@ class MainClass:
 def top_level_func():
     """A top-level function."""
     pass
-""")
+'''
+        )
 
     with open(dummy_repo_path / "module1" / "utils.py", "w") as f:
-        f.write("""
-"""Utils module docstring."""
+        f.write(
+            '''"""Utils module docstring."""
 def util_func1():
     """Utility function 1."""
     return "util1"
@@ -494,20 +504,22 @@ def util_func1():
 class HelperClass:
     """A helper class in utils."""
     pass
-""")
+'''
+        )
 
     with open(dummy_repo_path / "module2" / "services.py", "w") as f:
-        f.write("""
-# No module docstring here
+        f.write(
+            '''# No module docstring here
 def service_call_alpha():
     # No function docstring
     print("Alpha service")
 
 class ServiceOne:
     # No class docstring
-    def run(self): # No method docstring
+    def run(self):  # No method docstring
         pass
-""")
+'''
+        )
 
     # Add a venv to test filtering
     (dummy_repo_path / ".venv").mkdir(exist_ok=True)

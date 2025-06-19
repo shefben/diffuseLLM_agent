@@ -1,0 +1,11 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Model Training</h1>
+{% if message %}<p>{{ message }}</p>{% endif %}
+<form method="POST">
+    <input type="submit" name="action" value="Prepare Dataset">
+    <input type="submit" name="action" value="Fine-tune LoRA">
+    <input type="submit" name="action" value="Train Predictor">
+    <input type="submit" name="action" value="Run Full Pipeline">
+</form>
+{% endblock %}

@@ -4,7 +4,12 @@ from typing import Optional
 
 class SpecNormalizerModelInterface(ABC):
     @abstractmethod
-    def generate_spec_yaml(self, raw_issue_text: str, context_symbols_string: Optional[str] = None) -> Optional[str]:
+    def generate_spec_yaml(
+        self,
+        raw_issue_text: str,
+        context_symbols_string: Optional[str] = None,
+        mcp_prompt: Optional[str] = None,
+    ) -> Optional[str]:
         """
         Generates a YAML specification string from raw issue text and context.
         Returns None if generation fails.
