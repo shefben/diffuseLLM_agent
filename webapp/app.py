@@ -1,4 +1,14 @@
-from flask import Flask, render_template, request, redirect, url_for, jsonify
+from flask import (
+    Flask,
+    render_template,
+    request,
+    redirect,
+    url_for,
+    jsonify,
+    session,
+)
+from functools import wraps
+from werkzeug.security import check_password_hash, generate_password_hash
 import sys
 import uuid
 import threading
@@ -50,6 +60,7 @@ except ImportError as e:
     Phase = dict  # Placeholder type
 
 app = Flask(__name__)
+app.secret_key = "change-me"
 
 # Globals populated by initialize_components()
 app_config_global = {}
@@ -57,6 +68,42 @@ digester_global = None
 phase_planner_global = None
 initialized = False
 job_status: dict[str, dict] = {}
+
+# ---------------------------
+# User management
+# ---------------------------
+USERS_FILE = PROJECT_ROOT / "config" / "users.json"
+
+
+def load_users() -> dict:
+    if USERS_FILE.exists():
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    # create default user
+    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    default = {"admin": generate_password_hash("admin")}
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(default, f, indent=2)
+    return default
+
+
+def save_users(users: dict) -> None:
+    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, indent=2)
+
+
+def login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("user"):
+            return redirect(url_for("login_route", next=request.path))
+        return func(*args, **kwargs)
+
+    return wrapper
 
 
 def start_job(target, *args, **kwargs) -> str:
@@ -77,6 +124,26 @@ def start_job(target, *args, **kwargs) -> str:
     return job_id
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login_route():
+    users = load_users()
+    message = None
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if username in users and check_password_hash(users[username], password):
+            session["user"] = username
+            return redirect(request.args.get("next") or url_for("dashboard_route"))
+        message = "Invalid credentials"
+    return render_template("login.html", message=message)
+
+
+@app.route("/logout")
+def logout_route():
+    session.pop("user", None)
+    return redirect(url_for("login_route"))
+
+
 # -------------------------------------------------------------
 # Environment management and selection
 # -------------------------------------------------------------
@@ -87,13 +154,14 @@ def projects_route():
     envs = load_environments()
     message = None
     if request.method == "POST":
-        if request.form.get("action") == "select":
+        action = request.form.get("action")
+        if action == "select":
             name = request.form.get("env_name")
             for env in envs:
                 if env.get("name") == name:
                     initialize_components(Path(env["path"]))
                     return redirect(url_for("dashboard_route"))
-        else:  # create new environment
+        elif action == "create":
             name = request.form.get("new_name")
             path = request.form.get("new_path")
             desc = request.form.get("new_desc")
@@ -103,6 +171,20 @@ def projects_route():
                 initialize_components(Path(path))
                 return redirect(url_for("dashboard_route"))
             message = "Name and path are required"
+        elif action == "delete":
+            name = request.form.get("env_name")
+            envs = [e for e in envs if e.get("name") != name]
+            save_environments(envs)
+        elif action == "rename":
+            name = request.form.get("env_name")
+            new_name = request.form.get("new_name")
+            for env in envs:
+                if env.get("name") == name and new_name:
+                    env["name"] = new_name
+            save_environments(envs)
+    for env in envs:
+        fp = Path(env.get("path", "")) / "style_fingerprint.json"
+        env["profiled"] = fp.exists()
     return render_template("projects.html", environments=envs, message=message)
 
 
@@ -156,6 +238,7 @@ def initialize_components(
 
 
 @app.route("/")
+@login_required
 def dashboard_route():
     if not initialized:
         return redirect(url_for("projects_route"))
@@ -185,6 +268,7 @@ def dashboard_route():
 
 
 @app.route("/issue", methods=["GET", "POST"])
+@login_required
 def issue_route():
     spec_data_str = None
     plan_data_str = None
@@ -276,6 +360,7 @@ def issue_route():
 
 
 @app.route("/memory")
+@login_required
 def view_memory():
     """Display recent success memory entries with optional filtering."""
     if not initialized:
@@ -325,6 +410,7 @@ def view_memory():
 
 
 @app.route("/memory/<int:index>")
+@login_required
 def memory_detail_route(index: int):
     """Display full details for a single memory entry."""
     if not initialized:
@@ -344,6 +430,7 @@ def memory_detail_route(index: int):
 
 
 @app.route("/apply_patch", methods=["POST"])
+@login_required
 def apply_patch_route():
     """Run full patch generation for an issue and redirect to memory."""
     if not initialized:
@@ -373,6 +460,7 @@ def apply_patch_route():
 
 
 @app.route("/apply_plan", methods=["POST"])
+@login_required
 def apply_plan_route():
     """Execute a user-approved plan represented as JSON."""
     if not initialized:
@@ -414,6 +502,7 @@ def apply_plan_route():
 
 
 @app.route("/feedback", methods=["POST"])
+@login_required
 def feedback_route():
     if not initialized:
         return "Application not initialized", 503
@@ -444,6 +533,7 @@ def feedback_route():
 
 
 @app.route("/prepare_dataset")
+@login_required
 def prepare_dataset_route():
     """Generate a fine-tuning dataset from success memory."""
     if not initialized:
@@ -468,6 +558,7 @@ def prepare_dataset_route():
 
 
 @app.route("/train", methods=["GET", "POST"])
+@login_required
 def train_route():
     if not initialized:
         return "Application not initialized", 503
@@ -565,6 +656,7 @@ def job_status_route(job_id: str):
 
 
 @app.route("/query_graph", methods=["GET"])
+@login_required
 def query_graph_route():
     """Query the knowledge graph and display results."""
     if not initialized:
@@ -589,6 +681,7 @@ def query_graph_route():
 
 
 @app.route("/search_code", methods=["GET", "POST"])
+@login_required
 def search_code_route():
     """Search symbols using the digester's retriever."""
     if not initialized:
@@ -629,30 +722,62 @@ if __name__ == "__main__":
 
 
 @app.route("/config", methods=["GET", "POST"])
+@login_required
 def config_route():
     if not initialized:
         return "Application not initialized", 503
     config_path = Path(app_config_global.get("loaded_config_path", "config.yaml"))
+    basic_fields = {
+        "general__data_dir": "",
+        "webui__port": "",
+        "active_learning__enabled": "",
+    }
+
     if request.method == "POST":
-        new_text = request.form.get("config_text", "")
-        try:
-            yaml.safe_load(new_text)
+        mode = request.form.get("mode", "text")
+        if mode == "basic":
+            for key in basic_fields:
+                section, field = key.split("__")
+                val = request.form.get(key)
+                app_config_global.setdefault(section, {})[field] = yaml.safe_load(val)
             with open(config_path, "w", encoding="utf-8") as f:
-                f.write(new_text)
-            app_config_global.update(yaml.safe_load(new_text) or {})
+                yaml.safe_dump(app_config_global, f)
             message = "Configuration updated"
-        except Exception as e:
-            message = f"Failed to update config: {e}"
-        return render_template("config.html", config_text=new_text, message=message)
+        else:
+            new_text = request.form.get("config_text", "")
+            try:
+                yaml.safe_load(new_text)
+                with open(config_path, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+                app_config_global.update(yaml.safe_load(new_text) or {})
+                message = "Configuration updated"
+            except Exception as e:
+                message = f"Failed to update config: {e}"
+            return render_template(
+                "config.html",
+                config_text=new_text,
+                message=message,
+                basic_fields=basic_fields,
+            )
     text = (
         config_path.read_text(encoding="utf-8")
         if config_path.exists()
         else yaml.dump(app_config_global)
     )
-    return render_template("config.html", config_text=text, message=None)
+    # populate field values
+    for key in basic_fields:
+        section, field = key.split("__")
+        basic_fields[key] = app_config_global.get(section, {}).get(field, "")
+    return render_template(
+        "config.html",
+        config_text=text,
+        message=None,
+        basic_fields=basic_fields,
+    )
 
 
 @app.route("/chat", methods=["GET", "POST"])
+@login_required
 def chat_route():
     if not initialized:
         return "Application not initialized", 503
@@ -677,6 +802,7 @@ def chat_route():
 
 
 @app.route("/easyedit", methods=["GET", "POST"])
+@login_required
 def easyedit_route():
     if not initialized:
         return "Application not initialized", 503
@@ -691,6 +817,7 @@ def easyedit_route():
 
 
 @app.route("/mcp", methods=["GET", "POST"])
+@login_required
 def mcp_route():
     if not initialized:
         return "Application not initialized", 503
@@ -727,6 +854,7 @@ def mcp_route():
 
 
 @app.route("/custom_workflow", methods=["GET", "POST"])
+@login_required
 def custom_workflow_route():
     if not initialized:
         return "Application not initialized", 503
