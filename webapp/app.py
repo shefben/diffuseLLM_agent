@@ -949,7 +949,11 @@ def custom_workflow_route():
         name = request.form.get("workflow_name", "custom")
         prompt = request.form.get("prompt", "")
         model_path = app_config_global.get("models", {}).get("operations_llm_gguf")
-        wf = generate_custom_workflow(prompt, model_path=model_path)
+        wf = generate_custom_workflow(
+            prompt,
+            model_path=model_path,
+            use_vllm=app_config_global.get("general", {}).get("use_vllm", False),
+        )
         if wf:
             if "name" not in wf:
                 wf["name"] = name

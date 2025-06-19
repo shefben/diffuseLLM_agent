@@ -535,6 +535,7 @@ class PhasePlanner:
             model_path=self.operations_llm_path,
             verbose=self.verbose,
             mcp_prompt=mcp_ops,
+            use_vllm=self.app_config.get("general", {}).get("use_vllm", False),
         )
 
         if not llm_ops:
@@ -1228,7 +1229,9 @@ Score:"""
                                         print(
                                             f"PhasePlanner: Successfully logged patch to success memory in {self.data_dir_path}."
                                         )
-                                elif self.verbose:  # Only print warning if verbose, as it's non-critical
+                                elif (
+                                    self.verbose
+                                ):  # Only print warning if verbose, as it's non-critical
                                     print(
                                         f"PhasePlanner Warning: Failed to log patch to success memory in {self.data_dir_path}."
                                     )
@@ -1251,12 +1254,12 @@ Score:"""
                                 execution_summary
                                 and execution_summary[-1]["status"] == "success"
                             ):
-                                execution_summary[-1]["status"] = (
-                                    "error"  # Update status
-                                )
-                                execution_summary[-1]["error_message"] = (
-                                    "CommitBuilder failed to save patch set"
-                                )
+                                execution_summary[-1][
+                                    "status"
+                                ] = "error"  # Update status
+                                execution_summary[-1][
+                                    "error_message"
+                                ] = "CommitBuilder failed to save patch set"
                             else:  # If summary was not updated for success yet, add new error entry
                                 execution_summary.append(
                                     {

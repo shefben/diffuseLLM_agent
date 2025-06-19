@@ -43,6 +43,8 @@ class LLMCore:
         self.style_profile = style_profile
         self.naming_conventions_db_path = naming_conventions_db_path
 
+        self.use_vllm = self.app_config.get("general", {}).get("use_vllm", False)
+
         self.verbose = self.app_config.get("general", {}).get("verbose", False)
 
         default_agent_llm_path = DEFAULT_APP_CONFIG.get("models", {}).get(
@@ -192,6 +194,7 @@ Quote Style: {style_profile.get("quote_style", DEFAULT_APP_CONFIG.get("style_pro
             n_ctx=scaffold_n_ctx,
             max_tokens_for_scaffold=scaffold_max_tokens,
             temperature=scaffold_temp,
+            use_vllm=self.use_vllm,
         )
 
         if raw_llm_output is None:
@@ -497,6 +500,7 @@ Your goal is to refine the provided LibCST script for clarity, correctness, and 
             n_ctx=polish_n_ctx,
             max_tokens_for_polished_script=polish_max_tokens,
             temperature=polish_temp,
+            use_vllm=self.use_vllm,
         )
 
         if not llm_output_string:  # Handles None or empty string

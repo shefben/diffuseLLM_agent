@@ -8,6 +8,7 @@ DEFAULT_CONFIG_FILENAMES = ["config.yaml", "config.yml"]
 DEFAULT_APP_CONFIG: Dict[str, Any] = {
     "general": {
         "verbose": False,
+        "use_vllm": False,
         "project_root": None,  # To be dynamically set by the main application/CLI
         "data_dir": ".agent_data",  # Relative to project_root for success memory, etc.
         "patches_output_dir": ".autopatches",  # Relative to project_root for CommitBuilder output

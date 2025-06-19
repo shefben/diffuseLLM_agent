@@ -14,6 +14,7 @@ The assistant relies on three cooperating models:
 
 Paths to each model and various parameters are configured in `config.yaml`.
 Command‑line arguments act as overrides when needed.
+Set `general.use_vllm: true` if you have the [vLLM](https://github.com/vllm-project/vllm) package installed and want to use it for faster inference instead of `llama-cpp`.
 
 ## Project Phases
 
@@ -48,7 +49,14 @@ Some features depend on optional packages such as `transformers` and GPU‑enabl
    Open <http://localhost:5001> to create or select a project and provide the repository path. The profiler runs automatically, then you can submit issues, review plans and approve patches.
    Model paths and training parameters are read from `config.yaml`, so command‑line flags are optional.
   The dashboard also offers code search, knowledge graph queries, memory review, and training controls. Use the **Config** page to edit the YAML settings directly and the **Training** page to run LoRA fine‑tuning and predictor updates without extra scripts. When submitting an issue you can select among several agent workflows—**prompt_chaining**, **routing**, **parallelization**, **orchestrator-workers**, or **evaluator-optimizer**—to control how patches are generated.
-  The **MCP** page lets you manage prompting tools and assign them to agents per workflow.
+   The **MCP** page lets you manage prompting tools and assign them to agents per workflow.
+
+2. **Run inside Docker**
+   ```bash
+   docker build -t diffuse-agent .
+   docker run -p 5001:5001 -v /path/to/your/project:/workspace/project diffuse-agent
+   ```
+   The container installs all dependencies and launches the web UI automatically.
 
 For more detailed workflows—including active learning and fine‑tuning—see the [Usage Guide](docs/HOW_TO_USE.md).
 

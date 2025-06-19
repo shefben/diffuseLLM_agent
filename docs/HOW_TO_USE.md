@@ -22,6 +22,7 @@ python3 scripts/launch_assistant.py /path/to/your/project
 
 The script digests the repository, initializes databases, and opens a Flask web interface (default `http://localhost:5001`).
 Parameters like the port and active learning settings are loaded from `config.yaml`, so extra flags are usually unnecessary. Pass `--active-learning` to force training even if the config disables it.
+Set `general.use_vllm` to `true` in the config if you installed the optional vLLM package for faster model inference.
 
 ## 3. Submitting Issues
 

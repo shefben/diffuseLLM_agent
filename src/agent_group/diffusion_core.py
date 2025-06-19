@@ -35,6 +35,7 @@ class DiffusionCore:
             style_profile  # Store style_profile if needed by other methods
         )
         self.verbose = self.app_config.get("general", {}).get("verbose", False)
+        self.use_vllm = self.app_config.get("general", {}).get("use_vllm", False)
         if self.verbose:
             print(f"DiffusionCore initialized. Verbose: {self.verbose}")
             print(f"  Style profile keys: {list(self.style_profile.keys())}")
@@ -216,6 +217,7 @@ Provide only the code snippet to replace `{hole_marker}`:"""
                             max_tokens_for_infill=gguf_max_tokens,
                             temperature=gguf_temp,
                             stop=stop_sequences,
+                            use_vllm=self.use_vllm,
                         )
                         llm_call_succeeded = infilled_code_snippet is not None
 

@@ -32,3 +32,4 @@ watchdog
 # For Phase 3 & 4: Spec/Plan Schemas and YAML processing
 pydantic
 PyYAML
+vllm

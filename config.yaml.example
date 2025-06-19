@@ -1,5 +1,6 @@
 general:
   verbose: false
+  use_vllm: false
   project_root: null
   data_dir: .agent_data
   patches_output_dir: .autopatches
